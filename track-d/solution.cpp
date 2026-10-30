@@ -1,6 +1,6 @@
 /**
  * Speed Demon 2026 - Track D (Traverse)
- * High-K Parallel CSR + Multi-Target Grouped Dijkstra + Zero-RSS-Overlap
+ * Zero-RSS-Overlap CSR + Bound-Pruned Adaptive 32/64-bit Parallel Dijkstra
  */
 
 #include <fcntl.h>
@@ -10,68 +10,59 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
 struct Edge {
-    uint32_t to;
-    uint32_t w;
+    uint32_t to, w;
 };
 
-struct HeapNode {
-    uint64_t dist;
-    uint32_t u;
+struct Query {
+    uint32_t s, t, id;
 };
 
+struct SourceGroup {
+    uint32_t s, begin_idx, end_idx;
+};
+
+template <typename DistT>
 struct MinHeap4 {
-    std::vector<HeapNode> data;
+    struct Node {
+        DistT dist;
+        uint32_t u;
+    };
+    std::vector<Node> data;
 
-    void clear() { data.clear(); }
-    bool empty() const { return data.empty(); }
-
-    inline void push(uint64_t dist, uint32_t u) {
+    inline void push(DistT dist, uint32_t u) {
         uint32_t i = data.size();
         data.push_back({dist, u});
         while (i > 0) {
             uint32_t p = (i - 1) >> 2;
-            if (dist < data[p].dist) {
-                data[i] = data[p];
-                i = p;
-            } else {
-                break;
-            }
+            if (dist >= data[p].dist) break;
+            data[i] = data[p];
+            i = p;
         }
         data[i] = {dist, u};
     }
 
-    inline HeapNode pop() {
-        HeapNode top = data[0];
-        HeapNode last = data.back();
+    inline Node pop() {
+        Node top = data[0], last = data.back();
         data.pop_back();
-        uint32_t size = data.size();
-        if (size > 0) {
-            uint32_t i = 0;
-            while (true) {
-                uint32_t c = (i << 2) + 1;
-                if (c >= size) break;
-                uint32_t min_c = c;
-                uint32_t end_c = c + 4 < size ? c + 4 : size;
-                for (uint32_t k = c + 1; k < end_c; ++k) {
-                    if (data[k].dist < data[min_c].dist) min_c = k;
-                }
-                if (data[min_c].dist < last.dist) {
-                    data[i] = data[min_c];
-                    i = min_c;
-                } else {
-                    break;
-                }
+        uint32_t sz = data.size(), i = 0;
+        while (true) {
+            uint32_t c = (i << 2) + 1;
+            if (c >= sz) break;
+            uint32_t mc = c, ec = std::min(c + 4, sz);
+            for (uint32_t k = c + 1; k < ec; ++k) {
+                if (data[k].dist < data[mc].dist) mc = k;
             }
-            data[i] = last;
+            if (data[mc].dist >= last.dist) break;
+            data[i] = data[mc];
+            i = mc;
         }
+        if (sz > 0) data[i] = last;
         return top;
     }
 };
@@ -88,71 +79,64 @@ struct FastMmap {
         fstat(fd, &st);
         size = st.st_size;
         if (size > 0) {
-            data = (char*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            data = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
             madvise(data, size, MADV_SEQUENTIAL);
         }
     }
 
     void release() {
-        if (data && data != MAP_FAILED) {
-            munmap(data, size);
-            data = nullptr;
-        }
-        if (fd >= 0) {
-            close(fd);
-            fd = -1;
-        }
+        if (data && data != MAP_FAILED) munmap(data, size);
+        if (fd >= 0) close(fd);
+        data = nullptr;
+        fd = -1;
     }
 
     ~FastMmap() { release(); }
 };
 
-struct Query {
-    uint32_t s, t, id;
-};
+// Drops already-parsed page-aligned windows from process RssFile to keep VmHWM minimal
+inline void drop_pages(const char* start, const char* end) {
+    uintptr_t a = (reinterpret_cast<uintptr_t>(start) + 4095) & ~uintptr_t(4095);
+    uintptr_t b = reinterpret_cast<uintptr_t>(end) & ~uintptr_t(4095);
+    if (b > a) madvise(reinterpret_cast<void*>(a), b - a, MADV_DONTNEED);
+}
+
+template <typename F>
+void run_parallel(uint32_t nt, F&& fn) {
+    std::vector<std::thread> pool;
+    pool.reserve(nt - 1);
+    for (uint32_t t = 1; t < nt; ++t) pool.emplace_back(fn, t);
+    fn(0);
+    for (auto& w : pool) w.join();
+}
 
 int main(int argc, char** argv) {
-    const char* data_dir = "/data";
-    const char* out_dir = "/out";
-
-    int pos = 0;
-    for (int i = 1; i < argc; ++i) {
+    const char *data_dir = "/data", *out_dir = "/out";
+    for (int i = 1, pos = 0; i < argc; ++i) {
         if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
-        else if (argv[i][0] != '-') {
-            if (pos == 0) data_dir = argv[i];
-            else if (pos == 1) out_dir = argv[i];
-            pos++;
-        }
+        else if (argv[i][0] != '-') (pos++ == 0 ? data_dir : out_dir) = argv[i];
     }
 
-    std::string graph_path = std::string(data_dir) + "/graph.txt";
-    std::string queries_path = std::string(data_dir) + "/queries.txt";
-    std::string out_path = std::string(out_dir) + "/distances.txt";
+    FastMmap gmap((std::string(data_dir) + "/graph.txt").c_str());
+    if (!gmap.data || gmap.data == MAP_FAILED) return 1;
 
-    FastMmap gmap(graph_path.c_str());
-    if (!gmap.data) return 1;
-
-    const char* p = gmap.data;
-    const char* g_end = gmap.data + gmap.size;
+    const char *p = gmap.data, *g_end = gmap.data + gmap.size;
+    while (g_end > p && *(g_end - 1) < '0') g_end--;
 
     uint32_t n = 0, m = 0;
-    while (*p >= '0') n = n * 10 + (*p++ - '0');
-    p++;
-    while (*p >= '0') m = m * 10 + (*p++ - '0');
-    if (*p == '\r') p++;
-    p++;
+    while (p < g_end && *p >= '0') n = n * 10 + (*p++ - '0');
+    while (p < g_end && *p < '0') p++;
+    while (p < g_end && *p >= '0') m = m * 10 + (*p++ - '0');
+    while (p < g_end && *p < '0') p++;
 
     const char* edge_start = p;
     size_t edge_bytes = g_end - edge_start;
-
     constexpr uint32_t NUM_THREADS = 12;
     uint32_t nt = (m < 50000) ? 1 : NUM_THREADS;
 
-    // Partition file into line-aligned chunks for parallel parsing
-    std::vector<const char*> chunk_bounds(nt + 1);
+    std::vector<const char*> chunk_bounds(nt + 1, g_end);
     chunk_bounds[0] = edge_start;
-    chunk_bounds[nt] = g_end;
     for (uint32_t t = 1; t < nt; ++t) {
         const char* cp = edge_start + (edge_bytes * t) / nt;
         while (cp < g_end && *(cp - 1) != '\n') cp++;
@@ -160,44 +144,47 @@ int main(int argc, char** argv) {
     }
 
     std::vector<uint32_t> head(n + 1, 0);
-    uint32_t bitset_words = (n + 63) >> 6;
-    std::vector<uint64_t> has_in_bitset(bitset_words, 0);
+    std::vector<uint64_t> has_in_bitset((n + 63) >> 6, 0);
 
-    // Pass 1: Parallel degree counting & incoming bitset marking
-    {
-        std::vector<std::thread> workers;
-        for (uint32_t t = 0; t < nt; ++t) {
-            workers.emplace_back([&, t]() {
-                const char* cur = chunk_bounds[t];
-                const char* end = chunk_bounds[t + 1];
-                auto* deg_ptr = reinterpret_cast<std::atomic<uint32_t>*>(head.data());
-                auto* bit_ptr = reinterpret_cast<std::atomic<uint64_t>*>(has_in_bitset.data());
+    // Pass 1: Parallel degree counting with local run batching & sliding page release
+    run_parallel(nt, [&](uint32_t t) {
+        const char *cur = chunk_bounds[t], *end = chunk_bounds[t + 1], *win = cur;
+        auto* deg_ptr = reinterpret_cast<std::atomic<uint32_t>*>(head.data());
+        auto* bit_ptr = reinterpret_cast<std::atomic<uint64_t>*>(has_in_bitset.data());
+        uint32_t prev_u = UINT32_MAX, run_cnt = 0;
 
-                while (cur < end) {
-                    uint32_t u = 0;
-                    while (*cur >= '0') u = u * 10 + (*cur++ - '0');
-                    cur++;
-                    uint32_t v = 0;
-                    while (*cur >= '0') v = v * 10 + (*cur++ - '0');
-                    cur++;
-                    while (*cur >= '0') cur++;
-                    if (*cur == '\r') cur++;
-                    cur++;
+        while (cur < end) {
+            uint32_t u = 0, v = 0;
+            while (*cur >= '0') u = u * 10 + (*cur++ - '0');
+            cur++;
+            while (*cur >= '0') v = v * 10 + (*cur++ - '0');
+            cur++;
+            while (cur < end && *cur >= '0') cur++;
+            while (cur < end && *cur < '0') cur++;
 
-                    if (u != v) {
-                        deg_ptr[u].fetch_add(1, std::memory_order_relaxed);
-                        uint64_t mask = 1ULL << (v & 63);
-                        if ((bit_ptr[v >> 6].load(std::memory_order_relaxed) & mask) == 0) {
-                            bit_ptr[v >> 6].fetch_or(mask, std::memory_order_relaxed);
-                        }
-                    }
+            if (u != v) {
+                if (u == prev_u) {
+                    run_cnt++;
+                } else {
+                    if (run_cnt) deg_ptr[prev_u].fetch_add(run_cnt, std::memory_order_relaxed);
+                    prev_u = u;
+                    run_cnt = 1;
                 }
-            });
+                uint64_t mask = 1ULL << (v & 63);
+                if (!(bit_ptr[v >> 6].load(std::memory_order_relaxed) & mask)) {
+                    bit_ptr[v >> 6].fetch_or(mask, std::memory_order_relaxed);
+                }
+            }
+            if (cur - win >= (2 << 20)) {
+                drop_pages(win, cur);
+                win = cur;
+            }
         }
-        for (auto& w : workers) w.join();
-    }
+        if (run_cnt) deg_ptr[prev_u].fetch_add(run_cnt, std::memory_order_relaxed);
+        drop_pages(win, end);
+    });
+    madvise(gmap.data, gmap.size, MADV_DONTNEED);
 
-    // Exclusive prefix sum in-place on head
     uint32_t accum = 0;
     for (uint32_t i = 0; i <= n; ++i) {
         uint32_t d = head[i];
@@ -206,217 +193,246 @@ int main(int argc, char** argv) {
     }
 
     std::vector<Edge> edges(accum);
+    std::atomic<uint32_t> global_max_w{0};
 
-    // Pass 2: Parallel edge population
-    {
-        std::vector<uint32_t> cur_pos(head.begin(), head.begin() + n);
-        std::vector<std::thread> workers;
-        for (uint32_t t = 0; t < nt; ++t) {
-            workers.emplace_back([&, t]() {
-                const char* cur = chunk_bounds[t];
-                const char* end = chunk_bounds[t + 1];
-                auto* pos_ptr = reinterpret_cast<std::atomic<uint32_t>*>(cur_pos.data());
+    // Pass 2: Populate edges in-place using head[] directly (saves 4*N bytes vs cur_pos[])
+    run_parallel(nt, [&](uint32_t t) {
+        const char *cur = chunk_bounds[t], *end = chunk_bounds[t + 1], *win = cur;
+        auto* pos_ptr = reinterpret_cast<std::atomic<uint32_t>*>(head.data());
+        uint32_t local_max_w = 0;
 
-                while (cur < end) {
-                    uint32_t u = 0;
-                    while (*cur >= '0') u = u * 10 + (*cur++ - '0');
-                    cur++;
-                    uint32_t v = 0;
-                    while (*cur >= '0') v = v * 10 + (*cur++ - '0');
-                    cur++;
-                    uint32_t w = 0;
-                    while (*cur >= '0') w = w * 10 + (*cur++ - '0');
-                    if (*cur == '\r') cur++;
-                    cur++;
+        while (cur < end) {
+            uint32_t u = 0, v = 0, w = 0;
+            while (*cur >= '0') u = u * 10 + (*cur++ - '0');
+            cur++;
+            while (*cur >= '0') v = v * 10 + (*cur++ - '0');
+            cur++;
+            while (cur < end && *cur >= '0') w = w * 10 + (*cur++ - '0');
+            while (cur < end && *cur < '0') cur++;
 
-                    if (u != v) {
-                        uint32_t idx = pos_ptr[u].fetch_add(1, std::memory_order_relaxed);
-                        edges[idx] = {v, w};
-                    }
-                }
-            });
+            if (u != v) {
+                uint32_t idx = pos_ptr[u].fetch_add(1, std::memory_order_relaxed);
+                edges[idx] = {v, w};
+                if (w > local_max_w) local_max_w = w;
+            }
+            if (cur - win >= (2 << 20)) {
+                drop_pages(win, cur);
+                win = cur;
+            }
         }
-        for (auto& w : workers) w.join();
-    }
-
-    // Immediately unmap graph.txt to drop file-backed pages from RSS before query phase
+        drop_pages(win, end);
+        uint32_t prev = global_max_w.load(std::memory_order_relaxed);
+        while (local_max_w > prev && !global_max_w.compare_exchange_weak(prev, local_max_w, std::memory_order_relaxed)) {}
+    });
     gmap.release();
 
-    // Sort adjacency lists in parallel (sort by weight ascending first for better cache prefetching)
-    {
-        std::atomic<uint32_t> next_chunk{0};
-        std::vector<std::thread> workers;
-        for (uint32_t t = 0; t < nt; ++t) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    uint32_t u_base = next_chunk.fetch_add(4096, std::memory_order_relaxed);
-                    if (u_base >= n) break;
-                    uint32_t u_end = std::min(n, u_base + 4096);
-                    for (uint32_t u = u_base; u < u_end; ++u) {
-                        uint32_t s = head[u], e = head[u + 1];
-                        if (e - s > 1) {
-                            std::sort(edges.data() + s, edges.data() + e, [](const Edge& a, const Edge& b) {
-                                return (a.to != b.to) ? (a.to < b.to) : (a.w < b.w);
-                            });
+    // Restore exclusive prefix sum in head[] after in-place atomic increments
+    if (n > 0) memmove(&head[1], &head[0], n * sizeof(uint32_t));
+    head[0] = 0;
+
+    // Parallel adjacency sort + multi-edge detection
+    std::atomic<uint32_t> next_chunk{0};
+    std::atomic<bool> has_dups{false};
+    run_parallel(nt, [&](uint32_t) {
+        bool local_dups = false;
+        while (true) {
+            uint32_t u_base = next_chunk.fetch_add(4096, std::memory_order_relaxed);
+            if (u_base >= n) break;
+            uint32_t u_end = std::min(n, u_base + 4096);
+            for (uint32_t u = u_base; u < u_end; ++u) {
+                uint32_t s = head[u], e = head[u + 1];
+                if (e - s > 1) {
+                    std::sort(edges.data() + s, edges.data() + e, [](const Edge& a, const Edge& b) {
+                        return (a.to != b.to) ? (a.to < b.to) : (a.w < b.w);
+                    });
+                    if (!local_dups) {
+                        for (uint32_t i = s + 1; i < e; ++i) {
+                            if (edges[i].to == edges[i - 1].to) {
+                                local_dups = true;
+                                break;
+                            }
                         }
                     }
                 }
-            });
+            }
         }
-        for (auto& w : workers) w.join();
-    }
+        if (local_dups) has_dups.store(true, std::memory_order_relaxed);
+    });
 
-    // Deduplicate parallel edges sequentially in-place
-    uint32_t compacted = 0;
-    for (uint32_t u = 0; u < n; ++u) {
-        uint32_t s = head[u], e = head[u + 1];
-        uint32_t u_start = compacted;
-        for (uint32_t i = s; i < e; ++i) {
-            if (compacted > u_start && edges[i].to == edges[compacted - 1].to) continue;
-            edges[compacted++] = edges[i];
+    // Only pay for sequential compaction if parallel edges actually exist
+    if (has_dups.load(std::memory_order_relaxed)) {
+        uint32_t compacted = 0;
+        for (uint32_t u = 0; u < n; ++u) {
+            uint32_t s = head[u], e = head[u + 1], u_start = compacted;
+            for (uint32_t i = s; i < e; ++i) {
+                if (compacted > u_start && edges[i].to == edges[compacted - 1].to) continue;
+                edges[compacted++] = edges[i];
+            }
+            head[u] = u_start;
         }
-        head[u] = u_start;
+        head[n] = compacted;
     }
-    head[n] = compacted;
 
     // Parse queries
-    FastMmap qmap(queries_path.c_str());
-    if (!qmap.data) return 1;
+    FastMmap qmap((std::string(data_dir) + "/queries.txt").c_str());
+    if (!qmap.data || qmap.data == MAP_FAILED) return 1;
     std::vector<Query> queries;
     queries.reserve(4096);
     p = qmap.data;
     const char* q_end = qmap.data + qmap.size;
-    uint32_t qid = 0;
-    while (p < q_end) {
+    for (uint32_t qid = 0; p < q_end;) {
         while (p < q_end && *p < '0') p++;
         if (p >= q_end) break;
-        uint32_t s = 0;
+        uint32_t s = 0, t = 0;
         while (p < q_end && *p >= '0') s = s * 10 + (*p++ - '0');
         while (p < q_end && *p < '0') p++;
-        uint32_t t = 0;
         while (p < q_end && *p >= '0') t = t * 10 + (*p++ - '0');
         queries.push_back({s, t, qid++});
     }
     qmap.release();
 
-    size_t num_q = queries.size();
-    std::vector<int64_t> answers(num_q, -1);
-
-    // Filter trivial queries & group remaining queries by source vertex `s`
+    std::vector<int64_t> answers(queries.size(), -1);
     std::vector<Query> active_q;
-    active_q.reserve(num_q);
+    active_q.reserve(queries.size());
     for (const auto& q : queries) {
         if (q.s == q.t) {
             answers[q.id] = 0;
-        } else if (head[q.s] == head[q.s + 1] || !(has_in_bitset[q.t >> 6] & (1ULL << (q.t & 63)))) {
-            answers[q.id] = -1;
-        } else {
+        } else if (q.s < n && q.t < n && head[q.s] < head[q.s + 1] &&
+                   (has_in_bitset[q.t >> 6] & (1ULL << (q.t & 63)))) {
             active_q.push_back(q);
         }
     }
+    queries = std::vector<Query>(); // Free raw queries vector before allocating Dijkstra buffers
 
     std::sort(active_q.begin(), active_q.end(), [](const Query& a, const Query& b) {
         return (a.s != b.s) ? (a.s < b.s) : (a.t < b.t);
     });
 
-    struct SourceGroup {
-        uint32_t s;
-        uint32_t begin_idx;
-        uint32_t end_idx;
-    };
     std::vector<SourceGroup> groups;
-    for (uint32_t i = 0; i < active_q.size();) {
+    for (uint32_t i = 0, sz = active_q.size(); i < sz;) {
         uint32_t j = i + 1;
-        while (j < active_q.size() && active_q[j].s == active_q[i].s) j++;
+        while (j < sz && active_q[j].s == active_q[i].s) j++;
         groups.push_back({active_q[i].s, i, j});
         i = j;
     }
+    // Schedule heaviest multi-target source groups first to avoid tail stragglers
+    std::sort(groups.begin(), groups.end(), [](const SourceGroup& a, const SourceGroup& b) {
+        return (a.end_idx - a.begin_idx) > (b.end_idx - b.begin_idx);
+    });
 
-    // Parallel Multi-Target Dijkstra Execution
+    uint32_t q_threads = std::max<uint32_t>(1, std::min<uint32_t>(NUM_THREADS, groups.size()));
     std::atomic<size_t> next_group{0};
-    uint32_t q_threads = std::min<uint32_t>(NUM_THREADS, groups.size());
-    if (q_threads == 0) q_threads = 1;
 
-    {
-        std::vector<std::thread> workers;
-        for (uint32_t t = 0; t < q_threads; ++t) {
-            workers.emplace_back([&]() {
-                std::vector<uint64_t> dist(n, UINT64_MAX);
-                std::vector<uint8_t> is_target(n, 0);
-                std::vector<uint32_t> dirty;
-                dirty.reserve(65536);
+    // Generic Dijkstra runner: uses 32-bit distances when safe (halving RAM & doubling cache density)
+    auto execute_dijkstra = [&](auto inf_val) {
+        using DistT = decltype(inf_val);
+        const uint32_t dirty_limit = (n >> 4) + 1024;
 
-                MinHeap4 heap;
-                heap.data.reserve(65536);
+        run_parallel(q_threads, [&](uint32_t) {
+            std::vector<DistT> dist(n, inf_val);
+            std::vector<uint64_t> is_target((n + 63) >> 6, 0);
+            std::vector<uint32_t> dirty;
+            dirty.reserve(dirty_limit);
+            MinHeap4<DistT> heap;
+            heap.data.reserve(32768);
 
-                while (true) {
-                    size_t gi = next_group.fetch_add(1, std::memory_order_relaxed);
-                    if (gi >= groups.size()) break;
+            while (true) {
+                size_t gi = next_group.fetch_add(1, std::memory_order_relaxed);
+                if (gi >= groups.size()) break;
 
-                    const auto& grp = groups[gi];
-                    uint32_t s = grp.s;
-                    uint32_t remaining = 0;
+                const auto& grp = groups[gi];
+                uint32_t s = grp.s, remaining = 0, single_t = active_q[grp.begin_idx].t;
+                DistT bound = inf_val;
 
+                if (single_t == active_q[grp.end_idx - 1].t) {
+                    remaining = 1;
+                } else {
                     for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
-                        uint32_t target = active_q[k].t;
-                        if (!is_target[target]) {
-                            is_target[target] = 1;
+                        uint32_t tk = active_q[k].t;
+                        uint64_t mask = 1ULL << (tk & 63);
+                        if (!(is_target[tk >> 6] & mask)) {
+                            is_target[tk >> 6] |= mask;
                             remaining++;
                         }
                     }
+                }
 
-                    heap.clear();
-                    dirty.clear();
+                heap.data.clear();
+                dirty.clear();
+                bool dirty_overflow = false;
 
-                    dist[s] = 0;
-                    dirty.push_back(s);
-                    heap.push(0, s);
+                dist[s] = 0;
+                dirty.push_back(s);
+                heap.push(0, s);
 
-                    while (!heap.empty()) {
-                        HeapNode top = heap.pop();
-                        uint64_t d = top.dist;
-                        uint32_t u = top.u;
+                while (!heap.data.empty()) {
+                    auto top = heap.pop();
+                    DistT d = top.dist;
+                    uint32_t u = top.u;
 
-                        if (d > dist[u]) continue;
+                    if (d >= bound) break;
+                    if (d > dist[u]) continue;
 
-                        if (is_target[u]) {
-                            is_target[u] = 0;
-                            if (--remaining == 0) break;
-                        }
-
-                        uint32_t e_start = head[u];
-                        uint32_t e_end = head[u + 1];
-                        for (uint32_t e = e_start; e < e_end; ++e) {
-                            uint32_t v = edges[e].to;
-                            uint64_t nd = d + edges[e].w;
-                            if (nd < dist[v]) {
-                                if (dist[v] == UINT64_MAX) dirty.push_back(v);
-                                dist[v] = nd;
-                                heap.push(nd, v);
+                    if (remaining > 1) {
+                        uint64_t mask = 1ULL << (u & 63);
+                        if (is_target[u >> 6] & mask) {
+                            is_target[u >> 6] &= ~mask;
+                            if (--remaining == 1) {
+                                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                                    uint32_t tk = active_q[k].t;
+                                    if (is_target[tk >> 6] & (1ULL << (tk & 63))) {
+                                        single_t = tk;
+                                        is_target[tk >> 6] &= ~(1ULL << (tk & 63));
+                                        bound = dist[tk];
+                                        break;
+                                    }
+                                }
+                                if (d >= bound) break;
                             }
                         }
                     }
 
-                    for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
-                        uint32_t target = active_q[k].t;
-                        is_target[target] = 0;
-                        uint64_t d = dist[target];
-                        answers[active_q[k].id] = (d == UINT64_MAX) ? -1 : static_cast<int64_t>(d);
-                    }
-
-                    // Fast sparse reset of touched vertices only
-                    for (uint32_t u : dirty) {
-                        dist[u] = UINT64_MAX;
+                    uint32_t e_start = head[u], e_end = head[u + 1];
+                    for (uint32_t e = e_start; e < e_end; ++e) {
+                        if (e + 4 < e_end) __builtin_prefetch(&dist[edges[e + 4].to], 0, 1);
+                        uint32_t v = edges[e].to;
+                        DistT nd = d + static_cast<DistT>(edges[e].w);
+                        if (nd < dist[v] && nd < bound) {
+                            if (dist[v] == inf_val && !dirty_overflow) {
+                                if (dirty.size() < dirty_limit) dirty.push_back(v);
+                                else dirty_overflow = true;
+                            }
+                            dist[v] = nd;
+                            if (remaining == 1 && v == single_t) bound = nd;
+                            else heap.push(nd, v);
+                        }
                     }
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+
+                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                    uint32_t tk = active_q[k].t;
+                    if (remaining > 1) is_target[tk >> 6] = 0;
+                    DistT d = dist[tk];
+                    answers[active_q[k].id] = (d == inf_val) ? -1 : static_cast<int64_t>(d);
+                }
+
+                if (dirty_overflow) {
+                    std::fill(dist.begin(), dist.end(), inf_val);
+                } else {
+                    for (uint32_t u : dirty) dist[u] = inf_val;
+                }
+            }
+        });
+    };
+
+    if (static_cast<uint64_t>(global_max_w.load()) * n < UINT32_MAX) {
+        execute_dijkstra(UINT32_MAX);
+    } else {
+        execute_dijkstra(UINT64_MAX);
     }
 
-    // Fast integer-to-ASCII output formatting
     std::string out_buf;
-    out_buf.reserve(num_q * 12);
+    out_buf.reserve(answers.size() * 12);
     char tmp[24];
     for (int64_t ans : answers) {
         if (ans < 0) {
@@ -435,16 +451,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int out_fd = open((std::string(out_dir) + "/distances.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out_fd >= 0) {
-        size_t written = 0;
-        while (written < out_buf.size()) {
+        for (size_t written = 0; written < out_buf.size();) {
             ssize_t w = write(out_fd, out_buf.data() + written, out_buf.size() - written);
             if (w <= 0) break;
             written += w;
         }
         close(out_fd);
     }
-
     return 0;
 }

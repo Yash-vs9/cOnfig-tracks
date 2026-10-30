@@ -7,6 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline C++20 with forward CSR, 4-ary min-heap, and epoch visited tracking | local-baseline | 12.20 | 169.0 | 26.6 |
 | 2 | Parallel 12-thread CSR build + source grouping + multi-target Dijkstra with sparse reset + zero RSS overlap | local-step2 | 4.84 | 240.8 | 35.1 |
+| 3 | Sliding window `drop_pages`, in-place `head` reuse (-7MB), early bound-pruning & prefetching | local-step3 | 4.83 | 216.6 | 35.6 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -16,3 +17,8 @@ Every step from the reference to your final version, each with the live-board ru
   3. *Multi-Target Source Grouping:* Sorted active queries by source vertex $s$, executing a single Dijkstra tree per source group while tracking multiple target terminals simultaneously.
   4. *Sparse Dirty Reset:* Replaced full distance array scans with a touched-vertex `dirty` list, restoring only explored nodes to `UINT64_MAX`.
   Total container runtime on `d-full` dropped to **4.84 s** ($15.0\times$ faster than reference), bringing score to $K = 5.03$ and **35.1 Speed Points**.
+- **Step 3:** Further memory optimization and search pruning:
+  1. *Sliding Page Release:* Dropped already-parsed 2MB page windows during Pass 1 and Pass 2 via `drop_pages(MADV_DONTNEED)`, keeping page table RSS low.
+  2. *In-place Head Vector Reuse:* Eliminated the `cur_pos` vector during Pass 2 by writing directly to `head[]` and restoring offsets via `memmove`, saving 7 MB anonymous RAM.
+  3. *Bound-Pruned Dijkstra & Cache Prefetching:* Maintained dynamic upper bound distances to break early once the target is bounded, added L1 cache prefetching for neighbor nodes, and ordered multi-target source groups from heaviest to lightest to eliminate stragglers.
+  Peak RSS dropped to **216.6 MB** while maintaining **4.83 s** execution time, pushing score to $K = 5.15$ and **35.6 Speed Points**.
