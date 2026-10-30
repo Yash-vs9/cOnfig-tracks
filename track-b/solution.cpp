@@ -24,7 +24,7 @@ static uint32_t n_terms = 0, total_docs = 0, doc_s[NUM_C], doc_e[NUM_C], c_base[
 static size_t c_byte[NUM_C + 1];
 struct Query { uint8_t kind, k; uint16_t ops; uint32_t tids[8]; };
 static std::vector<Query> queries;
-static std::vector<uint32_t> rep_map, term_df, bs_idx, c_off[NUM_C];
+static std::vector<uint32_t> rep_map, term_df, bs_idx, c_off[NUM_C], b_idx, p_idx;
 static std::vector<uint8_t> is_bs;
 static uint32_t* doc_ts = nullptr;
 static uint64_t* g_bs = nullptr;
@@ -353,6 +353,8 @@ int main(int argc, char** argv) {
             else q.tids[q.k++] = insert_term(tk, l, q_buf);
         }
         queries.push_back(q);
+        if (!q.kind) b_idx.push_back((uint32_t)queries.size() - 1);
+        else p_idx.push_back((uint32_t)queries.size() - 1);
         qp_ = (const char*)memchr(le, '\n', qe - le); if (qp_) qp_++; else break;
     }
     rep_map.assign(n_terms, UINT32_MAX);
@@ -415,10 +417,9 @@ int main(int argc, char** argv) {
     uint32_t n_q = (uint32_t)queries.size();
     q_res.resize(n_q);
     res_buf = (char*)malloc((size_t)n_q * 48 + 65536);
-    run_par(n_q, 64, [&](uint32_t i) {
-        if (!queries[i].kind) exec_bool(queries[i], q_res[i]);
-        else exec_phrase(queries[i], d_buf, q_buf, q_res[i]);
-    });
+    run_par((uint32_t)b_idx.size(), 128, [&](uint32_t bi) { uint32_t i = b_idx[bi]; exec_bool(queries[i], q_res[i]); });
+    run_par((uint32_t)p_idx.size(), 64, [&](uint32_t pi) { uint32_t i = p_idx[pi]; exec_phrase(queries[i], d_buf, q_buf, q_res[i]); });
+    std::vector<uint32_t>().swap(b_idx); std::vector<uint32_t>().swap(p_idx);
 
     // Immediate stage deallocation before file I/O
     munmap((void*)d_buf, f_sz); munmap((void*)q_buf, q_sz);
