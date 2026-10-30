@@ -1,12 +1,13 @@
 #include <bits/stdc++.h>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <omp.h>
 #include <sys/mman.h>
 
 // High-speed decimal formatting directly into the pre-allocated output buffer
 #define P(x) (o = std::to_chars(o, o + 24, x).ptr, *o++ = ' ')
-// 64-bit FNV-1a prime multiply step for on-the-fly unescaped name hashing
-#define H(c) (nh = (nh ^ (uint8_t)(c)) * 1099511628211ULL)
+// Hardware CRC32 single-cycle instruction for on-the-fly unescaped name hashing
+#define H(c) (nh = __builtin_ia32_crc32qi(nh, (uint8_t)(c)))
 // Fast branchless quote unescaping: consumes "" pairs as 1 literal byte
 #define C (*p == '"' ? (p += 2, '"') : *p++)
 
@@ -43,6 +44,17 @@ static inline int64_t gi(const char *&p, int64_t x = 0) {
   return ++p, x;
 }
 
+// SIMD AVX2 vectorized quote counting for sub-millisecond chunk parity scanning
+static inline size_t cq(const char *p, const char *end) {
+  __m256i t = _mm256_set1_epi8('"');
+  size_t c = 0, n = (end - p) & ~31;
+  for (size_t i = 0; i < n; i += 32)
+    c += __builtin_popcount(_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i)), t)));
+  for (size_t i = n; i < size_t(end - p); ++i) c += (p[i] == '"');
+  return c;
+}
+
 int main(int c, char **v) {
   // Stage 1: Zero-copy mmap of regions and records files over pre-warmed OS cache
   int r = open(c > 1 ? v[1] : "/data/regions.csv", 0),
@@ -64,10 +76,10 @@ int main(int c, char **v) {
 #pragma omp parallel num_threads(12)
   {
     int tid = omp_get_thread_num();
-    for (int sh = 0; sh < 12; ++sh) B[tid][sh].reserve(26000);
+    for (int sh = 0; sh < 12; ++sh) B[tid][sh].reserve(24000);
 
     size_t s0 = bo + (sz - bo) * tid / 12, s1 = bo + (sz - bo) * (tid + 1) / 12;
-    qc[tid] = std::count(base + s0, base + s1, '"');
+    qc[tid] = cq(base + s0, base + s1);
 #pragma omp barrier
 #pragma omp single
     for (int t = (cs[0] = bo, cs[12] = sz, 0); t < 12; ++t)
@@ -78,14 +90,14 @@ int main(int c, char **v) {
     tid ? cs[tid] = p0 < base + sz ? p0 - base + 1 : sz : 0;
 #pragma omp barrier
 
-    // Stage 3: Lock-free streaming CSV parser with unrolled fast name & note scanning
+    // Stage 3: Lock-free streaming CSV parser with hardware CRC32 name hashing
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     while (p < end) {
       p += ((uint8_t)*p == 0xEF ? 3 : 0); // Strip optional mid-file UTF-8 BOM
       int64_t id = gi(p), nb = 0, ntb = 0, cents = 0;
-      uint64_t nh = 14695981039346656037ULL;
+      uint32_t nh = 0xFFFFFFFF;
 
-      // Fast unrolled name scanning
+      // Fast unrolled name scanning with hardware CRC32
       if (*p == '"') {
         ++p;
         while (*p != '"' || p[1] == '"') {
@@ -128,19 +140,20 @@ int main(int c, char **v) {
         ++p;
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
-      uint64_t h = nh ^ (nh >> 32) ^ (nb * 0x9e3779b97f4a7c15ULL);
+      uint64_t h = (uint64_t)nh | ((uint64_t)nb << 32);
       B[tid][cid % 12].push_back((uint64_t)cid << 48 | (h & 0xFFFFFFFFFFFFULL));
     }
 
 #pragma omp barrier
     // Stage 4: Deduplicate distinct names per country shard with immediate buffer free
     V s;
-    s.reserve(300000);
+    s.reserve(280000);
     for (auto &b : B)
       s.insert(s.end(), b[tid].begin(), b[tid].end()), V().swap(b[tid]);
     std::sort(s.begin(), s.end());
     for (uint64_t x : std::span(s.begin(), std::unique(s.begin(), s.end())))
       G[x >> 48].dn++;
+    V().swap(s);
   }
 
   // Cross-thread accumulation of local aggregates
