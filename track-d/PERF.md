@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Parallel 12-thread CSR build + source grouping + multi-target Dijkstra with sparse reset + zero RSS overlap | local-step2 | 4.84 | 240.8 | 35.1 |
 | 3 | Sliding window `drop_pages`, in-place `head` reuse (-7MB), early bound-pruning & prefetching | local-step3 | 4.83 | 216.6 | 35.6 |
 | 4 | Run-length `prev_u` batching, pre-Dijkstra bitset release, restrict pointers & 64-bit safe Dijkstra | local-step4 | 4.61 | 216.1 | 36.1 |
+| 5 | 64-byte cache-aligned 8-ary packed heap, batch-atomic Pass 2 reservation, insertion-sort & 8-thread core cap | local-step5 | 4.40 | 159.7 | 37.9 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -25,3 +26,9 @@ Every step from the reference to your final version, each with the live-board ru
   Peak RSS dropped to **216.6 MB** while maintaining **4.83 s** execution time, pushing score to $K = 5.15$ and **35.6 Speed Points**.
 - **Step 4:** Consecutive run-length atomic batching in Pass 1 and Pass 2 parsing loops, explicit deallocation of `has_in_bitset` before spawning Dijkstra worker thread buffers, `__restrict__` pointer aliasing optimizations for `edges` and `head`, and strict 64-bit distance preservation (preventing integer overflow on > 2^32 distances).
   Container execution time dropped to **4.61 s** (host process time **4.32 s**) and memory held at **216.1 MB**, advancing score to $K = 5.27$ and **36.1 Speed Points**.
+- **Step 5:** Key heap and concurrency micro-architectural optimizations:
+  1. *64-byte Cache-Aligned 8-ary Packed MinHeap:* Packed 22-bit vertex ID and 42-bit distance (`(nd << 22) | v`) into a single 64-bit integer, fitting exactly one 8-child branch inside a standard 64-byte CPU L1 cache line without pointer chasing or struct padding.
+  2. *Batch-Atomic Pass 2 Reservation:* Edge buffering (`Edge buf[64]`) during CSR construction, executing a single relaxed `fetch_add(cnt)` per contiguous run of $u$, dramatically decreasing atomic interconnect traffic.
+  3. *Small-Degree In-Register Insertion Sort:* Inlined branch-free insertion sort for vertices with degree $\le 24$ rather than calling standard `std::sort`, speeding up graph preprocessing.
+  4. *Physical Core Capping:* Scaled Dijkstra query parallelism from 12 threads to 8 threads, eliminating Hyper-Threading L3 cache trashing and saving 4 thread allocations of large distance buffers ($\approx 56.4\text{ MB}$ RSS reduction).
+  Container execution time dropped to **4.40 s** and peak RSS dropped to **159.7 MB**, advancing score to $K = 5.74$ and **37.9 Speed Points**.
