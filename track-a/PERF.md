@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | C++23 zero-copy mmap, 12-thread two-stage lock-free sharded aggregation | local | 0.08 | 75 | 100 |
+| 1 | C++23 zero-copy mmap, 12-thread two-stage lock-free sharded aggregation | run-f4217bdda361 | 0.141 | 92 | 61.72 |
+| 2 | Packed 12-byte record alignment, pre-reserved non-reallocating buckets, immediate swap deallocation | | | | |

@@ -10,14 +10,17 @@
 #define V(x) std::pair(std::string_view(x.hr, 13), std::string_view(x.ep, x.n))
 #define O(i, f, m) open(c > i ? v[i] : f, m, 438)
 #define M(g) (g.n != r.n || memcmp(g.hr, hr, 13) || memcmp(g.ep, ep, r.n))
-// Overlapping 8-byte hardware CRC32C hour hash covering 13-byte ISO timestamp
-// prefix
+// Overlapping 8-byte hardware CRC32C hour hash covering 13-byte ISO timestamp prefix
 #define H(p) __builtin_ia32_crc32di(*(size_t *)(p), *(size_t *)((p) + 5))
 
+#pragma pack(push, 1)
 struct Rec {
-  uint32_t h, p, l;
+  uint32_t p, l;
+  uint16_t h;
   uint8_t o, n, e;
 };
+#pragma pack(pop)
+
 struct Group {
   uint32_t off, stats[6], n;
   const char *hr, *ep;
@@ -34,11 +37,11 @@ int main(int c, char **v) {
 #pragma omp parallel num_threads(12)
   {
     size_t t = omp_get_thread_num(), s = t * sz / 12, e = (t + 1) * sz / 12;
+    for (int sh = 0; sh < 12; ++sh) shard_buf[t][sh].reserve(26000);
     W(s && s < sz && base[s - 1] != '\n')++ s;
     W(e && e < sz && base[e - 1] != '\n')++ e;
 
-    // Stage 2: Backward latency/status parsing and hardware CRC32C endpoint
-    // hashing
+    // Stage 2: Backward latency/status parsing and hardware CRC32C endpoint hashing
     for (const char *p = base + s, *end = base + e, *nl; p < end; p = nl + 1) {
       nl = (char *)memchr(p, '\n', end - p);
       const char *ep = (char *)memchr(p + 31, ' ', 8) + 1, *cur = nl - 1;
@@ -46,28 +49,28 @@ int main(int c, char **v) {
       W(*cur != ' ') lat += (*cur-- - '0') * m, m *= 10;
       uint8_t o = ep - p, n = cur - 4 - ep, err = cur[-3] == '5';
       W(ep < cur - 4) h = __builtin_ia32_crc32qi(h, *ep++);
-      shard_buf[t][h % 12].push_back({h, uint32_t(p - base), lat, o, n, err});
+      shard_buf[t][h % 12].push_back({uint32_t(p - base), lat, uint16_t(h), o, n, err});
     }
 
 #pragma omp barrier
-    // Stage 3: Two-stage lock-free flat CSR latency aggregation and percentile
-    // calculation
+    // Stage 3: Two-stage lock-free flat CSR latency aggregation and percentile calculation
     uint32_t ht[65536], tot = (memset(ht, -1, sizeof(ht)), 0);
     auto &groups = shard_out[t];
+    groups.reserve(16384);
     F(buf, shard_buf)
     F(r, buf[t]) {
       const char *hr = base + r.p, *ep = hr + r.o;
       uint32_t s = r.h & 65535, g;
       W(~(g = ht[s]) && M(groups[g])) s = (s + 1) & 65535;
-      ~g ? (groups[g].stats[4] += r.e, ++groups[g].stats[0], r.h = g)
+      ~g ? (groups[g].stats[4] += r.e, ++groups[g].stats[0], r.p = g)
          : (groups.push_back({0, {1, 0, 0, 0, r.e}, r.n, hr, ep}),
-            r.h = ht[s] = groups.size() - 1);
+            r.p = ht[s] = groups.size() - 1);
     }
 
     F(g, groups) g.off = tot, tot += g.stats[0], g.stats[0] = 0;
     std::vector<uint32_t> lats(tot);
     F(buf, shard_buf) {
-      F(r, buf[t]) lats[groups[r.h].off + groups[r.h].stats[0]++] = r.l;
+      F(r, buf[t]) lats[groups[r.p].off + groups[r.p].stats[0]++] = r.l;
       std::vector<Rec>().swap(buf[t]);
     }
     F(g, groups) {
