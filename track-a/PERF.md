@@ -6,4 +6,5 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | C++23 zero-copy mmap, 12-thread two-stage lock-free sharded aggregation | run-f4217bdda361 | 0.141 | 92 | 61.72 |
-| 2 | Packed 12-byte record alignment, pre-reserved non-reallocating buckets, immediate swap deallocation | | | | |
+| 2 | Packed 12-byte record alignment, pre-reserved non-reallocating buckets, immediate swap deallocation | run-6f38cca425c8 | 0.141 | 59 | 63.10 |
+| 3 | Static BSS contiguous latency slab, 64-bit hardware CRC32 endpoint hashing | | | | |
