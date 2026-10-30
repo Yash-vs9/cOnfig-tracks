@@ -1,6 +1,6 @@
 /**
  * Speed Demon 2026 - Track D (Traverse)
- * Batch-Atomic CSR + 64-Byte Cache-Aligned 8-Ary Packed Heap + Bound-Pruned Dijkstra
+ * Batch-Atomic CSR + Dataset Bucketing + 1-Bit Sink Filter + 8-Ary Packed Heap
  */
 
 #include <fcntl.h>
@@ -27,7 +27,7 @@ struct SourceGroup {
     uint32_t s, begin_idx, end_idx;
 };
 
-// 8-ary MinHeap of packed 64-bit integers: 8 children = exactly one 64-byte L1 cache line
+// 8-ary MinHeap of packed 64-bit words: 8 children = 64 bytes (1 L1 cache line)
 struct FastHeap8 {
     std::vector<uint64_t> data;
 
@@ -92,6 +92,10 @@ struct FastMmap {
 
 template <typename F>
 void run_parallel(uint32_t nt, F&& fn) {
+    if (nt <= 1) {
+        fn(0);
+        return;
+    }
     std::vector<std::thread> pool;
     pool.reserve(nt - 1);
     for (uint32_t t = 1; t < nt; ++t) pool.emplace_back(fn, t);
@@ -121,8 +125,12 @@ int main(int argc, char** argv) {
 
     const char* edge_start = p;
     size_t edge_bytes = g_end - edge_start;
-    constexpr uint32_t NUM_THREADS = 12;
-    uint32_t nt = (m < 50000) ? 1 : NUM_THREADS;
+
+    // Dataset scale bucketing: Tiny (<50k edges), Sample (50k-2M edges), Full (>=2M edges)
+    const bool is_tiny = (m < 50000);
+    const bool is_sample = (!is_tiny && m < 2000000);
+    const uint32_t nt = is_tiny ? 1 : (is_sample ? 6 : 12);
+    const uint32_t dijkstra_workers = is_tiny ? 1 : (is_sample ? 6 : 8);
 
     std::vector<const char*> chunk_bounds(nt + 1, g_end);
     chunk_bounds[0] = edge_start;
@@ -135,7 +143,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> head(n + 1, 0);
     std::vector<uint64_t> has_in_bitset((n + 63) >> 6, 0);
 
-    // Pass 1: Parallel degree counting with consecutive-u run batching
+    // Pass 1: Parallel degree counting with consecutive-u batching
     run_parallel(nt, [&](uint32_t t) {
         const char *cur = chunk_bounds[t], *end = chunk_bounds[t + 1];
         auto* deg_ptr = reinterpret_cast<std::atomic<uint32_t>*>(head.data());
@@ -218,6 +226,7 @@ int main(int argc, char** argv) {
         }
     });
     gmap.release();
+    chunk_bounds = std::vector<const char*>();
 
     if (n > 0) memmove(&head[1], &head[0], n * sizeof(uint32_t));
     head[0] = 0;
@@ -227,10 +236,11 @@ int main(int argc, char** argv) {
     std::atomic<bool> has_dups{false};
     run_parallel(nt, [&](uint32_t) {
         bool local_dups = false;
+        const uint32_t csz = is_tiny ? 256 : 8192;
         while (true) {
-            uint32_t u_base = next_chunk.fetch_add(8192, std::memory_order_relaxed);
+            uint32_t u_base = next_chunk.fetch_add(csz, std::memory_order_relaxed);
             if (u_base >= n) break;
-            uint32_t u_end = std::min(n, u_base + 8192);
+            uint32_t u_end = std::min(n, u_base + csz);
             for (uint32_t u = u_base; u < u_end; ++u) {
                 uint32_t s = head[u], e = head[u + 1], len = e - s;
                 if (len <= 1) continue;
@@ -275,6 +285,16 @@ int main(int argc, char** argv) {
         }
         head[n] = compacted;
     }
+
+    // Build 1-bit fast filter of vertices with out-degree > 0
+    uint32_t num_sinks = 0;
+    std::vector<uint64_t> has_out_bitset((n + 63) >> 6, 0);
+    for (uint32_t u = 0; u < n; ++u) {
+        if (head[u] < head[u + 1]) has_out_bitset[u >> 6] |= (1ULL << (u & 63));
+        else num_sinks++;
+    }
+    // Enable sink filtering if sinks represent a non-negligible fraction of the graph (>= 1%)
+    const bool use_sink_filter = (num_sinks * 100 >= n);
 
     // Parse queries
     FastMmap qmap((std::string(data_dir) + "/queries.txt").c_str());
@@ -323,15 +343,13 @@ int main(int argc, char** argv) {
         return (a.end_idx - a.begin_idx) > (b.end_idx - b.begin_idx);
     });
 
-    // 8 Dijkstra workers across 6 P-cores saves 56 MB of Peak RSS while avoiding SMT L3 thrashing
-    constexpr uint32_t DIJKSTRA_THREADS = 8;
-    uint32_t q_threads = std::max<uint32_t>(1, std::min<uint32_t>(DIJKSTRA_THREADS, groups.size()));
+    uint32_t q_threads = std::max<uint32_t>(1, std::min<uint32_t>(dijkstra_workers, groups.size()));
     std::atomic<size_t> next_group{0};
-    const uint32_t dirty_limit = (n >> 4) + 1024;
+    const uint32_t dirty_limit = is_tiny ? n : ((n >> 4) + 1024);
     const Edge* __restrict__ edge_ptr = edges.data();
     const uint32_t* __restrict__ head_ptr = head.data();
+    const uint64_t* __restrict__ out_bit_ptr = has_out_bitset.data();
 
-    // 22-bit vertex ID + 42-bit distance (supports distances up to 4.39 trillion in a single 64-bit word)
     constexpr uint32_t V_BITS = 22;
     constexpr uint64_t V_MASK = (1ULL << V_BITS) - 1;
 
@@ -342,28 +360,16 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> dirty;
         dirty.reserve(dirty_limit);
         FastHeap8 heap;
-        heap.data.reserve(32768);
+        heap.data.reserve(is_tiny ? 512 : 32768);
 
         while (true) {
             size_t gi = next_group.fetch_add(1, std::memory_order_relaxed);
             if (gi >= groups.size()) break;
 
             const auto& grp = groups[gi];
-            uint32_t s = grp.s, remaining = 0, single_t = active_q[grp.begin_idx].t;
-            uint64_t bound = UINT64_MAX;
-
-            if (single_t == active_q[grp.end_idx - 1].t) {
-                remaining = 1;
-            } else {
-                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
-                    uint32_t tk = active_q[k].t;
-                    uint64_t mask = 1ULL << (tk & 63);
-                    if (!(is_target[tk >> 6] & mask)) {
-                        is_target[tk >> 6] |= mask;
-                        remaining++;
-                    }
-                }
-            }
+            uint32_t s = grp.s;
+            uint32_t single_t = active_q[grp.begin_idx].t;
+            const bool is_single = (single_t == active_q[grp.end_idx - 1].t);
 
             heap.data.clear();
             dirty.clear();
@@ -373,55 +379,106 @@ int main(int argc, char** argv) {
             dirty.push_back(s);
             heap.push(s);
 
-            while (!heap.data.empty()) {
-                uint64_t top = heap.pop();
-                uint64_t d = top >> V_BITS;
-                uint32_t u = static_cast<uint32_t>(top & V_MASK);
+            if (is_single) {
+                // Dedicated Fast-Path for Single-Target Queries (zero target bitset pollution)
+                uint64_t bound = UINT64_MAX;
+                while (!heap.data.empty()) {
+                    uint64_t top = heap.pop();
+                    uint64_t d = top >> V_BITS;
+                    uint32_t u = static_cast<uint32_t>(top & V_MASK);
 
-                if (d >= bound) break;
-                if (d > d_ptr[u]) continue;
+                    if (d >= bound) break;
+                    if (d > d_ptr[u]) continue;
 
-                if (remaining > 1) {
-                    uint64_t mask = 1ULL << (u & 63);
-                    if (is_target[u >> 6] & mask) {
-                        is_target[u >> 6] &= ~mask;
-                        if (--remaining == 1) {
-                            for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
-                                uint32_t tk = active_q[k].t;
-                                if (is_target[tk >> 6] & (1ULL << (tk & 63))) {
-                                    single_t = tk;
-                                    is_target[tk >> 6] &= ~(1ULL << (tk & 63));
-                                    bound = d_ptr[tk];
-                                    break;
-                                }
+                    uint32_t e_start = head_ptr[u], e_end = head_ptr[u + 1];
+                    for (uint32_t e = e_start; e < e_end; ++e) {
+                        if (e + 4 < e_end) __builtin_prefetch(&d_ptr[edge_ptr[e + 4].to], 0, 1);
+                        uint32_t v = edge_ptr[e].to;
+                        uint64_t nd = d + edge_ptr[e].w;
+                        if (nd < d_ptr[v] && nd < bound) {
+                            if (d_ptr[v] == UINT64_MAX && !dirty_overflow) {
+                                if (dirty.size() < dirty_limit) dirty.push_back(v);
+                                else dirty_overflow = true;
                             }
-                            if (d >= bound) break;
+                            d_ptr[v] = nd;
+                            if (v == single_t) {
+                                bound = nd;
+                            } else if (!use_sink_filter || (out_bit_ptr[v >> 6] & (1ULL << (v & 63)))) {
+                                heap.push((nd << V_BITS) | v);
+                            }
+                        }
+                    }
+                }
+                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                    uint64_t d = d_ptr[single_t];
+                    answers[active_q[k].id] = (d == UINT64_MAX) ? -1 : static_cast<int64_t>(d);
+                }
+            } else {
+                // Multi-Target Group Path
+                uint32_t remaining = 0;
+                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                    uint32_t tk = active_q[k].t;
+                    uint64_t mask = 1ULL << (tk & 63);
+                    if (!(is_target[tk >> 6] & mask)) {
+                        is_target[tk >> 6] |= mask;
+                        remaining++;
+                    }
+                }
+
+                uint64_t bound = UINT64_MAX;
+                while (!heap.data.empty()) {
+                    uint64_t top = heap.pop();
+                    uint64_t d = top >> V_BITS;
+                    uint32_t u = static_cast<uint32_t>(top & V_MASK);
+
+                    if (d >= bound) break;
+                    if (d > d_ptr[u]) continue;
+
+                    if (remaining > 1) {
+                        uint64_t mask = 1ULL << (u & 63);
+                        if (is_target[u >> 6] & mask) {
+                            is_target[u >> 6] &= ~mask;
+                            if (--remaining == 1) {
+                                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                                    uint32_t tk = active_q[k].t;
+                                    if (is_target[tk >> 6] & (1ULL << (tk & 63))) {
+                                        single_t = tk;
+                                        is_target[tk >> 6] &= ~(1ULL << (tk & 63));
+                                        bound = d_ptr[tk];
+                                        break;
+                                    }
+                                }
+                                if (d >= bound) break;
+                            }
+                        }
+                    }
+
+                    uint32_t e_start = head_ptr[u], e_end = head_ptr[u + 1];
+                    for (uint32_t e = e_start; e < e_end; ++e) {
+                        if (e + 4 < e_end) __builtin_prefetch(&d_ptr[edge_ptr[e + 4].to], 0, 1);
+                        uint32_t v = edge_ptr[e].to;
+                        uint64_t nd = d + edge_ptr[e].w;
+                        if (nd < d_ptr[v] && nd < bound) {
+                            if (d_ptr[v] == UINT64_MAX && !dirty_overflow) {
+                                if (dirty.size() < dirty_limit) dirty.push_back(v);
+                                else dirty_overflow = true;
+                            }
+                            d_ptr[v] = nd;
+                            if (remaining == 1 && v == single_t) {
+                                bound = nd;
+                            } else if (!use_sink_filter || ((out_bit_ptr[v >> 6] | is_target[v >> 6]) & (1ULL << (v & 63)))) {
+                                heap.push((nd << V_BITS) | v);
+                            }
                         }
                     }
                 }
 
-                uint32_t e_start = head_ptr[u], e_end = head_ptr[u + 1];
-                for (uint32_t e = e_start; e < e_end; ++e) {
-                    if (e + 4 < e_end) __builtin_prefetch(&d_ptr[edge_ptr[e + 4].to], 0, 1);
-                    uint32_t v = edge_ptr[e].to;
-                    uint64_t nd = d + edge_ptr[e].w;
-                    if (nd < d_ptr[v] && nd < bound) {
-                        if (d_ptr[v] == UINT64_MAX && !dirty_overflow) {
-                            if (dirty.size() < dirty_limit) dirty.push_back(v);
-                            else dirty_overflow = true;
-                        }
-                        d_ptr[v] = nd;
-                        if (remaining == 1 && v == single_t) bound = nd;
-                        else heap.push((nd << V_BITS) | v);
-                    }
+                for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
+                    uint32_t tk = active_q[k].t;
+                    if (remaining > 1) is_target[tk >> 6] = 0;
+                    uint64_t d = d_ptr[tk];
+                    answers[active_q[k].id] = (d == UINT64_MAX) ? -1 : static_cast<int64_t>(d);
                 }
-            }
-
-            for (uint32_t k = grp.begin_idx; k < grp.end_idx; ++k) {
-                uint32_t tk = active_q[k].t;
-                if (remaining > 1) is_target[tk >> 6] = 0;
-                uint64_t d = d_ptr[tk];
-                answers[active_q[k].id] = (d == UINT64_MAX) ? -1 : static_cast<int64_t>(d);
             }
 
             if (dirty_overflow) {
