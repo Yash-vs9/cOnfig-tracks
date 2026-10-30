@@ -37,22 +37,20 @@ static void fc(int64_t c) {
 }
 
 // Parses unquoted positive integer from comma-separated input
-static int64_t gi(const char *&p, int64_t x = 0) {
+static inline int64_t gi(const char *&p, int64_t x = 0) {
   while (*p != ',')
     x = x * 10 + (*p++ - '0');
   return ++p, x;
 }
 
 int main(int c, char **v) {
-  // Stage 1: Zero-copy mmap of regions and records files over pre-warmed OS
-  // cache
+  // Stage 1: Zero-copy mmap of regions and records files over pre-warmed OS cache
   int r = open(c > 1 ? v[1] : "/data/regions.csv", 0),
       m = open(c > 2 ? v[2] : "/data/records.csv", 0);
   const char *rb = (char *)mmap(0, rsz = lseek(r, 0, 2), 1, 1, r, 0),
              *base = (char *)mmap(0, sz = lseek(m, 0, 2), 1, 1, m, 0);
 
-  // O(1) BSS direct lookup table for 1M regions (0 = _UNMATCHED, 1..17576 =
-  // AAA..ZZZ)
+  // O(1) BSS direct lookup table for 1M regions (0 = _UNMATCHED, 1..17576 = AAA..ZZZ)
   for (const char *p = (char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
     uint32_t reg = gi(p);
     reg_lut[reg] = p[0] * 676 + p[1] * 26 + p[2] - 45694;
@@ -62,11 +60,12 @@ int main(int c, char **v) {
 
   size_t bo = (char *)memchr(base, '\n', sz) + 1 - base, q = 0;
 
-  // Stage 2: Two-pass parallel quote-parity scan resolves exact record
-  // boundaries across embedded LFs
+  // Stage 2: Two-pass parallel quote-parity scan resolves exact record boundaries across embedded LFs
 #pragma omp parallel num_threads(12)
   {
     int tid = omp_get_thread_num();
+    for (int sh = 0; sh < 12; ++sh) B[tid][sh].reserve(26000);
+
     size_t s0 = bo + (sz - bo) * tid / 12, s1 = bo + (sz - bo) * (tid + 1) / 12;
     qc[tid] = std::count(base + s0, base + s1, '"');
 #pragma omp barrier
@@ -79,27 +78,49 @@ int main(int c, char **v) {
     tid ? cs[tid] = p0 < base + sz ? p0 - base + 1 : sz : 0;
 #pragma omp barrier
 
-    // Stage 3: Lock-free streaming CSV parser with on-the-fly FNV-1a name
-    // hashing and BSS region join
+    // Stage 3: Lock-free streaming CSV parser with unrolled fast name & note scanning
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
-    bool q, neg;
     while (p < end) {
-      p += (uint8_t)*p == 0xEF ? 3 : 0; // Strip optional mid-file UTF-8 BOM
+      p += ((uint8_t)*p == 0xEF ? 3 : 0); // Strip optional mid-file UTF-8 BOM
       int64_t id = gi(p), nb = 0, ntb = 0, cents = 0;
       uint64_t nh = 14695981039346656037ULL;
 
-      // Scan name and note fields handling quotes, commas, and embedded
-      // newlines
-      for (int f = 0; f < 2; ++f) {
-        p += (q = *p == '"');
-        while (q ? *p != '"' || p[1] == '"' : *p != ',')
-          f ? (++ntb, C) : (++nb, H(C));
-        p += 1 + q;
+      // Fast unrolled name scanning
+      if (*p == '"') {
+        ++p;
+        while (*p != '"' || p[1] == '"') {
+          ++nb;
+          H(C);
+        }
+        p += 2;
+      } else {
+        while (*p != ',') {
+          ++nb;
+          H(*p++);
+        }
+        ++p;
       }
+
+      // Fast unrolled note scanning (length counter only)
+      if (*p == '"') {
+        ++p;
+        while (*p != '"' || p[1] == '"') {
+          ++ntb;
+          C;
+        }
+        p += 2;
+      } else {
+        while (*p != ',') {
+          ++ntb;
+          ++p;
+        }
+        ++p;
+      }
+
       uint32_t rid = gi(p), cid = rid < 1000000 ? reg_lut[rid] : 0;
 
       // Exact fixed-point cents parsing without double-precision conversion
-      neg = *p == '-' && ++p;
+      bool neg = (*p == '-' && ++p);
       while (*p != '.')
         cents = cents * 10 + (*p++ - '0');
       cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
@@ -112,9 +133,9 @@ int main(int c, char **v) {
     }
 
 #pragma omp barrier
-    // Stage 4: Deduplicate distinct names per country shard with immediate
-    // buffer free
+    // Stage 4: Deduplicate distinct names per country shard with immediate buffer free
     V s;
+    s.reserve(300000);
     for (auto &b : B)
       s.insert(s.end(), b[tid].begin(), b[tid].end()), V().swap(b[tid]);
     std::sort(s.begin(), s.end());
@@ -128,8 +149,7 @@ int main(int c, char **v) {
       if (t[c].cnt)
         G[c].add(t[c]);
 
-  // Stage 5: Formatted buffered write to /out/aggregates.txt in ascending ASCII
-  // order
+  // Stage 5: Formatted buffered write to /out/aggregates.txt in ascending ASCII order
   for (int cid = 0; cid < 17577; ++cid)
     if (Agg &g = G[cid < 17576 ? cid + 1 : 0]; g.cnt) {
       cid > 17575 ? (memcpy(o, "_UNMATCHED ", 11), o += 11)

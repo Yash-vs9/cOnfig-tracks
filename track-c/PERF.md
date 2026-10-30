@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 20.64 | 367 | 0 |
-| 1 | C++23 zero-copy mmap, quote parity chunking, direct 1M LUT, parallel sharded dedup, immediate vector swap free | local | 0.40 | 45 | 100 |
+| 1 | C++23 zero-copy mmap, quote parity chunking, direct 1M LUT, parallel sharded dedup | run-2dc91c0fb143 | 0.111 | 57 | 60.74 |
+| 2 | Unrolled branchless quote-scanning for name/note fields, pre-reserved exact shard capacities | | | | |
