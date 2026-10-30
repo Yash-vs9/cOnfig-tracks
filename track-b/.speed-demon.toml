@@ -1,0 +1,5 @@
+# Read by the board and the scoring harness.
+track = "b"
+team = "SpeedDemon"
+language = "cpp"
+dependency_count = 0
