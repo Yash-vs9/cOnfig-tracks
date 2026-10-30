@@ -1,8 +1,10 @@
 /**
  * Speed Demon 2026 - Track B (Index)
- * Ultra-Optimized Zero-Dependency C++20 Solution (SWAR + AVX2 + Lock-Free CSR/Bitset)
+ * Single-Pass SWAR + AVX2 + Bigram-Accelerated CSR/Bitset Engine
  */
-#pragma GCC optimize("O3,unroll-loops")
+#pragma GCC optimize("O3,unroll-loops,fast-math")
+#pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt")
+
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
@@ -19,7 +21,8 @@
 #include <vector>
 
 static constexpr uint32_t HASH_SIZE = 131072, HASH_MASK = HASH_SIZE - 1;
-static constexpr uint32_t BITSET_THRESHOLD = 15625, NUM_CHUNKS = 12, MAX_CHUNK_WORDS = 384;
+static constexpr uint32_t BIGRAM_HASH_SIZE = 65536, BIGRAM_MASK = BIGRAM_HASH_SIZE - 1;
+static constexpr uint32_t BITSET_THRESHOLD = 14000, NUM_CHUNKS = 12, MAX_CHUNK_WORDS = 512;
 
 alignas(64) static uint8_t char_map[256], char_map_sep[256];
 static void init_char_map() {
@@ -38,10 +41,14 @@ struct TermInfo {
     uint16_t len;
     uint8_t first_char;
 };
+struct BigramSlot { uint64_t key; uint32_t b_tid; };
+
 static VocabSlot vocab_table[HASH_SIZE];
-static TermInfo term_info[81920];
+static BigramSlot bigram_table[BIGRAM_HASH_SIZE];
+static TermInfo term_info[131072];
 alignas(64) static uint64_t bloom[8192];
-static uint32_t num_terms = 0;
+alignas(64) static uint64_t first_term_bits[2048];
+static uint32_t num_base_terms = 0, num_terms = 0;
 
 static inline uint64_t mix64(uint64_t w0, uint64_t w1, uint32_t len) {
     uint64_t h = (w0 ^ ((w1 * 0x9e3779b97f4a7c15ULL) + len)) * 0xbf58476d1ce4e5b9ULL;
@@ -86,20 +93,52 @@ static inline uint32_t get_or_insert_term(const char* s, uint32_t len, const cha
     return tid;
 }
 
-struct Query { uint8_t kind, num_terms; uint16_t ops_packed; uint32_t term_ids[8]; };
+static inline uint32_t get_or_insert_bigram(uint32_t t1, uint32_t t2) {
+    uint64_t key = ((uint64_t)t1 << 32) | t2 | (1ULL << 63);
+    uint64_t h = (key * 0x9e3779b97f4a7c15ULL);
+    uint32_t idx = (uint32_t)(h ^ (h >> 32)) & BIGRAM_MASK;
+    while (bigram_table[idx].key) {
+        if (bigram_table[idx].key == key) return bigram_table[idx].b_tid;
+        idx = (idx + 1) & BIGRAM_MASK;
+    }
+    uint32_t b_tid = num_terms++;
+    bigram_table[idx] = {key, b_tid};
+    first_term_bits[t1 >> 6] |= (1ULL << (t1 & 63));
+    return b_tid;
+}
+
+static inline uint32_t lookup_bigram(uint32_t t1, uint32_t t2) {
+    uint64_t key = ((uint64_t)t1 << 32) | t2 | (1ULL << 63);
+    uint64_t h = (key * 0x9e3779b97f4a7c15ULL);
+    uint32_t idx = (uint32_t)(h ^ (h >> 32)) & BIGRAM_MASK;
+    while (bigram_table[idx].key) {
+        if (bigram_table[idx].key == key) return bigram_table[idx].b_tid;
+        idx = (idx + 1) & BIGRAM_MASK;
+    }
+    return UINT32_MAX;
+}
+
+struct Query { uint8_t kind, num_terms; uint16_t ops_packed; uint32_t term_ids[8], bigram_ids[7]; };
 static std::vector<Query> queries;
-static std::vector<uint32_t> repeat_term_map;
 
 static uint32_t* doc_text_start = nullptr;
 static uint32_t total_docs = 0, doc_start[NUM_CHUNKS], doc_end[NUM_CHUNKS];
 static size_t chunk_byte_start[NUM_CHUNKS + 1];
 static uint32_t num_threads = 1, words_per_doc = 0, num_bitsets = 0;
+static bool has_long_phrases = false;
 
 static std::vector<uint32_t> term_df, term_bitset_idx, chunk_term_offsets[NUM_CHUNKS];
 static std::vector<uint8_t> is_bitset_term;
 static uint32_t chunk_base[NUM_CHUNKS];
 static uint64_t* global_bitsets = nullptr;
 static uint16_t* global_postings_u16 = nullptr;
+
+struct ChunkTemp {
+    uint16_t* post_doc = nullptr;
+    uint32_t* post_tid = nullptr;
+    uint32_t count = 0, cap = 0;
+};
+static ChunkTemp chunk_temps[NUM_CHUNKS];
 
 struct ResultSlice { uint32_t offset, len; };
 static std::vector<ResultSlice> query_results;
@@ -110,99 +149,111 @@ template <typename F>
 static void run_parallel(uint32_t n, uint32_t batch, F&& fn) {
     std::atomic<uint32_t> idx{0};
     std::vector<std::thread> th;
+    th.reserve(num_threads);
     for (uint32_t t = 0; t < num_threads; ++t)
         th.emplace_back([&]() {
             while (true) {
                 uint32_t i = idx.fetch_add(batch, std::memory_order_relaxed);
                 if (i >= n) break;
-                for (uint32_t j = i; j < std::min(n, i + batch); ++j) fn(j);
+                uint32_t end = std::min(n, i + batch);
+                for (uint32_t j = i; j < end; ++j) fn(j);
             }
         });
     for (auto& w : th) w.join();
 }
 
-template <typename F>
-static inline void scan_doc_tokens(const char*& p, const char* q_buf, F&& fn) {
-    uint32_t pos = 0, prev_tid = UINT32_MAX, prev_pos = UINT32_MAX;
-    while (*p != '\n') {
-        while (char_map_sep[(uint8_t)*p]) p++;
-        if (*p == '\n') break;
-        uint64_t w0 = 0, w1 = 0;
-        char tail[16];
-        uint32_t len = 0;
-        uint8_t m = char_map[(uint8_t)*p];
-        do {
-            if (len < 8) w0 |= ((uint64_t)m << (len * 8));
-            else if (len < 16) w1 |= ((uint64_t)m << ((len - 8) * 8));
-            else if (len < 32) tail[len - 16] = (char)m;
-            len++; p++;
-            m = char_map[(uint8_t)*p];
-        } while (m);
-        uint64_t h = mix64(w0, w1, len);
-        uint32_t tid = UINT32_MAX;
-        if ((bloom[(h >> 32) & 8191] >> (h & 63)) & 1ULL) {
-            tid = vocab_lookup_swar(w0, w1, tail, len, q_buf, h);
-        }
-        if (tid != UINT32_MAX) {
-            fn(tid, (prev_tid == tid && pos == prev_pos + 1));
-            prev_tid = tid; prev_pos = pos;
-        } else prev_tid = UINT32_MAX;
-        pos++;
-    }
-    p++;
-}
-
-static void index_chunk_pass1(uint32_t c, const char* d_buf, const char* q_buf, uint32_t* counts, uint32_t* last_seen) {
-    if (doc_start[c] >= doc_end[c]) return;
-    memset(last_seen, 0xFF, num_terms * sizeof(uint32_t));
-    const char* p = d_buf + chunk_byte_start[c], *p_end = d_buf + chunk_byte_start[c + 1];
-    const uint32_t r_size = (uint32_t)repeat_term_map.size();
-    const uint32_t* r_map = repeat_term_map.data();
-    while (p < p_end) {
-        uint32_t d = 0;
-        while (*p >= '0' && *p <= '9') d = d * 10 + (*p++ - '0');
-        if (*p == '\t') p++;
-        doc_text_start[d] = (uint32_t)(p - d_buf);
-        scan_doc_tokens(p, q_buf, [&](uint32_t tid, bool is_repeat) {
-            if (last_seen[tid] != d) { counts[tid]++; last_seen[tid] = d; }
-            if (__builtin_expect(is_repeat, 0) && tid < r_size) {
-                uint32_t r_tid = r_map[tid];
-                if (r_tid != UINT32_MAX && last_seen[r_tid] != d) { counts[r_tid]++; last_seen[r_tid] = d; }
-            }
-        });
-    }
-}
-
-static void index_chunk_pass2(uint32_t c, const char* d_buf, const char* q_buf, uint32_t* last_seen) {
+static void index_chunk_single_pass(uint32_t c, const char* d_buf, const char* q_buf, uint32_t* counts, uint32_t* last_seen) {
     uint32_t d_first = doc_start[c];
     if (d_first >= doc_end[c]) return;
     memset(last_seen, 0xFF, num_terms * sizeof(uint32_t));
     const char* p = d_buf + chunk_byte_start[c], *p_end = d_buf + chunk_byte_start[c + 1];
-    uint32_t* c_offsets = chunk_term_offsets[c].data();
-    const uint8_t* is_bs = is_bitset_term.data();
-    const uint32_t* bs_idx = term_bitset_idx.data();
-    const uint32_t r_size = (uint32_t)repeat_term_map.size();
-    const uint32_t* r_map = repeat_term_map.data();
 
-    auto emit = [&](uint32_t tid, uint32_t d) {
-        if (is_bs[tid]) {
-            global_bitsets[(size_t)bs_idx[tid] * words_per_doc + (d >> 6)] |= (1ULL << (d & 63));
-        } else {
-            global_postings_u16[c_offsets[tid]++] = (uint16_t)(d - d_first);
+    uint32_t cap = 1 << 20;
+    uint16_t* p_doc = (uint16_t*)malloc(cap * sizeof(uint16_t));
+    uint32_t* p_tid = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    uint32_t cnt = 0;
+
+    auto record = [&](uint32_t tid, uint32_t d, uint16_t local_d) {
+        if (last_seen[tid] != d) {
+            last_seen[tid] = d;
+            counts[tid]++;
+            if (__builtin_expect(cnt == cap, 0)) {
+                cap <<= 1;
+                p_doc = (uint16_t*)realloc(p_doc, cap * sizeof(uint16_t));
+                p_tid = (uint32_t*)realloc(p_tid, cap * sizeof(uint32_t));
+            }
+            p_doc[cnt] = local_d;
+            p_tid[cnt] = tid;
+            cnt++;
         }
     };
+
     while (p < p_end) {
         uint32_t d = 0;
         while (*p >= '0' && *p <= '9') d = d * 10 + (*p++ - '0');
         if (*p == '\t') p++;
-        scan_doc_tokens(p, q_buf, [&](uint32_t tid, bool is_repeat) {
-            if (last_seen[tid] != d) { last_seen[tid] = d; emit(tid, d); }
-            if (__builtin_expect(is_repeat, 0) && tid < r_size) {
-                uint32_t r_tid = r_map[tid];
-                if (r_tid != UINT32_MAX && last_seen[r_tid] != d) { last_seen[r_tid] = d; emit(r_tid, d); }
+        if (has_long_phrases) doc_text_start[d] = (uint32_t)(p - d_buf);
+        uint16_t local_d = (uint16_t)(d - d_first);
+        uint32_t prev_tid = UINT32_MAX;
+
+        while (*p != '\n') {
+            while (char_map_sep[(uint8_t)*p]) p++;
+            if (*p == '\n') break;
+            uint64_t w0 = 0, w1 = 0;
+            char tail[16];
+            uint32_t len = 0;
+            uint8_t m = char_map[(uint8_t)*p];
+            do {
+                if (len < 8) w0 |= ((uint64_t)m << (len * 8));
+                else if (len < 16) w1 |= ((uint64_t)m << ((len - 8) * 8));
+                else if (len < 32) tail[len - 16] = (char)m;
+                len++; p++;
+                m = char_map[(uint8_t)*p];
+            } while (m);
+            uint64_t h = mix64(w0, w1, len);
+            uint32_t tid = UINT32_MAX;
+            if ((bloom[(h >> 32) & 8191] >> (h & 63)) & 1ULL) {
+                tid = vocab_lookup_swar(w0, w1, tail, len, q_buf, h);
             }
-        });
+            if (tid != UINT32_MAX) {
+                record(tid, d, local_d);
+                if (prev_tid != UINT32_MAX && ((first_term_bits[prev_tid >> 6] >> (prev_tid & 63)) & 1ULL)) {
+                    uint32_t b_tid = lookup_bigram(prev_tid, tid);
+                    if (b_tid != UINT32_MAX) record(b_tid, d, local_d);
+                }
+                prev_tid = tid;
+            } else {
+                prev_tid = UINT32_MAX;
+            }
+        }
+        p++;
     }
+    chunk_temps[c] = {p_doc, p_tid, cnt, cap};
+}
+
+static void populate_chunk_index(uint32_t c) {
+    uint32_t d_first = doc_start[c];
+    if (d_first >= doc_end[c]) return;
+    const auto& ct = chunk_temps[c];
+    uint32_t* c_offsets = chunk_term_offsets[c].data();
+    const uint8_t* is_bs = is_bitset_term.data();
+    const uint32_t* bs_idx = term_bitset_idx.data();
+    const uint16_t* p_doc = ct.post_doc;
+    const uint32_t* p_tid = ct.post_tid;
+    uint32_t cnt = ct.count;
+
+    for (uint32_t i = 0; i < cnt; ++i) {
+        uint32_t tid = p_tid[i];
+        uint16_t local_d = p_doc[i];
+        if (is_bs[tid]) {
+            uint32_t d = d_first + local_d;
+            global_bitsets[(size_t)bs_idx[tid] * words_per_doc + (d >> 6)] |= (1ULL << (d & 63));
+        } else {
+            global_postings_u16[c_offsets[tid]++] = local_d;
+        }
+    }
+    free(ct.post_doc);
+    free(ct.post_tid);
 }
 
 static inline void get_term_chunk_bitset(uint32_t tid, uint32_t c, uint32_t c_words, uint64_t* out) {
@@ -389,23 +440,25 @@ static void execute_phrase_query(const Query& q, const char* d_buf, const char* 
             format_result(0, 0, nullptr, 0, slice); return;
         }
     }
-    uint32_t distinct[16]; uint8_t num_distinct = 0;
-    for (uint8_t i = 0; i < k; ++i) {
-        uint32_t tid = q.term_ids[i]; bool found = false;
-        for (uint8_t j = 0; j < num_distinct; ++j) if (distinct[j] == tid) { found = true; break; }
-        if (!found) distinct[num_distinct++] = tid;
-    }
     for (uint8_t i = 0; i < k - 1; ++i) {
-        if (q.term_ids[i] == q.term_ids[i + 1]) {
-            uint32_t tid = q.term_ids[i];
-            uint32_t r_tid = (tid < repeat_term_map.size()) ? repeat_term_map[tid] : UINT32_MAX;
-            if (r_tid != UINT32_MAX) {
-                if (!term_df[r_tid]) { format_result(0, 0, nullptr, 0, slice); return; }
-                bool found = false;
-                for (uint8_t j = 0; j < num_distinct; ++j) if (distinct[j] == r_tid) { found = true; break; }
-                if (!found) distinct[num_distinct++] = r_tid;
-            }
+        if (q.bigram_ids[i] == UINT32_MAX || !term_df[q.bigram_ids[i]]) {
+            format_result(0, 0, nullptr, 0, slice); return;
         }
+    }
+
+    // Fast Path: 1-term or 2-term phrase query is 100% exact via single term / bigram index!
+    if (k <= 2) {
+        uint32_t exact_tid = (k == 1) ? q.term_ids[0] : q.bigram_ids[0];
+        Query bq = {0, 1, 0, {exact_tid}, {0}};
+        execute_bool_query(bq, slice);
+        return;
+    }
+
+    uint32_t distinct[16]; uint8_t num_distinct = 0;
+    for (uint8_t i = 0; i < k - 1; ++i) {
+        uint32_t b_tid = q.bigram_ids[i]; bool found = false;
+        for (uint8_t j = 0; j < num_distinct; ++j) if (distinct[j] == b_tid) { found = true; break; }
+        if (!found) distinct[num_distinct++] = b_tid;
     }
     std::sort(distinct, distinct + num_distinct, [](uint32_t a, uint32_t b) { return term_df[a] < term_df[b]; });
 
@@ -414,7 +467,7 @@ static void execute_phrase_query(const Query& q, const char* d_buf, const char* 
 
     uint64_t total_count = 0, total_sum = 0;
     uint32_t top10[10], top10_count = 0;
-    uint16_t cand_u16[21000];
+    uint16_t cand_u16[32768];
 
     for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
         uint32_t c_start = doc_start[c], c_docs = doc_end[c] - c_start;
@@ -508,7 +561,9 @@ static const char* mmap_file(const char* path, size_t& size) {
     if (fd < 0) return nullptr;
     struct stat st; fstat(fd, &st);
     size = st.st_size;
-    return (const char*)mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    const char* p = (const char*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    return p;
 }
 
 int main(int argc, char** argv) {
@@ -535,7 +590,7 @@ int main(int argc, char** argv) {
         q_ptr += is_bool ? 5 : 8;
         const char* line_end = is_bool ? (const char*)memchr(q_ptr, '\n', q_end - q_ptr) : (const char*)memchr(q_ptr, '\"', q_end - q_ptr);
         if (!line_end) line_end = q_end;
-        Query q = {(uint8_t)(is_bool ? 0 : 1), 0, 0, {0}};
+        Query q = {(uint8_t)(is_bool ? 0 : 1), 0, 0, {0}, {0}};
         while (q_ptr < line_end) {
             while (q_ptr < line_end && *q_ptr == ' ') q_ptr++;
             if (q_ptr >= line_end) break;
@@ -552,18 +607,12 @@ int main(int argc, char** argv) {
         if (q_ptr) q_ptr++; else break;
     }
 
-    repeat_term_map.assign(num_terms, UINT32_MAX);
-    for (const auto& q : queries) {
+    num_base_terms = num_terms;
+    for (auto& q : queries) {
         if (q.kind == 1) {
+            if (q.num_terms > 2) has_long_phrases = true;
             for (uint8_t i = 0; i < q.num_terms - 1; ++i) {
-                if (q.term_ids[i] == q.term_ids[i + 1]) {
-                    uint32_t tid = q.term_ids[i];
-                    if (repeat_term_map[tid] == UINT32_MAX) {
-                        uint32_t r_tid = num_terms++;
-                        repeat_term_map[tid] = r_tid;
-                        term_info[r_tid] = term_info[tid];
-                    }
-                }
+                q.bigram_ids[i] = get_or_insert_bigram(q.term_ids[i], q.term_ids[i + 1]);
             }
         }
     }
@@ -580,12 +629,14 @@ int main(int argc, char** argv) {
         total_docs = last_id + 1;
     }
 
-    doc_text_start = (uint32_t*)malloc(total_docs * sizeof(uint32_t));
+    if (has_long_phrases) {
+        doc_text_start = (uint32_t*)malloc(total_docs * sizeof(uint32_t));
+    }
 
     uint32_t docs_per_chunk = (total_docs + NUM_CHUNKS - 1) / NUM_CHUNKS;
     for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
         uint32_t start = c * docs_per_chunk;
-        if (c > 0) start = (start + 63) & ~63u;
+        if (c > 0) start = (start + 511) & ~511u; // 512-doc (64-byte cacheline) alignment
         if (start > total_docs) start = total_docs;
         doc_start[c] = start;
         if (c > 0) doc_end[c - 1] = start;
@@ -628,11 +679,15 @@ int main(int argc, char** argv) {
                 while (true) {
                     uint32_t c = chunk_idx.fetch_add(1, std::memory_order_relaxed);
                     if (c >= NUM_CHUNKS) break;
-                    index_chunk_pass1(c, d_buf, q_buf, chunk_counts + c * num_terms, my_last_seen);
+                    index_chunk_single_pass(c, d_buf, q_buf, chunk_counts + c * num_terms, my_last_seen);
                 }
             });
         }
         for (auto& w : th) w.join();
+    }
+
+    if (!has_long_phrases) {
+        madvise((void*)d_buf, file_size, MADV_DONTNEED);
     }
 
     term_df.assign(num_terms, 0);
@@ -667,25 +722,9 @@ int main(int argc, char** argv) {
 
     global_postings_u16 = (uint16_t*)malloc((size_t)total_u16_postings * sizeof(uint16_t));
 
-    size_t ls_bytes = (size_t)num_threads * num_terms * sizeof(uint32_t);
-    uint32_t* pass2_last_seen = (uint32_t*)mmap(nullptr, ls_bytes, PROT_READ | PROT_WRITE,
-                                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    {
-        std::atomic<uint32_t> chunk_idx{0};
-        std::vector<std::thread> th;
-        for (uint32_t t = 0; t < num_threads; ++t) {
-            th.emplace_back([&, t]() {
-                uint32_t* my_last_seen = pass2_last_seen + (size_t)t * num_terms;
-                while (true) {
-                    uint32_t c = chunk_idx.fetch_add(1, std::memory_order_relaxed);
-                    if (c >= NUM_CHUNKS) break;
-                    index_chunk_pass2(c, d_buf, q_buf, my_last_seen);
-                }
-            });
-        }
-        for (auto& w : th) w.join();
-    }
-    munmap(pass2_last_seen, ls_bytes);
+    run_parallel(NUM_CHUNKS, 1, [&](uint32_t c) {
+        populate_chunk_index(c);
+    });
 
     uint32_t num_q = (uint32_t)queries.size();
     query_results.resize(num_q);
