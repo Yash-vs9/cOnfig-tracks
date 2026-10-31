@@ -11,9 +11,8 @@ extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_SCAN_T: usize = 6;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 680_000;
+const FW_CAP: usize = 630_000;
 const DP_CAP: usize = 11_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
@@ -329,40 +328,37 @@ w }
 unsafe fn emit_bits(&self, curr: &[u64], cs: u32, cd: u32, cw: usize, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize) {
 let mut w = 0usize;
 let v_zero = _mm256_setzero_si256();
-while w + 4 <= cw {
+while w < cw {
+if w + 4 <= cw {
 let v = _mm256_loadu_si256(curr.as_ptr().add(w) as *const __m256i);
 let eq = _mm256_cmpeq_epi64(v, v_zero);
-if (_mm256_movemask_epi8(eq) as u32) != 0xFFFFFFFF {
-for i in 0..4 {
-let mut val = *curr.get_unchecked(w + i);
-if val != 0 {
-let base_id = cs + ((w + i) << 6) as u32;
-while val != 0 {
-let bit = val.trailing_zeros();
-let d = base_id + bit;
-if d - cs < cd {
-*t_cnt += 1;
-*t_sum += d as u64;
-if *tc < 10 {
-top[*tc] = d;
-*tc += 1; } }
-val &= val - 1; }
-} } }
-w += 4; }
-while w < cw {
+if (_mm256_movemask_epi8(eq) as u32) == 0xFFFFFFFF {
+w += 4;
+continue; } }
 let mut val = *curr.get_unchecked(w);
+if w == (cd >> 6) as usize {
+let rem = cd & 63;
+if rem != 0 { val &= (1u64 << rem) - 1; } }
 if val != 0 {
 let base_id = cs + (w << 6) as u32;
+if *tc < 10 {
 while val != 0 {
 let bit = val.trailing_zeros();
 let d = base_id + bit;
-if d - cs < cd {
 *t_cnt += 1;
 *t_sum += d as u64;
 if *tc < 10 {
 top[*tc] = d;
-*tc += 1; } }
-val &= val - 1; } }
+*tc += 1; }
+val &= val - 1; }
+} else {
+let cnt = val.count_ones() as u64;
+*t_cnt += cnt;
+*t_sum += cnt * (base_id as u64);
+while val != 0 {
+let bit = val.trailing_zeros();
+*t_sum += bit as u64;
+val &= val - 1; } } }
 w += 1; } }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
@@ -372,12 +368,7 @@ let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
 let curr = curr_uninit.assume_init_mut();
 let mut clist_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let clist = clist_uninit.assume_init_mut();
-let record_doc = |d: u32, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize| {
-*t_cnt += 1;
-*t_sum += d as u64;
-if *tc < 10 {
-top[*tc] = d;
-*tc += 1; } };
+
 let is_pure_and = (1..q.k as usize).all(|i| ((q.ops >> ((i - 1) * 2)) & 3) == 1);
 for c in 0..NUM_C {
 let (cs, cd) = (self.doc_s[c], self.doc_e[c] - self.doc_s[c]);
@@ -405,8 +396,14 @@ let t = tid as usize;
 if t != min_t {
 clen = self.intersect_and(c, t, cs, clist, clen);
 if clen == 0  { break; } } }
-for &ld in &clist[..clen]  { record_doc(cs + ld as u32, &mut t_cnt, &mut t_sum, &mut top, &mut tc); } continue;
-} }
+t_cnt += clen as u64;
+let need = (10 - tc).min(clen);
+for i in 0..need { top[tc + i] = cs + clist[i] as u32; }
+tc += need;
+let mut s = 0u64;
+for &ld in &clist[..clen] { s += ld as u64; }
+t_sum += (cs as u64) * (clen as u64) + s;
+continue; } }
 let t0 = q_ts[0] as usize;
 if self.is_bs(t0) {
 in_bs = true;
@@ -456,7 +453,13 @@ for &ld in self.chunk_postings(c, nt_id)  { *curr.get_unchecked_mut((ld as usize
 for &ld in self.chunk_postings(c, nt_id)  { *curr.get_unchecked_mut((ld as usize) >> 6) &= !(1u64 << (ld & 63)); } }
 } else if op == 1  { clen = self.intersect_and(c, nt_id, cs, clist, clen); } else if op == 3  { clen = self.intersect_not(c, nt_id, cs, clist, clen); } }
 if !in_bs {
-for &ld in &clist[..clen]  { record_doc(cs + ld as u32, &mut t_cnt, &mut t_sum, &mut top, &mut tc); }
+t_cnt += clen as u64;
+let need = (10 - tc).min(clen);
+for i in 0..need { top[tc + i] = cs + clist[i] as u32; }
+tc += need;
+let mut s = 0u64;
+for &ld in &clist[..clen] { s += ld as u64; }
+t_sum += (cs as u64) * (clen as u64) + s;
 } else { self.emit_bits(curr, cs, cd, cw, &mut t_cnt, &mut t_sum, &mut top, &mut tc); } }
 fmt_res(t_cnt, t_sum, &top, tc, out); }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -792,7 +795,7 @@ hi = (lo + hi) / 2;
 let sc_count = NUM_C * nt;
 let c_offs = alloc_mmap::<u32>(sc_count);
 let c_offs_val = c_offs as usize;
-let thread_counts = alloc_mmap::<u16>(NUM_SCAN_T * nt);
+let thread_counts = alloc_mmap::<u16>(NUM_T * nt);
 let thread_counts_val = thread_counts as usize;
 let doc_ts_ptr = doc_ts.as_mut_ptr() as usize;
 const ATOMIC_ZERO: AtomicUsize = AtomicUsize::new(0);
@@ -804,9 +807,9 @@ let nb = (queries.len() + QB - 1) / QB;
 let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
 let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
 let next_b = AtomicUsize::new(0);
-let mut fw_ptrs = [0usize; NUM_SCAN_T];
-let mut dp_ptrs = [0usize; NUM_SCAN_T];
-for t in 0..NUM_SCAN_T {
+let mut fw_ptrs = [0usize; NUM_T];
+let mut dp_ptrs = [0usize; NUM_T];
+for t in 0..NUM_T {
 fw_ptrs[t] = alloc_mmap::<u16>(FW_CAP) as usize;
 dp_ptrs[t] = alloc_mmap::<u32>(DP_CAP) as usize; }
 let next_chunk = AtomicUsize::new(0);
@@ -826,14 +829,13 @@ let q_terms_ref = &q_terms;
 let next_ref = &next_b;
 let c_post_ptrs_ref = &c_post_ptrs;
 let c_post_lens_ref = &c_post_lens;
-let fw_ptr_c = if tid < NUM_SCAN_T { fw_ptrs[tid] } else { 0 };
-let dp_ptr_c = if tid < NUM_SCAN_T { dp_ptrs[tid] } else { 0 };
+let fw_ptr_c = fw_ptrs[tid];
+let dp_ptr_c = dp_ptrs[tid];
 std::thread::Builder::new()
 .stack_size(196608)
 .spawn_scoped(s, move || {
 let aff_mask = 1u64 << (tid % 12);
 sched_setaffinity(0, 8, &aff_mask);
-if tid < NUM_SCAN_T {
 let fw = fw_ptr_c as *mut u16;
 let dp = dp_ptr_c as *mut u32;
 let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
@@ -877,7 +879,7 @@ fw,
 dp,
 ); }
 free_mmap(fw, FW_CAP);
-free_mmap(dp, DP_CAP); }
+free_mmap(dp, DP_CAP);
 ready_ref.fetch_add(1, Ordering::Release);
 while phase_ref.load(Ordering::Acquire) < 1  { std::hint::spin_loop(); }
 let mut cp_ptrs = [ptr::null(); NUM_C];
@@ -964,7 +966,7 @@ let end = *c_offs.add(base + i);
 let start = if i > 0 { *c_offs.add(base + i - 1) } else { 0 };
 df += end - start; }
 TINFO[i].df = (df as u16).min(65535); } }
-free_mmap(thread_counts, NUM_SCAN_T * nt);
+free_mmap(thread_counts, NUM_T * nt);
 phase.store(1, Ordering::Release);
 let mut cp_ptrs = [ptr::null(); NUM_C];
 for c in 0..NUM_C  { cp_ptrs[c] = c_post_ptrs[c].load(Ordering::Relaxed) as *const u16; }
