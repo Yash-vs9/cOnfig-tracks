@@ -20,9 +20,10 @@ extern "C" {
 
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_C: usize = 12;
-const FW_CAP: usize = 1_350_000;
-const DP_CAP: usize = 22_000;
+const NUM_T: usize = 12;
+const NUM_C: usize = 24;
+const FW_CAP: usize = 650_000;
+const DP_CAP: usize = 11_000;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
@@ -664,9 +665,6 @@ impl<'a> Engine<'a> {
             poff[i] = ti.off as usize;
         }
 
-        let check_match = |j: usize, l: usize, w0: u64, w1: u64, tail: &[u8]| -> bool {
-            l == plen[j] && w0 == pw0[j] && (l <= 8 || (w1 == pw1[j] && (l <= 16 || &self.q_buf[poff[j] + 16..poff[j] + l] == &tail[..l - 16])))
-        };
 
         let first_ch = (pw0[0] & 0xFF) as u8;
         let first_up = if first_ch >= b'a' && first_ch <= b'z' { first_ch - 32 } else { first_ch };
@@ -725,24 +723,72 @@ impl<'a> Engine<'a> {
             }
 
             let (d_ptr, d_len) = (self.d_buf.as_ptr(), self.d_buf.len());
+            let is_alnum = |b: u8| -> bool { b.wrapping_sub(b'0') <= 9 || (b | 0x20).wrapping_sub(b'a') <= 25 };
+
             let try_match = |cand_p: usize| -> bool {
                 let mut tp = cand_p;
-                let mut tail = [0u8; 16];
-                let (w0, w1, l) = read_tok(self.d_buf, &mut tp, &mut tail);
-                if !check_match(0, l, w0, w1, &tail) {
-                    return false;
-                }
-                for j in 1..k {
-                    while *CMAP.get_unchecked(*self.d_buf.get_unchecked(tp) as usize) == 0 {
-                        tp += 1;
-                    }
-                    if *self.d_buf.get_unchecked(tp) == b'\n' {
+                for j in 0..k {
+                    let l = plen[j];
+                    if tp + l >= d_len {
                         return false;
                     }
-                    let mut sub_tail = [0u8; 16];
-                    let (sw0, sw1, sl) = read_tok(self.d_buf, &mut tp, &mut sub_tail);
-                    if !check_match(j, sl, sw0, sw1, &sub_tail) {
+                    if l <= 8 {
+                        if tp + 8 > d_len {
+                            return false;
+                        }
+                        let raw = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+                        let mask = if l == 8 { u64::MAX } else { (1u64 << (l * 8)) - 1 };
+                        if (raw & mask) != pw0[j] {
+                            return false;
+                        }
+                    } else if l <= 16 {
+                        if tp + 16 > d_len {
+                            return false;
+                        }
+                        let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+                        if raw0 != pw0[j] {
+                            return false;
+                        }
+                        let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
+                        let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
+                        if (raw1 & mask1) != pw1[j] {
+                            return false;
+                        }
+                    } else {
+                        if tp + 16 > d_len {
+                            return false;
+                        }
+                        let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+                        if raw0 != pw0[j] {
+                            return false;
+                        }
+                        let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
+                        if raw1 != pw1[j] {
+                            return false;
+                        }
+                        let q_tail = &self.q_buf[poff[j] + 16..poff[j] + l];
+                        let d_tail = std::slice::from_raw_parts(d_ptr.add(tp + 16), l - 16);
+                        for t_idx in 0..l - 16 {
+                            if (d_tail[t_idx] | 0x20) != q_tail[t_idx] {
+                                return false;
+                            }
+                        }
+                    }
+                    if is_alnum(*d_ptr.add(tp + l)) {
                         return false;
+                    }
+                    tp += l;
+                    if j + 1 < k {
+                        if *d_ptr.add(tp) == b' ' && is_alnum(*d_ptr.add(tp + 1)) {
+                            tp += 1;
+                        } else {
+                            while !is_alnum(*d_ptr.add(tp)) {
+                                if *d_ptr.add(tp) == b'\n' {
+                                    return false;
+                                }
+                                tp += 1;
+                            }
+                        }
                     }
                 }
                 true
@@ -770,7 +816,7 @@ impl<'a> Engine<'a> {
                             let bit = valid_ch.trailing_zeros() as usize;
                             valid_ch &= valid_ch - 1;
                             let cand_p = sp + bit;
-                            if *CMAP.get_unchecked(*d_ptr.add(cand_p - 1) as usize) <= 1 && try_match(cand_p) {
+                            if !is_alnum(*d_ptr.add(cand_p - 1)) && try_match(cand_p) {
                                 matched = true;
                                 break 'doc_scan;
                             }
@@ -806,9 +852,9 @@ impl<'a> Engine<'a> {
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_scan_fw(
     c: usize,
-    nt: usize,
+    _nt: usize,
     w_per_doc: usize,
-    sc_ptr: *mut u32,
+    co_ptr: *mut u32,
     doc_ts_ptr: *mut u32,
     g_bs_ptr: *mut u64,
     bs_idx: *const u16,
@@ -824,7 +870,6 @@ unsafe fn worker_scan_fw(
     let mut hl = [0u32; 2048];
     let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
     madvise(d_buf.as_ptr().add(p) as *mut u8, pe - p, 3);
-    let co_ptr = sc_ptr.add(c * nt);
     let mut fw_idx = 0usize;
     while p < pe {
         while *d_buf.get_unchecked(p) != b'\t' {
@@ -877,8 +922,8 @@ unsafe fn worker_scan_fw(
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_transpose(
     c: usize,
-    nt: usize,
-    cur_offs: *mut u32,
+    _nt: usize,
+    cur_ptr: *mut u32,
     chunk_u16_ptr: *mut u16,
     doc_s: &[u32; NUM_C],
     doc_e: &[u32; NUM_C],
@@ -886,9 +931,6 @@ unsafe fn worker_transpose(
     dp_ptr: *mut u32,
 ) {
     let num_docs = (doc_e[c] - doc_s[c]) as usize;
-    let base = c * nt;
-    let cur_ptr = cur_offs.add(base);
-
     for ld in 0..num_docs {
         let start = *dp_ptr.add(ld) as usize;
         let end = *dp_ptr.add(ld + 1) as usize;
@@ -908,7 +950,6 @@ unsafe fn worker_transpose(
 }
 
 unsafe fn run_all() {
-    let t_start = std::time::Instant::now();
     mallopt(-8, 1);
     mallopt(-1, 0);
     mallopt(-3, 65536);
@@ -1035,6 +1076,7 @@ unsafe fn run_all() {
             n_bs += 1;
         }
     }
+    drop(sample_counts);
 
     let g_bs_total = n_bs * w_per_doc;
     let raw_bs_ptr = alloc_mmap::<u64>(g_bs_total);
@@ -1073,12 +1115,10 @@ unsafe fn run_all() {
     }
 
     let sc_count = NUM_C * nt;
-    let c_counts = alloc_mmap::<u32>(sc_count);
-    let c_counts_val = c_counts as usize;
     let c_offs = alloc_mmap::<u32>(sc_count);
     let c_offs_val = c_offs as usize;
-    let cur_offs = alloc_mmap::<u32>(sc_count);
-    let cur_offs_val = cur_offs as usize;
+    let thread_counts = alloc_mmap::<u32>(NUM_T * nt);
+    let thread_counts_val = thread_counts as usize;
     let doc_ts_ptr = doc_ts.as_mut_ptr() as usize;
 
     const ATOMIC_ZERO: AtomicUsize = AtomicUsize::new(0);
@@ -1092,23 +1132,23 @@ unsafe fn run_all() {
     let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
     let next_b = AtomicUsize::new(0);
 
-    // Per-worker forward buffers
-    let mut fw_ptrs = [0usize; NUM_C];
-    let mut dp_ptrs = [0usize; NUM_C];
-    for c in 0..NUM_C {
-        fw_ptrs[c] = alloc_mmap::<u16>(FW_CAP) as usize;
-        dp_ptrs[c] = alloc_mmap::<u32>(DP_CAP) as usize;
+    // Per-worker forward buffers (only NUM_T buffers allocated)
+    let mut fw_ptrs = [0usize; NUM_T];
+    let mut dp_ptrs = [0usize; NUM_T];
+    for t in 0..NUM_T {
+        fw_ptrs[t] = alloc_mmap::<u16>(FW_CAP) as usize;
+        dp_ptrs[t] = alloc_mmap::<u32>(DP_CAP) as usize;
     }
 
+    let next_chunk = AtomicUsize::new(0);
     let phase = AtomicUsize::new(0);
     let ready = AtomicUsize::new(0);
-    let t_init = t_start.elapsed();
-    let mut t_scan = std::time::Duration::ZERO;
 
     std::thread::scope(|s| {
-        for tid in 1..NUM_C {
+        for tid in 1..NUM_T {
             let phase_ref = &phase;
             let ready_ref = &ready;
+            let next_c_ref = &next_chunk;
             let r_ref = &rep_map;
             let ds_ref = &doc_s;
             let de_ref = &doc_e;
@@ -1124,54 +1164,64 @@ unsafe fn run_all() {
             std::thread::Builder::new()
                 .stack_size(196608)
                 .spawn_scoped(s, move || {
-                    worker_scan_fw(
-                        tid,
-                        nt,
-                        w_per_doc,
-                        c_counts_val as *mut u32,
-                        doc_ts_ptr as *mut u32,
-                        raw_bs_val as *mut u64,
-                        bs_idx_ptr as *const u16,
-                        d_buf,
-                        q_buf,
-                        r_ref,
-                        ds_ref,
-                        cb_ref,
-                        fw_ptr_c as *mut u16,
-                        dp_ptr_c as *mut u32,
-                    );
-
-                    let co_ptr = (c_counts_val as *mut u32).add(tid * nt);
-                    let off_ptr = (c_offs_val as *mut u32).add(tid * nt);
-                    let cur_ptr = (cur_offs_val as *mut u32).add(tid * nt);
+                    let fw = fw_ptr_c as *mut u16;
+                    let dp = dp_ptr_c as *mut u32;
+                    let thread_cnt_p = (thread_counts_val as *mut u32).add(tid * nt);
                     let bs_idx_p = bs_idx_ptr as *const u16;
-                    let mut my_tot = 0u32;
-                    for i in 0..nt {
-                        *cur_ptr.add(i) = my_tot;
-                        let cnt = *co_ptr.add(i);
-                        if *bs_idx_p.add(i) == u16::MAX {
-                            my_tot += cnt;
+
+                    loop {
+                        let c = next_c_ref.fetch_add(1, Ordering::Relaxed);
+                        if c >= NUM_C {
+                            break;
                         }
-                        *off_ptr.add(i) = my_tot;
+
+                        ptr::write_bytes(thread_cnt_p, 0, nt);
+
+                        worker_scan_fw(
+                            c,
+                            nt,
+                            w_per_doc,
+                            thread_cnt_p,
+                            doc_ts_ptr as *mut u32,
+                            raw_bs_val as *mut u64,
+                            bs_idx_p,
+                            d_buf,
+                            q_buf,
+                            r_ref,
+                            ds_ref,
+                            cb_ref,
+                            fw,
+                            dp,
+                        );
+
+                        let c_off_p = (c_offs_val as *mut u32).add(c * nt);
+                        let mut my_tot = 0u32;
+                        for i in 0..nt {
+                            *c_off_p.add(i) = my_tot;
+                            if *bs_idx_p.add(i) == u16::MAX {
+                                my_tot += *thread_cnt_p.add(i);
+                            }
+                        }
+
+                        let my_total = (my_tot as usize).max(1);
+                        let chunk_u16 = alloc_mmap::<u16>(my_total);
+                        c_post_ptrs_ref[c].store(chunk_u16 as usize, Ordering::Release);
+                        c_post_lens_ref[c].store(my_total, Ordering::Relaxed);
+
+                        worker_transpose(
+                            c,
+                            nt,
+                            c_off_p,
+                            chunk_u16,
+                            ds_ref,
+                            de_ref,
+                            fw,
+                            dp,
+                        );
                     }
 
-                    let my_total = (my_tot as usize).max(1);
-                    let chunk_u16 = alloc_mmap::<u16>(my_total);
-                    c_post_ptrs_ref[tid].store(chunk_u16 as usize, Ordering::Release);
-                    c_post_lens_ref[tid].store(my_total, Ordering::Relaxed);
-
-                    worker_transpose(
-                        tid,
-                        nt,
-                        cur_offs_val as *mut u32,
-                        chunk_u16,
-                        ds_ref,
-                        de_ref,
-                        fw_ptr_c as *mut u16,
-                        dp_ptr_c as *mut u32,
-                    );
-                    free_mmap(fw_ptr_c as *mut u16, FW_CAP);
-                    free_mmap(dp_ptr_c as *mut u32, DP_CAP);
+                    free_mmap(fw, FW_CAP);
+                    free_mmap(dp, DP_CAP);
 
                     ready_ref.fetch_add(1, Ordering::Release);
                     while phase_ref.load(Ordering::Acquire) < 1 {
@@ -1221,70 +1271,87 @@ unsafe fn run_all() {
                 .unwrap();
         }
 
-        worker_scan_fw(
-            0,
-            nt,
-            w_per_doc,
-            c_counts,
-            doc_ts_ptr as *mut u32,
-            raw_bs_ptr,
-            bs_idx.as_ptr(),
-            d_buf,
-            q_buf,
-            &rep_map,
-            &doc_s,
-            &c_byte,
-            fw_ptrs[0] as *mut u16,
-            dp_ptrs[0] as *mut u32,
-        );
+        let fw0 = fw_ptrs[0] as *mut u16;
+        let dp0 = dp_ptrs[0] as *mut u32;
+        let thread_cnt_0 = thread_counts;
+        let bs_idx_p = bs_idx.as_ptr();
 
-        let mut my_tot = 0u32;
-        for i in 0..nt {
-            *cur_offs.add(i) = my_tot;
-            let cnt = *c_counts.add(i);
-            if bs_idx[i] == u16::MAX {
-                my_tot += cnt;
+        loop {
+            let c = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if c >= NUM_C {
+                break;
             }
-            *c_offs.add(i) = my_tot;
+
+            ptr::write_bytes(thread_cnt_0, 0, nt);
+
+            worker_scan_fw(
+                c,
+                nt,
+                w_per_doc,
+                thread_cnt_0,
+                doc_ts_ptr as *mut u32,
+                raw_bs_ptr,
+                bs_idx_p,
+                d_buf,
+                q_buf,
+                &rep_map,
+                &doc_s,
+                &c_byte,
+                fw0,
+                dp0,
+            );
+
+            let c_off_p = c_offs.add(c * nt);
+            let mut my_tot = 0u32;
+            for i in 0..nt {
+                *c_off_p.add(i) = my_tot;
+                if *bs_idx_p.add(i) == u16::MAX {
+                    my_tot += *thread_cnt_0.add(i);
+                }
+            }
+
+            let my_total = (my_tot as usize).max(1);
+            let chunk_u16 = alloc_mmap::<u16>(my_total);
+            c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
+            c_post_lens[c].store(my_total, Ordering::Relaxed);
+
+            worker_transpose(
+                c,
+                nt,
+                c_off_p,
+                chunk_u16,
+                &doc_s,
+                &doc_e,
+                fw0,
+                dp0,
+            );
         }
 
-        let my_total = (my_tot as usize).max(1);
-        let chunk_u16 = alloc_mmap::<u16>(my_total);
-        c_post_ptrs[0].store(chunk_u16 as usize, Ordering::Release);
-        c_post_lens[0].store(my_total, Ordering::Relaxed);
+        free_mmap(fw0, FW_CAP);
+        free_mmap(dp0, DP_CAP);
 
-        worker_transpose(
-            0,
-            nt,
-            cur_offs,
-            chunk_u16,
-            &doc_s,
-            &doc_e,
-            fw_ptrs[0] as *mut u16,
-            dp_ptrs[0] as *mut u32,
-        );
-        free_mmap(fw_ptrs[0] as *mut u16, FW_CAP);
-        free_mmap(dp_ptrs[0] as *mut u32, DP_CAP);
-
-        while ready.load(Ordering::Acquire) < NUM_C - 1 {
+        while ready.load(Ordering::Acquire) < NUM_T - 1 {
             std::hint::spin_loop();
         }
-        t_scan = t_start.elapsed();
 
         madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
 
         for i in 0..nt {
-            TINFO[i].df = 0;
-        }
-        for c in 0..NUM_C {
-            let co = c_counts.add(c * nt);
-            for i in 0..nt {
-                TINFO[i].df = TINFO[i].df.saturating_add(*co.add(i) as u16);
+            if bs_idx[i] != u16::MAX {
+                TINFO[i].df = 65535;
+            } else {
+                let mut df = 0u32;
+                for c in 0..NUM_C {
+                    let base = c * nt;
+                    let end = *c_offs.add(base + i);
+                    let start = if i > 0 { *c_offs.add(base + i - 1) } else { 0 };
+                    df += end - start;
+                }
+                TINFO[i].df = (df as u16).min(65535);
             }
         }
 
-        free_mmap(cur_offs, sc_count);
-        free_mmap(c_counts, sc_count);
+        free_mmap(thread_counts, NUM_T * nt);
 
         phase.store(1, Ordering::Release);
 
@@ -1327,15 +1394,6 @@ unsafe fn run_all() {
             }
         }
     });
-
-    let t_query = t_start.elapsed();
-    eprintln!(
-        "TIMING: init={:?} scan+transpose={:?} query={:?} total={:?}",
-        t_init,
-        t_scan.saturating_sub(t_init),
-        t_query.saturating_sub(t_scan),
-        t_query
-    );
 
     let _ = std::fs::create_dir_all(&o_dir);
     let mut f = File::create(format!("{}/results.txt", o_dir)).unwrap();
