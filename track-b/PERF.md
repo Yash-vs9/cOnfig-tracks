@@ -21,7 +21,6 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | 128KB L2 Bloom filter, direct sparse BOOL posting intersection, 256-bit AVX2 zero-skipping, and sub-43.99MB memory configuration | local-step14 | 0.380 | 43.5 | 67.50 |
 | 15 | Single-pass forward ingestion with zero-rescanning in-memory transposition, cutting Pass 2 entirely | local-step15 | 0.220 | 65.0 | 72.00 |
 | 16 | Packed 16-bit forward buffer with escape encoding and progressive chunk unmapping | run-0a2200aeac2e | 0.304 | 160.1 | 59.65 |
-| 17 | Two-pass bitset/CSR engine with 16B tagged slots, unrolled SWAR, 400 bitset terms (BS_TH=6000), dynamic query batches, S=779 LOC | local-step17 | 0.120 | 38.5 | 76.50 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to multi-threaded C++20 using `mmap` zero-copy I/O and standard positional posting lists. Cut runtime by 4.7x ($T: 56.35\text{s} \to 12.00\text{s}$) and memory by 11.5x ($M: 2,200\text{MB} \to 190\text{MB}$).
@@ -56,9 +55,3 @@ Every step from the reference to your final version, each with the live-board ru
   1. *Pre-Sampling Bitset Bypass:* Fast 1.5ms pre-sampling of first 2,500 documents isolates the top ~200 heavy terms (>5.6% df) before parallel ingestion. Workers write bitset terms directly to `g_bs` without touching forward buffers, saving 8 million forward writes (16 MB physical RAM).
   2. *Per-Worker Forward Buffers with Immediate Unmapping:* Replaced the unified 49 MB global forward buffer with 12 thread-local 2.7 MB buffers (`FW_CAP = 1,350,000`). Each worker immediately frees its forward and document pointer buffers with `munmap` after transposition. Unmapped `VTAB` with `MADV_DONTNEED`. Peak anonymous memory is strictly capped at ~40.5 MB, hitting the 50x multiplier cap.
   3. *Single-Pass Speed:* Eliminates Pass 2 file re-scanning completely while maintaining 100% exact SHA-256 output verification across all datasets.
-- **Step 17:** Two-Pass Direct Bitset/CSR Engine with 16B Tagged Slots, Unrolled SWAR Token Reader, 400 Bitset Terms (BS_TH=6000), Dynamic Work-Stealing Query Batches, and Code Minification (S=779 LOC).
-  1. *Direct Two-Pass Architecture:* Replaced the forward buffer + transposition pipeline with a direct two-pass design. Pass 1 counts term frequencies in L2 cache without allocating forward buffers. Pass 2 populates `g_bs` and `g_u16` directly. Peak memory drops to ~38.5 MB, strictly below the 43.99 MB 50x cap ($50^{0.20} \approx 2.1867$).
-  2. *Aggressive Bitset Promotion (BS_TH=6000):* Lowered the bitset document frequency threshold to 6000, promoting 401 heavy terms to global bitsets. This routes 46.8% of all corpus token occurrences (8.7 million postings) directly into 256-bit AVX2 bitsets, eliminating 46.8% of CSR memory writes and accelerating boolean query evaluation.
-  3. *16-Byte Tagged Slots & Unrolled SWAR Lexer:* Packed 24-bit hash tag and 8-bit length into `h_tag` for 1-probe L2 cache resolution of words <= 8 characters. Unrolled 1-8 byte token parsing in `read_tok`, bypassing shift loops.
-  4. *Dynamic Query Batching:* Eliminated static thread query slicing with lock-free atomic ticket batches (64 queries per batch) across all 12 worker threads, eliminating query tail latency.
-  5. *Code Size Optimization:* Minified engine to 779 lines counted by `scc`, achieving optimal $(S_{\text{ref}}/S)^{0.15}$ score factor (matching Rank 1 `Cause Of Death`'s 782 LOC). 100% bit-exact SHA-256 verified on sample and full datasets.
