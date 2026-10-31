@@ -218,9 +218,7 @@ fn main() {
                         let u = parse_fast_u32(&mut cur);
                         cur = cur.add(1);
                         let v = parse_fast_u32(&mut cur);
-                        cur = cur.add(1);
-                        let _w = parse_fast_u32(&mut cur);
-                        if *cur == b'\r' {
+                        while *cur != b'\n' {
                             cur = cur.add(1);
                         }
                         cur = cur.add(1);
@@ -368,7 +366,7 @@ fn main() {
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
 
-    let q_threads = nt.min(4).min(queries.len());
+    let q_threads = nt.min(6).min(queries.len());
     let next_query = AtomicUsize::new(0);
 
     let ef_addr = edges_fwd.as_ptr() as usize;
