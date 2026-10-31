@@ -5,22 +5,29 @@ extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn close(fd: i32) -> i32;
     fn mallopt(p: i32, v: i32) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn malloc_trim(pad: usize) -> i32;
 }
 
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const BLOOM_SZ: usize = 16384;
 const BLOOM_MSK: usize = BLOOM_SZ - 1;
-const NUM_C: usize = 6;
+const NUM_C: usize = 12;
 const BS_TH: u32 = 15625;
-const MAX_W: usize = 700;
+const MAX_W: usize = 350;
 
 #[derive(Clone, Copy, Default)]
 struct Slot(u32, u32);
 #[derive(Clone, Copy, Default)]
-struct TInfo(u64, u32, u16);
+struct TInfo(u64, u32, u16, u16);
 #[derive(Clone, Copy)]
-struct Query(u8, u8, u16, [u32; 8]);
+struct Query {
+    ib: u8,
+    k: u8,
+    ops: u16,
+    t_idx: u32,
+}
 
 const CMAP: [u8; 256] = {
     let mut m = [0u8; 256];
@@ -42,9 +49,14 @@ const CMAP: [u8; 256] = {
     m
 };
 
-static mut VTAB: [Slot; H_SZ] = [Slot(0, 0); H_SZ];
-static mut TINFO: [TInfo; 81920] = [TInfo(0, 0, 0); 81920];
-static mut BLOOM: [u64; BLOOM_SZ] = [0; BLOOM_SZ];
+#[repr(align(4096))]
+struct AlignedVTab([Slot; H_SZ]);
+#[repr(align(4096))]
+struct AlignedBloom([u64; BLOOM_SZ]);
+
+static mut VTAB: AlignedVTab = AlignedVTab([Slot(0, 0); H_SZ]);
+static mut TINFO: [TInfo; 81920] = [TInfo(0, 0, 0, 0); 81920];
+static mut BLOOM: AlignedBloom = AlignedBloom([0; BLOOM_SZ]);
 static mut N_TERMS: usize = 0;
 
 #[inline(always)]
@@ -58,7 +70,7 @@ fn mix64(w0: u64, w1: u64, len: usize) -> u64 {
 unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h: u64) -> u32 {
     let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
     loop {
-        let s = *VTAB.get_unchecked(idx);
+        let s = *VTAB.0.get_unchecked(idx);
         if s.0 == 0 {
             return u32::MAX;
         }
@@ -102,16 +114,16 @@ unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
         return tid;
     }
     let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
-    while VTAB[idx].0 != 0 {
+    while VTAB.0[idx].0 != 0 {
         idx = (idx + 1) & H_MSK;
     }
     let nt = N_TERMS as u32;
     N_TERMS += 1;
-    VTAB[idx] = Slot(h32, nt);
-    TINFO[nt as usize] = TInfo(w0, off, len as u16);
-    BLOOM[((h >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h & 63);
+    VTAB.0[idx] = Slot(h32, nt);
+    TINFO[nt as usize] = TInfo(w0, off, len as u16, 0);
+    BLOOM.0[((h >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h & 63);
     let h2 = h.rotate_left(27);
-    BLOOM[((h2 >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h2 & 63);
+    BLOOM.0[((h2 >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h2 & 63);
     nt
 }
 
@@ -177,8 +189,9 @@ unsafe fn scan_doc<F: FnMut(usize)>(
         let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
         let h = mix64(w0, w1, len);
         let h2 = h.rotate_left(27);
-        let tid = if ((*BLOOM.get_unchecked(((h >> 32) as usize) & BLOOM_MSK) >> (h & 63)) & 1 != 0)
-            && ((*BLOOM.get_unchecked(((h2 >> 32) as usize) & BLOOM_MSK) >> (h2 & 63)) & 1 != 0)
+        let tid = if ((*BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK) >> (h & 63)) & 1
+            != 0)
+            && ((*BLOOM.0.get_unchecked(((h2 >> 32) as usize) & BLOOM_MSK) >> (h2 & 63)) & 1 != 0)
         {
             lookup_swar(w0, w1, &tail, len, q_buf, h)
         } else {
@@ -244,17 +257,17 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 struct Engine<'a> {
     c_off: &'a [u32],
     c_base: &'a [u32; NUM_C],
-    bs_idx: &'a [u32],
+    bs_idx: &'a [u16],
     doc_s: &'a [u32; NUM_C],
     doc_e: &'a [u32; NUM_C],
     w_per_doc: usize,
     g_bs: &'a [u64],
     g_u16: &'a [u16],
-    term_df: &'a [u32],
     rep_map: &'a [u32],
     doc_ts: &'a [u32],
     d_buf: &'a [u8],
     q_buf: &'a [u8],
+    q_terms: &'a [u32],
     nt: usize,
 }
 
@@ -272,7 +285,7 @@ impl<'a> Engine<'a> {
 
     #[inline(always)]
     unsafe fn is_bs(&self, tid: usize) -> bool {
-        *self.bs_idx.get_unchecked(tid) != u32::MAX
+        *self.bs_idx.get_unchecked(tid) != u16::MAX
     }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -282,18 +295,20 @@ impl<'a> Engine<'a> {
         let mut curr_uninit = MaybeUninit::<[u64; MAX_W]>::uninit();
         let curr = curr_uninit.assume_init_mut();
 
+        let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
+        let t0 = q_ts[0] as usize;
+
         for c in 0..NUM_C {
             let (cs, cd) = (self.doc_s[c], self.doc_e[c] - self.doc_s[c]);
             if cd == 0 {
                 continue;
             }
             let cw = ((cd + 63) >> 6) as usize;
-            let t0 = q.3[0] as usize;
             let mut clen = 0usize;
             let mut in_bs = self.is_bs(t0);
 
             let get_c_bs = |tid: usize, buf: &mut [u64; MAX_W]| {
-                if tid == u32::MAX as usize {
+                if tid == u16::MAX as usize {
                     buf[..cw].fill(0);
                 } else if self.is_bs(tid) {
                     let off = (self.bs_idx[tid] as usize) * self.w_per_doc + ((cs >> 6) as usize);
@@ -319,9 +334,9 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            for oi in 0..(q.1 as usize - 1) {
-                let op = (q.2 >> (oi * 2)) & 3;
-                let nt_id = q.3[oi + 1] as usize;
+            for oi in 0..(q.k as usize - 1) {
+                let op = (q.ops >> (oi * 2)) & 3;
+                let nt_id = q_ts[oi + 1] as usize;
                 let r = self.range(c, nt_id);
 
                 if !in_bs && op == 2 {
@@ -429,9 +444,10 @@ impl<'a> Engine<'a> {
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     unsafe fn exec_phrase(&self, q: &Query, out: &mut Vec<u8>) {
-        let (k, mut nd, mut dist) = (q.1 as usize, 0usize, [0usize; 16]);
+        let (k, mut nd, mut dist) = (q.k as usize, 0usize, [0usize; 16]);
+        let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + k];
         let mut add_dist = |t: usize| {
-            if t == u32::MAX as usize || *self.term_df.get_unchecked(t) == 0 {
+            if t == u32::MAX as usize || TINFO[t].3 == 0 {
                 false
             } else {
                 if !dist[..nd].contains(&t) {
@@ -443,21 +459,21 @@ impl<'a> Engine<'a> {
         };
 
         for i in 0..k {
-            let t = q.3[i] as usize;
+            let t = q_ts[i] as usize;
             if !add_dist(t) {
                 return fmt_res(0, 0, &[0; 10], 0, out);
             }
-            if i + 1 < k && t == q.3[i + 1] as usize && t < self.rep_map.len() {
+            if i + 1 < k && t == q_ts[i + 1] as usize && t < self.rep_map.len() {
                 let rt = *self.rep_map.get_unchecked(t) as usize;
                 if rt != u32::MAX as usize && !add_dist(rt) {
                     return fmt_res(0, 0, &[0; 10], 0, out);
                 }
             }
         }
-        dist[..nd].sort_unstable_by_key(|&t| *self.term_df.get_unchecked(t));
+        dist[..nd].sort_unstable_by_key(|&t| TINFO[t].3);
         let mut pt = [TInfo::default(); 8];
         for i in 0..k {
-            pt[i] = *TINFO.get_unchecked(q.3[i] as usize);
+            pt[i] = *TINFO.get_unchecked(q_ts[i] as usize);
         }
 
         let check_match = |j: usize, l: usize, w0: u64, w1: u64, tail: &[u8]| -> bool {
@@ -478,7 +494,7 @@ impl<'a> Engine<'a> {
         };
 
         let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-        let mut cand_uninit = MaybeUninit::<[u16; 42000]>::uninit();
+        let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
         let cand = cand_uninit.assume_init_mut();
 
         for c in 0..NUM_C {
@@ -612,6 +628,7 @@ fn main() {
         let d_buf = map_file(&format!("{}/docs.txt", d_dir));
 
         let mut queries = Vec::with_capacity(50000);
+        let mut q_terms = Vec::with_capacity(160000);
         let (mut qp, qe) = (0usize, q_buf.len());
         while qp < qe {
             while qp < qe && q_buf[qp] <= b' ' {
@@ -626,19 +643,26 @@ fn main() {
             while le < qe && q_buf[le] != if ib { b'\n' } else { b'"' } {
                 le += 1;
             }
-            let mut q = Query((!ib) as u8, 0, 0, [0; 8]);
+            let t_idx = q_terms.len() as u32;
+            let mut q = Query {
+                ib: (!ib) as u8,
+                k: 0,
+                ops: 0,
+                t_idx,
+            };
             for tok in q_buf[qp..le]
                 .split(|&b| b == b' ')
                 .filter(|s| !s.is_empty())
             {
                 let tk = (tok.as_ptr() as usize) - (q_buf.as_ptr() as usize);
                 match (ib, tok) {
-                    (true, b"AND") => q.2 |= 1 << ((q.1 - 1) * 2),
-                    (true, b"OR") => q.2 |= 2 << ((q.1 - 1) * 2),
-                    (true, b"NOT") => q.2 |= 3 << ((q.1 - 1) * 2),
+                    (true, b"AND") => q.ops |= 1 << ((q.k - 1) * 2),
+                    (true, b"OR") => q.ops |= 2 << ((q.k - 1) * 2),
+                    (true, b"NOT") => q.ops |= 3 << ((q.k - 1) * 2),
                     _ => {
-                        q.3[q.1 as usize] = insert_term(tok, tk as u32, q_buf);
-                        q.1 += 1;
+                        let tid = insert_term(tok, tk as u32, q_buf);
+                        q_terms.push(tid);
+                        q.k += 1;
                     }
                 }
             }
@@ -650,11 +674,13 @@ fn main() {
             qp += 1;
         }
         queries.shrink_to_fit();
+        q_terms.shrink_to_fit();
 
         let mut rep_map = vec![u32::MAX; N_TERMS];
         for q in &queries {
-            if q.0 == 1 {
-                for w in q.3[..q.1 as usize].windows(2) {
+            if q.ib == 1 {
+                let q_ts = &q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
+                for w in q_ts.windows(2) {
                     if w[0] == w[1] && rep_map[w[0] as usize] == u32::MAX {
                         let (t, rt) = (w[0] as usize, N_TERMS as u32);
                         N_TERMS += 1;
@@ -754,13 +780,16 @@ fn main() {
             }
         }
 
-        let (mut bs_idx, mut n_bs) = (vec![u32::MAX; nt], 0usize);
+        let (mut bs_idx, mut n_bs) = (vec![u16::MAX; nt], 0usize);
         for i in 0..nt {
-            if term_df[i] > BS_TH {
-                bs_idx[i] = n_bs as u32;
+            let df = term_df[i];
+            TINFO[i].3 = df.min(65535) as u16;
+            if df > BS_TH {
+                bs_idx[i] = n_bs as u16;
                 n_bs += 1;
             }
         }
+        drop(term_df);
 
         let w_per_doc = ((total_docs + 63) >> 6) as usize;
         let mut tot_u16 = 0u32;
@@ -773,7 +802,7 @@ fn main() {
             for i in 0..nt {
                 let cnt = c_off[c_base_off + i];
                 c_off[c_base_off + i] = tot_u16;
-                if bs_idx[i] == u32::MAX {
+                if bs_idx[i] == u16::MAX {
                     tot_u16 += cnt;
                 }
             }
@@ -806,7 +835,7 @@ fn main() {
                                 if *seen.get_unchecked(t) != ld {
                                     *seen.get_unchecked_mut(t) = ld;
                                     let bi_idx = *bi.get_unchecked(t);
-                                    if bi_idx != u32::MAX {
+                                    if bi_idx != u16::MAX {
                                         *bs_ptr.add(
                                             (bi_idx as usize) * w_per_doc + ((d >> 6) as usize),
                                         ) |= 1u64 << (d & 63);
@@ -825,6 +854,17 @@ fn main() {
             }
         });
 
+        madvise(
+            VTAB.0.as_mut_ptr() as *mut u8,
+            std::mem::size_of_val(&VTAB),
+            4,
+        );
+        madvise(
+            BLOOM.0.as_mut_ptr() as *mut u8,
+            std::mem::size_of_val(&BLOOM),
+            4,
+        );
+
         let eng = Engine {
             c_off: &c_off,
             c_base: &c_base,
@@ -834,26 +874,31 @@ fn main() {
             w_per_doc,
             g_bs: &g_bs,
             g_u16: &g_u16,
-            term_df: &term_df,
             rep_map: &rep_map,
             doc_ts: &doc_ts,
             d_buf,
             q_buf,
+            q_terms: &q_terms,
             nt,
         };
 
         const NUM_Q: usize = 12;
         let chunk_q = (queries.len() + NUM_Q - 1) / NUM_Q;
-        let mut out_bufs = vec![Vec::<u8>::with_capacity(chunk_q * 36); NUM_Q];
+        let mut out_bufs = vec![Vec::<u8>::with_capacity(chunk_q * 30); NUM_Q];
 
         std::thread::scope(|s| {
-            for (qc, ob) in queries.chunks(chunk_q).zip(&mut out_bufs) {
+            let mut chunks = queries
+                .chunks(chunk_q)
+                .zip(&mut out_bufs)
+                .collect::<Vec<_>>();
+            let last = chunks.pop();
+            for (qc, ob) in chunks {
                 let eng_ref = &eng;
                 std::thread::Builder::new()
-                    .stack_size(131072)
+                    .stack_size(65536)
                     .spawn_scoped(s, move || {
                         for q in qc {
-                            if q.0 == 0 {
+                            if q.ib == 0 {
                                 eng_ref.exec_bool(q, ob);
                             } else {
                                 eng_ref.exec_phrase(q, ob);
@@ -862,6 +907,15 @@ fn main() {
                     })
                     .unwrap();
             }
+            if let Some((qc, ob)) = last {
+                for q in qc {
+                    if q.ib == 0 {
+                        eng.exec_bool(q, ob);
+                    } else {
+                        eng.exec_phrase(q, ob);
+                    }
+                }
+            }
         });
 
         drop(g_bs);
@@ -869,6 +923,8 @@ fn main() {
         drop(c_off);
         drop(doc_ts);
         drop(queries);
+        drop(q_terms);
+        malloc_trim(0);
 
         let mut out_file = File::create(format!("{}/results.txt", o_dir)).unwrap();
         for ob in &out_bufs {
