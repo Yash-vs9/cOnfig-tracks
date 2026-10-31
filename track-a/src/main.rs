@@ -7,9 +7,7 @@ use std::ptr::copy_nonoverlapping as copy;
 use std::slice::{from_raw_parts as slc, from_raw_parts_mut as slc_mut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thread::Builder};
-extern "C" {
-    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-}
+extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; }
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
@@ -51,8 +49,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
     let u8_at = |q: *const u8| (q as *const u64).read_unaligned();
     let find = |q: *const u8, b| slc(q, lim - q as usize).iter().position(|&c| c == b).unwrap();
     let sk = |i: usize| bp.add(if i > 0 && i < sz { i + find(bp.add(i - 1), b'\n') } else { i });
+    let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
-    let mut tl_h = [0u64; 2048];
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
     let (mut cur_b, mut cur_f) = (-1i32, 256usize);
     while p < ec {
@@ -64,34 +62,15 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         }
         let mut ep = p.add(32 + (*p.add(32) != b'/') as usize);
         while *ep != b'/' { ep = ep.add(1); }
-        let m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(ep as _), sv)) as u32;
-        let el = if m0 != 0 {
-            m0.trailing_zeros() as usize
-        } else {
-            let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(ep.add(32) as _), sv)) as u32;
-            if m1 != 0 { 32 + m1.trailing_zeros() as usize } else { find(ep, b' ') }
-        };
+        let m = if ep.add(64) <= ec { sp_m(ep) | (sp_m(ep.add(32)) << 32) } else { 0 };
+        let el = if m != 0 { m.trailing_zeros() as usize } else { find(ep, b' ') };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| u8_at(ep.add(o)) & m8;
         let (w0, w1, w2, w3) = (rd(0), rd(d >> 1), rd(d.saturating_sub(8)), rd(d));
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let tl_slot = (h >> 16) as usize & 2047;
-        let tl_entry = tl_h[tl_slot];
-        let eid = if (tl_entry ^ h) < 65536 {
-            (tl_entry & 0xFFFF) as usize
-        } else {
-            let idx = ((h >> 16) as usize) & 32767;
-            let kv = (*s).k[idx].load(Relaxed);
-            let id = if (kv ^ h) < 65536 {
-                (kv & 0xFFFF) as usize
-            } else {
-                intern(1, ep, el as u8, h)
-            };
-            tl_h[tl_slot] = h | (id as u64);
-            id
-        };
+        let eid = intern(1, ep, el as u8, h);
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let lp = st_p.add(4);

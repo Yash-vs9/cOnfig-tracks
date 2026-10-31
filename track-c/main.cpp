@@ -86,9 +86,11 @@ int main(int argc, char **argv) {
   const char *rb = rsz ? (const char *)mmap(0, rsz, PROT_READ, MAP_SHARED, rfd, 0) : nullptr;
   if (rsz && rb == MAP_FAILED) rb = (const char *)mmap(0, rsz, PROT_READ, MAP_PRIVATE, rfd, 0);
   if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_WILLNEED | MADV_SEQUENTIAL);
+
   const char *base = sz ? (const char *)mmap(0, sz, PROT_READ, MAP_SHARED, mfd, 0) : nullptr;
   if (sz && base == MAP_FAILED) base = (const char *)mmap(0, sz, PROT_READ, MAP_PRIVATE, mfd, 0);
   if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
+
   memset(reg_lut, 0xFF, sizeof(reg_lut));
   if (rsz) {
     for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
@@ -162,21 +164,16 @@ int main(int argc, char **argv) {
       if (__builtin_expect(*p == '"', 1)) {
         const char *q = find_q(++p);
         if (__builtin_expect(q[1] != '"', 1)) {
-          nb = q - p;
-          nh = hash_bytes(p, (uint32_t)nb);
-          p = q + 2;
+          nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 2;
         } else {
           for (;;) {
             size_t seg = q - p + 1;
             if (nb + (int64_t)seg <= 512) memcpy(tmp + nb, p, seg);
-            nb += seg;
-            p = q + 2;
-            q = find_q(p);
+            nb += seg, p = q + 2, q = find_q(p);
             if (q[1] != '"') {
               size_t rem = q - p;
               if (nb + (int64_t)rem <= 512) memcpy(tmp + nb, p, rem);
-              nb += rem;
-              p = q + 2;
+              nb += rem, p = q + 2;
               break;
             }
           }
@@ -226,13 +223,11 @@ int main(int argc, char **argv) {
       uint32_t rid = (uint32_t)parse_u(p);
       uint8_t r_cid = rid < 1000000 ? reg_lut[rid] : 0xFF, cid = r_cid == 0xFF ? unm_cid : r_cid;
       bool neg = (*p == '-') && ++p;
-      while (*p != '.') cents = (cents << 3) + (cents << 1) + (*p++ - '0');
+      while (*p != '.') cents = cents * 10 + (*p++ - '0');
       cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
-      while (p < end && (uint8_t)*p <= ' ') ++p;
+      p += 1 + (*p == '\r');
 
-      Agg &a = T[tid][cid];
-      a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
-      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
+      T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
 
       uint32_t tl_idx = (uint32_t)nh & 2047;
       uint64_t tl_sig = (nh & ~0xFFULL) | cid;
@@ -247,9 +242,7 @@ int main(int argc, char **argv) {
           }
           if (k == nh) {
             uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-            if (!(*w & mask) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) {
-              a.dn++;
-            }
+            if (!(*w & mask) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
             break;
           }
         }
@@ -257,17 +250,11 @@ int main(int argc, char **argv) {
     }
   }
 
-  for (int cid = 0; cid <= unm_cid; ++cid) {
-    G[cid].mi = INT64_MAX, G[cid].ma = INT64_MIN;
+  for (int cid = 0; cid <= unm_cid; ++cid)
     for (int tid = 0; tid < 12; ++tid) {
-      Agg &t = T[tid][cid];
-      G[cid].dn += t.dn;
-      if (t.cnt) {
-        G[cid].cnt += t.cnt, G[cid].id_s += t.id_s, G[cid].am_s += t.am_s, G[cid].nb += t.nb, G[cid].ntb += t.ntb;
-        G[cid].mi = std::min(G[cid].mi, t.mi), G[cid].ma = std::max(G[cid].ma, t.ma);
-      }
+      G[cid].dn += T[tid][cid].dn;
+      if (T[tid][cid].cnt) G[cid].add(T[tid][cid]);
     }
-  }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) { ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' '; };
