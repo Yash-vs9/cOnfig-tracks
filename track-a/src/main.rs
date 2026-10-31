@@ -9,18 +9,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thread::Builder};
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn munmap(a: *mut u8, l: usize) -> i32;
-    fn madvise(a: *mut u8, l: usize, b: i32) -> i32;
 }
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
-    k: [AtomicU64; 33024], c: [AtomicU32; 163845], p: [usize; 2304],
+    k: [AtomicU64; 33024], c: [AtomicU32; 163844], p: [usize; 2304],
     q: [u32; 13312 * 256], g: [u32; 65536], l: [[u32; 49152]; 12], n: [i32; 13312],
     h: [[[i32; 128]; 12]; 2], w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]),
     u: ([u8; 2304], [[u8; 163840]; 12]),
-    str_buf: [u8; 65536],
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[inline(always)]
@@ -41,10 +38,7 @@ unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
     while (kv ^ h) >= 65536 {
         if kv == 0 && (*s).k[b_kv + idx].compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
-            let str_off = (*s).c[163844].fetch_add(len as u32, Relaxed) as usize;
-            let dst = (*s).str_buf.as_mut_ptr().add(str_off);
-            copy(p, dst, len as usize);
-            ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (dst as usize, len, (j - b_id) as u16);
+            ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
             (*s).k[b_kv + idx].store(h | ((j - b_id) as u64), Release);
         }
         idx = (idx + (kv > 1) as usize) & mask; kv = (*s).k[b_kv + idx].load(Acquire);
@@ -59,7 +53,6 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
     let sk = |i: usize| bp.add(if i > 0 && i < sz { i + find(bp.add(i - 1), b'\n') } else { i });
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     let mut tl_h = [0u64; 2048];
-    let mut last_evict = p;
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
     let (mut cur_b, mut cur_f) = (-1i32, 256usize);
     while p < ec {
@@ -102,17 +95,17 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let lp = st_p.add(4);
-        let mut lat = (*lp - b'0') as u32;
-        let mut c = lp.add(1);
-        while *c >= b'0' {
-            lat = (lat << 3) + (lat << 1) + (*c - b'0') as u32;
-            c = c.add(1);
+        let sub = if lp.add(8) <= ec { u8_at(lp).wrapping_sub(0x3030_3030_3030_3030) } else { 0 };
+        let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
+        if sub & 0x8080_8080_8080_8080 != 0 {
+            let tz = (sub & 0x8080_8080_8080_8080).trailing_zeros();
+            let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
+            let w2 = (w.wrapping_mul(6553601) >> 16 & 0xFFFF_0000_FFFF).wrapping_mul(42949672960001);
+            (c, lat) = (lp.add((tz >> 3) as usize), (w2 >> 32) as u32);
+        } else {
+            while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
         }
         p = c.add(1 + (*c == b'\r') as usize);
-        if p >= last_evict.add(2 << 20) {
-            madvise(last_evict as *mut _, p as usize - last_evict as usize, 4);
-            last_evict = p;
-        }
         if cur_f == 256 {
             (cur_b >= 0).then(|| (*s).w.1[cur_b as usize] = 256);
             let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
@@ -129,9 +122,6 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
     (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
     for i in 0..128 { ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]); }
     bar.wait();
-    if t == 0 {
-        munmap(bp as *mut _, sz);
-    }
     let (nh, ne) = ((*s).c[163840].load(Relaxed) as _, (*s).c[163841].load(Relaxed) as _);
     if t == 0 {
         let (p_arr, u0_arr) = ((*s).p.as_ptr(), (*s).u.0.as_ptr());
