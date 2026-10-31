@@ -18,7 +18,7 @@ const INF32: u32 = u32::MAX;
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const H_MAX_LOAD: u32 = 85000;
-const STREAM_BUF_SIZE: usize = 1024 * 1024;
+const STREAM_BUF_SIZE: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
 struct Query { s: u32, t: u32, id: u32 }
@@ -155,7 +155,7 @@ impl MinHeap4 {
         let packed = ((d as u64) << 32) | (v as u64);
         let mut i = self.data.len();
         unsafe {
-            if i >= self.data.capacity() { self.data.reserve(32768); }
+            if i >= self.data.capacity() { self.data.reserve(16384); }
             self.data.set_len(i + 1);
             let slice = self.data.as_mut_ptr();
             while i > 0 {
@@ -412,7 +412,6 @@ fn main() {
         }
     }
     drop(q_bytes);
-    queries.sort_unstable_by_key(|q| (q.s >> 5, q.t >> 5));
 
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
@@ -430,8 +429,8 @@ fn main() {
 
             scope.spawn(move || {
                 let mut dist_map = FastDistMap::new();
-                let mut heap_f = MinHeap4::with_capacity(32768);
-                let mut heap_b = MinHeap4::with_capacity(32768);
+                let mut heap_f = MinHeap4::with_capacity(16384);
+                let mut heap_b = MinHeap4::with_capacity(16384);
                 let (hf_ptr, hr_ptr) = (hf_ref.as_ptr(), hr_ref.as_ptr());
                 let (ef_ptr, er_ptr) = (ef_ref.as_ptr(), er_ref.as_ptr());
                 let ans_ptr = answers_addr as *mut i64;
