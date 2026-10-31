@@ -1,20 +1,17 @@
 //! Speed Demon 2026 - Track D (Traverse)
-//! Ultra-Low-RSS, 12-Thread Cache-Prefetched Bidirectional Dijkstra Engine.
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 const W_BITS: u32 = 11;
-const W_SENTINEL: u32 = (1 << W_BITS) - 1; // 2047
+const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_BITS: u32 = 21;
 const V_MASK: u32 = (1 << V_BITS) - 1;
 const INF32: u32 = u32::MAX;
-const H_SZ: usize = 131072;
+const H_SZ: usize = 65536;
 const H_MSK: usize = H_SZ - 1;
-const H_MAX_LOAD: u32 = 91750; // ~70% load factor cap
+const H_MAX_LOAD: u32 = 55705; // 85% of 65536
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
@@ -36,21 +33,102 @@ impl FastDistMap {
         if self.epoch == 0 { for s in &mut self.slots { s.epoch = 0; } self.epoch = 1; }
     }
     #[inline(always)]
-    fn get_slot(&mut self, v: u32) -> *mut Slot {
+    unsafe fn init_start(&mut self, s: u32, t: u32) {
+        let ep = self.epoch;
+        let mut idx = (s.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_mut_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep || (*slot).v == s {
+                (*slot).epoch = ep; (*slot).v = s; (*slot).fwd = 0; (*slot).rev = INF32;
+                self.used += 1;
+                break;
+            }
+            idx = (idx + 1) & H_MSK;
+        }
+        let mut idx_t = (t.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        loop {
+            let slot = base.add(idx_t);
+            if (*slot).epoch != ep || (*slot).v == t {
+                (*slot).epoch = ep; (*slot).v = t; (*slot).fwd = INF32; (*slot).rev = 0;
+                self.used += 1;
+                break;
+            }
+            idx_t = (idx_t + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn get_fwd_dist(&self, v: u32) -> u32 {
         let ep = self.epoch;
         let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
-        unsafe {
-            let base = self.slots.as_mut_ptr();
-            loop {
-                let slot = base.add(idx);
-                if (*slot).epoch != ep {
-                    (*slot).epoch = ep; (*slot).v = v; (*slot).fwd = INF32; (*slot).rev = INF32;
-                    self.used += 1;
-                    return slot;
-                }
-                if (*slot).v == v { return slot; }
-                idx = (idx + 1) & H_MSK;
+        let base = self.slots.as_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep { return INF32; }
+            if (*slot).v == v { return (*slot).fwd; }
+            idx = (idx + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn get_rev_dist(&self, v: u32) -> u32 {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep { return INF32; }
+            if (*slot).v == v { return (*slot).rev; }
+            idx = (idx + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn relax_fwd(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_mut_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep {
+                (*slot).epoch = ep; (*slot).v = v; (*slot).fwd = nd; (*slot).rev = INF32;
+                self.used += 1;
+                heap.push(nd, v);
+                return;
             }
+            if (*slot).v == v {
+                if nd < (*slot).fwd {
+                    (*slot).fwd = nd;
+                    heap.push(nd, v);
+                    let cr = (*slot).rev;
+                    if cr != INF32 { *mu = (*mu).min(nd.saturating_add(cr)); }
+                }
+                return;
+            }
+            idx = (idx + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn relax_rev(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_mut_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep {
+                (*slot).epoch = ep; (*slot).v = v; (*slot).fwd = INF32; (*slot).rev = nd;
+                self.used += 1;
+                heap.push(nd, v);
+                return;
+            }
+            if (*slot).v == v {
+                if nd < (*slot).rev {
+                    (*slot).rev = nd;
+                    heap.push(nd, v);
+                    let cf = (*slot).fwd;
+                    if cf != INF32 { *mu = (*mu).min(nd.saturating_add(cf)); }
+                }
+                return;
+            }
+            idx = (idx + 1) & H_MSK;
         }
     }
 }
@@ -93,8 +171,13 @@ impl MinHeap4 {
                     let c = (i << 2) + 1;
                     if c >= sz { break; }
                     let mut mc = c;
-                    let ec = (c + 4).min(sz);
-                    for k in c + 1..ec { if *slice.add(k) < *slice.add(mc) { mc = k; } }
+                    if c + 3 < sz {
+                        if *slice.add(c + 1) < *slice.add(mc) { mc = c + 1; }
+                        if *slice.add(c + 2) < *slice.add(mc) { mc = c + 2; }
+                        if *slice.add(c + 3) < *slice.add(mc) { mc = c + 3; }
+                    } else {
+                        for k in c + 1..sz { if *slice.add(k) < *slice.add(mc) { mc = k; } }
+                    }
                     if *slice.add(mc) >= last { break; }
                     *slice.add(i) = *slice.add(mc);
                     i = mc;
@@ -121,12 +204,12 @@ fn solve_query_64(
     ef_ptr: *const u32, er_ptr: *const u32,
     oflow: &[(u32, u32)],
 ) -> i64 {
-    let mut dist_f = HashMap::with_capacity(2048);
-    let mut dist_b = HashMap::with_capacity(2048);
-    let mut q_f = BinaryHeap::new();
-    let mut q_b = BinaryHeap::new();
+    let mut dist_f = std::collections::HashMap::with_capacity(65536);
+    let mut dist_b = std::collections::HashMap::with_capacity(65536);
+    let mut q_f = std::collections::BinaryHeap::new();
+    let mut q_b = std::collections::BinaryHeap::new();
     dist_f.insert(s as u32, 0u64); dist_b.insert(t as u32, 0u64);
-    q_f.push((Reverse(0u64), s as u32)); q_b.push((Reverse(0u64), t as u32));
+    q_f.push((std::cmp::Reverse(0u64), s as u32)); q_b.push((std::cmp::Reverse(0u64), t as u32));
     let mut mu = u64::MAX;
     unsafe {
         while !q_f.is_empty() && !q_b.is_empty() {
@@ -137,7 +220,7 @@ fn solve_query_64(
             } else {
                 (&mut q_b, &mut dist_b, &dist_f, hr_ptr, er_ptr, 1u32 << 31)
             };
-            let (Reverse(d), u) = q.pop().unwrap();
+            let (std::cmp::Reverse(d), u) = q.pop().unwrap();
             if d > *dist_m.get(&u).unwrap_or(&u64::MAX) { continue; }
             let (start, end) = (*h_ptr.add(u as usize) as usize, *h_ptr.add(u as usize + 1) as usize);
             for e in start..end {
@@ -152,7 +235,7 @@ fn solve_query_64(
                 let nd = d + w;
                 if nd < *dist_m.get(&v).unwrap_or(&u64::MAX) {
                     dist_m.insert(v, nd);
-                    q.push((Reverse(nd), v));
+                    q.push((std::cmp::Reverse(nd), v));
                     if let Some(&opp_d) = dist_o.get(&v) { mu = mu.min(nd + opp_d); }
                 }
             }
@@ -374,8 +457,7 @@ fn main() {
                     dist_map.next_query();
                     heap_f.clear(); heap_b.clear();
                     unsafe {
-                        (*dist_map.get_slot(s as u32)).fwd = 0;
-                        (*dist_map.get_slot(t as u32)).rev = 0;
+                        dist_map.init_start(s as u32, t as u32);
                     }
                     heap_f.push(0, s as u32); heap_b.push(0, t as u32);
 
@@ -389,8 +471,7 @@ fn main() {
 
                             if heap_f.data.len() <= heap_b.data.len() {
                                 let (d, u) = heap_f.pop();
-                                let u_slot = dist_map.get_slot(u);
-                                if d > (*u_slot).fwd { continue; }
+                                if d > dist_map.get_fwd_dist(u) { continue; }
                                 let (e_start, e_end) = (*hf_ptr.add(u as usize) as usize, *hf_ptr.add(u as usize + 1) as usize);
                                 for e in e_start..e_end {
                                     let packed = *ef_ptr.add(e);
@@ -404,18 +485,11 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    let vs = dist_map.get_slot(v);
-                                    if nd < (*vs).fwd {
-                                        let cr = (*vs).rev;
-                                        (*vs).fwd = nd;
-                                        heap_f.push(nd, v);
-                                        if cr != INF32 { mu = mu.min(nd.saturating_add(cr)); }
-                                    }
+                                    dist_map.relax_fwd(v, nd, &mut heap_f, &mut mu);
                                 }
                             } else {
                                 let (d, u) = heap_b.pop();
-                                let u_slot = dist_map.get_slot(u);
-                                if d > (*u_slot).rev { continue; }
+                                if d > dist_map.get_rev_dist(u) { continue; }
                                 let (e_start, e_end) = (*hr_ptr.add(u as usize) as usize, *hr_ptr.add(u as usize + 1) as usize);
                                 for e in e_start..e_end {
                                     let packed = *er_ptr.add(e);
@@ -429,13 +503,7 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    let vs = dist_map.get_slot(v);
-                                    if nd < (*vs).rev {
-                                        let cf = (*vs).fwd;
-                                        (*vs).rev = nd;
-                                        heap_b.push(nd, v);
-                                        if cf != INF32 { mu = mu.min(nd.saturating_add(cf)); }
-                                    }
+                                    dist_map.relax_rev(v, nd, &mut heap_b, &mut mu);
                                 }
                             }
                         }
