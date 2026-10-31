@@ -21,7 +21,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | Gated 64-bit fallback on touched_overflow & eliminated software prefetching | run-7e3369dda6da | 0.398 | 142.3 | 56.00 |
 | 15 | FastDistMap 2MB epoch linear hash table (-69MB thread RAM) & arena limits | run-2ea96534a8b9 | 0.369 | 73.4 | 59.46 |
 | 16 | Inlined single-probe relaxations, 6 P-core ingestion scaling, query mmap & LOC to 528 | run-0da9b767c30c | 0.846 | 91.8 | 49.15 |
-| 17 | Streaming pread (0 mmap RSS), FastDistMap 70% load guard, 12 query threads & cold fallback | pending | pending | pending | pending |
+| 17 | Streaming pread (0 mmap RSS), FastDistMap 70% load guard, 12 query threads & cold fallback | run-dab2cd6126c5 | 0.338 | 85.9 | 59.51 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
