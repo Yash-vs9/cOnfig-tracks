@@ -1,8 +1,17 @@
 #![allow(static_mut_refs)]
-use std::{arch::x86_64::*, fs::File, io::Write, mem::MaybeUninit, os::unix::io::IntoRawFd, ptr, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    arch::x86_64::*,
+    fs::File,
+    io::Write,
+    mem::{size_of, MaybeUninit},
+    os::unix::io::IntoRawFd,
+    ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn munmap(a: *mut u8, l: usize) -> i32;
     fn close(fd: i32) -> i32;
     fn mallopt(p: i32, v: i32) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
@@ -22,7 +31,12 @@ struct Slot(u32, u32);
 #[derive(Clone, Copy, Default)]
 struct TInfo(u64, u32, u16, u16);
 #[derive(Clone, Copy)]
-struct Query { ib: u8, k: u8, ops: u16, t_idx: u32 }
+struct Query {
+    ib: u8,
+    k: u8,
+    ops: u16,
+    t_idx: u32,
+}
 
 const CMAP: [u8; 256] = {
     let mut m = [0u8; 256];
@@ -49,7 +63,8 @@ static mut N_TERMS: usize = 0;
 
 #[inline(always)]
 fn mix64(w0: u64, w1: u64, len: usize) -> u64 {
-    let h = (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64))).wrapping_mul(0xbf58476d1ce4e5b9);
+    let h = (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64)))
+        .wrapping_mul(0xbf58476d1ce4e5b9);
     h ^ (h >> 31)
 }
 
@@ -67,8 +82,10 @@ unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h
                 let (q_ptr, off) = (q_buf.as_ptr().add(ti.1 as usize + 8), len - 8);
                 let w1_b = w1.to_ne_bytes();
                 let match_w1 = if off <= 8 {
-                    std::slice::from_raw_parts(q_ptr, off) == &w1_b[..off] } else {
-                    std::slice::from_raw_parts(q_ptr, 8) == &w1_b[..8] && std::slice::from_raw_parts(q_ptr.add(8), off - 8) == &tail[..off - 8]
+                    std::slice::from_raw_parts(q_ptr, off) == &w1_b[..off]
+                } else {
+                    std::slice::from_raw_parts(q_ptr, 8) == &w1_b[..8]
+                        && std::slice::from_raw_parts(q_ptr.add(8), off - 8) == &tail[..off - 8]
                 };
                 if match_w1 { return s.1; }
             }
@@ -81,7 +98,9 @@ unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h
 unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
     let (mut w0, mut w1, len) = (0u64, 0u64, s.len());
     ptr::copy_nonoverlapping(s.as_ptr(), &mut w0 as *mut _ as *mut u8, len.min(8));
-    if len > 8 { ptr::copy_nonoverlapping(s.as_ptr().add(8), &mut w1 as *mut _ as *mut u8, (len - 8).min(8)); }
+    if len > 8 {
+        ptr::copy_nonoverlapping(s.as_ptr().add(8), &mut w1 as *mut _ as *mut u8, (len - 8).min(8));
+    }
     let h = mix64(w0, w1, len);
     let tail = if len > 16 { &s[16..] } else { &[] };
     let tid = lookup_swar(w0, w1, tail, len, q_buf, h);
@@ -131,17 +150,38 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
 
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], rep_map: &[u32], mut fn_: F) {
-    let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
-    let d_ptr = d_buf.as_ptr();
-    let d_len = d_buf.len();
+unsafe fn scan_doc<F: FnMut(usize)>(
+    d_buf: &[u8], p: &mut usize, q_buf: &[u8], rep_map: &[u32], mut fn_: F,
+) {
+    let mut p_tid = u32::MAX;
+    let (d_ptr, d_len) = (d_buf.as_ptr(), d_buf.len());
     let v_20 = _mm256_set1_epi8(0x20);
-    let v_a = _mm256_set1_epi8((b'a' - 1) as i8);
-    let v_z = _mm256_set1_epi8((b'z' + 1) as i8);
-    let v_0 = _mm256_set1_epi8((b'0' - 1) as i8);
-    let v_9 = _mm256_set1_epi8((b'9' + 1) as i8);
+    let (v_a, v_z) = (_mm256_set1_epi8((b'a' - 1) as i8), _mm256_set1_epi8((b'z' + 1) as i8));
+    let (v_0, v_9) = (_mm256_set1_epi8((b'0' - 1) as i8), _mm256_set1_epi8((b'9' + 1) as i8));
     let v_nl = _mm256_set1_epi8(b'\n' as i8);
     let mut lbuf = [0u8; 48];
+
+    let mut process = |w0: u64, w1: u64, tail: &[u8], len: usize| {
+        let h = mix64(w0, w1, len);
+        let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
+        let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
+        let tid = if (b & m_bits) == m_bits {
+            lookup_swar(w0, w1, tail, len, q_buf, h)
+        } else {
+            u32::MAX
+        };
+        if tid != u32::MAX {
+            let t = tid as usize;
+            fn_(t);
+            if p_tid == tid && t < rep_map.len() {
+                let rt = *rep_map.get_unchecked(t);
+                if rt != u32::MAX { fn_(rt as usize); }
+            }
+            p_tid = tid;
+        } else {
+            p_tid = u32::MAX;
+        }
+    };
 
     'chunk_loop: while *p + 32 <= d_len {
         let raw = _mm256_loadu_si256(d_ptr.add(*p) as *const __m256i);
@@ -164,54 +204,23 @@ unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], r
                 *p += s_bit as usize;
                 let mut tail = [0u8; 16];
                 let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
-                let h = mix64(w0, w1, len);
-                let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
-                let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
-                let tid = if (b & m_bits) == m_bits { lookup_swar(w0, w1, &tail, len, q_buf, h) } else { u32::MAX };
-                if tid != u32::MAX {
-                    let t = tid as usize;
-                    fn_(t);
-                    if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
-                        let rt = *rep_map.get_unchecked(t);
-                        if rt != u32::MAX { fn_(rt as usize); }
-                    }
-                    p_tid = tid; p_pos = pos;
-                } else { p_tid = u32::MAX; }
-                pos += 1;
+                process(w0, w1, &tail, len);
                 continue 'chunk_loop;
             }
 
             let len = t_len as usize;
             let lp = lbuf.as_ptr().add(s_bit as usize);
-            let (w0, w1, tail) = if len <= 8 {
-                let raw_w0 = (lp as *const u64).read_unaligned();
-                (_bzhi_u64(raw_w0, (len * 8) as u32), 0u64, [0u8; 16])
-            } else if len <= 16 {
-                let raw_w0 = (lp as *const u64).read_unaligned();
+            let raw_w0 = (lp as *const u64).read_unaligned();
+            let mut tail = [0u8; 16];
+            let (w0, w1) = if len <= 8 {
+                (_bzhi_u64(raw_w0, (len * 8) as u32), 0u64)
+            } else {
                 let raw_w1 = (lp.add(8) as *const u64).read_unaligned();
-                (raw_w0, _bzhi_u64(raw_w1, ((len - 8) * 8) as u32), [0u8; 16]) } else {
-                let raw_w0 = (lp as *const u64).read_unaligned();
-                let raw_w1 = (lp.add(8) as *const u64).read_unaligned();
-                let mut t_arr = [0u8; 16];
-                ptr::copy_nonoverlapping(lp.add(16), t_arr.as_mut_ptr(), len - 16);
-                (raw_w0, raw_w1, t_arr)
+                if len > 16 { ptr::copy_nonoverlapping(lp.add(16), tail.as_mut_ptr(), len - 16); }
+                (raw_w0, _bzhi_u64(raw_w1, ((len - 8) * 8) as u32))
             };
 
-            let h = mix64(w0, w1, len);
-            let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
-            let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
-            let tid = if (b & m_bits) == m_bits { lookup_swar(w0, w1, &tail, len, q_buf, h) } else { u32::MAX };
-            if tid != u32::MAX {
-                let t = tid as usize;
-                fn_(t);
-                if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
-                    let rt = *rep_map.get_unchecked(t);
-                    if rt != u32::MAX { fn_(rt as usize); }
-                }
-                p_tid = tid; p_pos = pos;
-            } else { p_tid = u32::MAX; }
-            pos += 1;
-
+            process(w0, w1, &tail, len);
             let clear_shift = s_bit + t_len;
             if clear_shift >= 32 { break; }
             mask &= !((1u32 << clear_shift) - 1);
@@ -226,20 +235,7 @@ unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], r
         if *d_buf.get_unchecked(*p) == b'\n' { *p += 1; break; }
         let mut tail = [0u8; 16];
         let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
-        let h = mix64(w0, w1, len);
-        let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
-        let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
-        let tid = if (b & m_bits) == m_bits { lookup_swar(w0, w1, &tail, len, q_buf, h) } else { u32::MAX };
-        if tid != u32::MAX {
-            let t = tid as usize;
-            fn_(t);
-            if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
-                let rt = *rep_map.get_unchecked(t);
-                if rt != u32::MAX { fn_(rt as usize); }
-            }
-            p_tid = tid; p_pos = pos;
-        } else { p_tid = u32::MAX; }
-        pos += 1;
+        process(w0, w1, &tail, len);
     }
 }
 
@@ -258,10 +254,15 @@ fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
 #[inline(always)]
 fn fmt_res(cnt: u64, sum: u64, top: &[u32; 10], tc: usize, out: &mut Vec<u8>) {
     if cnt == 0 {
-        out.extend_from_slice(b"0 0\n"); } else {
-        push_u64(out, cnt); out.push(b' ');
+        out.extend_from_slice(b"0 0\n");
+    } else {
+        push_u64(out, cnt);
+        out.push(b' ');
         push_u64(out, sum);
-        for &d in &top[..tc] { out.push(b' '); push_u64(out, d as u64); }
+        for &d in &top[..tc] {
+            out.push(b' ');
+            push_u64(out, d as u64);
+        }
         out.push(b'\n');
     }
 }
@@ -273,6 +274,14 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     close(fd);
     std::slice::from_raw_parts(p, len)
+}
+
+unsafe fn alloc_mmap<T>(count: usize) -> *mut T {
+    mmap(ptr::null_mut(), count * size_of::<T>(), 3, 0x22, -1, 0) as *mut T
+}
+
+unsafe fn free_mmap<T>(p: *mut T, count: usize) {
+    munmap(p as *mut u8, count * size_of::<T>());
 }
 
 struct Engine<'a> {
@@ -301,7 +310,47 @@ impl<'a> Engine<'a> {
     }
 
     #[inline(always)]
-    unsafe fn is_bs(&self, tid: usize) -> bool { *self.bs_idx.get_unchecked(tid) != u16::MAX }
+    unsafe fn is_bs(&self, tid: usize) -> bool {
+        *self.bs_idx.get_unchecked(tid) != u16::MAX
+    }
+
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    unsafe fn emit_bits(
+        &self, curr: &[u64], cs: u32, cd: u32, cw: usize,
+        t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize,
+    ) {
+        let mut w = 0usize;
+        while w + 4 <= cw {
+            let v4 = _mm256_loadu_si256(curr.as_ptr().add(w) as *const __m256i);
+            if _mm256_testz_si256(v4, v4) != 0 { w += 4; continue; }
+            for i in 0..4 {
+                let mut v = *curr.get_unchecked(w + i);
+                if (w + i == cw - 1) && ((cd & 63) != 0) { v &= (1u64 << (cd & 63)) - 1; }
+                let base = cs + (((w + i) as u32) << 6);
+                while v != 0 {
+                    let d = base + v.trailing_zeros();
+                    *t_cnt += 1;
+                    *t_sum += d as u64;
+                    if *tc < 10 { top[*tc] = d; *tc += 1; }
+                    v &= v - 1;
+                }
+            }
+            w += 4;
+        }
+        while w < cw {
+            let mut v = *curr.get_unchecked(w);
+            if (w == cw - 1) && ((cd & 63) != 0) { v &= (1u64 << (cd & 63)) - 1; }
+            let base = cs + ((w as u32) << 6);
+            while v != 0 {
+                let d = base + v.trailing_zeros();
+                *t_cnt += 1;
+                *t_sum += d as u64;
+                if *tc < 10 { top[*tc] = d; *tc += 1; }
+                v &= v - 1;
+            }
+            w += 1;
+        }
+    }
 
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
@@ -312,8 +361,85 @@ impl<'a> Engine<'a> {
         let curr = curr_uninit.assume_init_mut();
 
         let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
-        let t0 = q_ts[0] as usize;
+        let is_pure_and = (0..q.k - 1).all(|i| ((q.ops >> (i * 2)) & 3) == 1);
 
+        if is_pure_and {
+            for c in 0..NUM_C {
+                let (cs, cd) = (self.doc_s[c], self.doc_e[c] - self.doc_s[c]);
+                if cd == 0 { continue; }
+                let cw = ((cd + 63) >> 6) as usize;
+                let (mut min_len, mut min_t, mut zero_cand) = (usize::MAX, usize::MAX, false);
+
+                for &tid in q_ts {
+                    let t = tid as usize;
+                    if !self.is_bs(t) {
+                        let l = self.range(c, t).len();
+                        if l == 0 { zero_cand = true; break; }
+                        if l < min_len { min_len = l; min_t = t; }
+                    }
+                }
+                if zero_cand { continue; }
+
+                if min_t != usize::MAX {
+                    let r0 = self.range(c, min_t);
+                    let mut clen = r0.len();
+                    clist[..clen].copy_from_slice(&self.g_u16[r0]);
+
+                    for &tid in q_ts {
+                        let ot = tid as usize;
+                        if ot == min_t { continue; }
+                        if clen == 0 { break; }
+                        let mut w = 0usize;
+                        if self.is_bs(ot) {
+                            let b = &self.g_bs[(self.bs_idx[ot] as usize) * self.w_per_doc..];
+                            for i in 0..clen {
+                                let d = (cs + clist[i] as u32) as usize;
+                                if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) != 0 {
+                                    clist[w] = clist[i]; w += 1;
+                                }
+                            }
+                        } else {
+                            let r = self.range(c, ot);
+                            let (mut i, mut j) = (0usize, r.start);
+                            while i < clen && j < r.end {
+                                let (cv, gv) = (clist[i], self.g_u16[j]);
+                                if cv == gv { clist[w] = cv; w += 1; }
+                                i += (cv <= gv) as usize;
+                                j += (cv >= gv) as usize;
+                            }
+                        }
+                        clen = w;
+                    }
+                    for i in 0..clen {
+                        let d = cs + clist[i] as u32;
+                        t_cnt += 1;
+                        t_sum += d as u64;
+                        if tc < 10 { top[tc] = d; tc += 1; }
+                    }
+                } else {
+                    let t0 = q_ts[0] as usize;
+                    let off0 = (self.bs_idx[t0] as usize) * self.w_per_doc + ((cs >> 6) as usize);
+                    curr[..cw].copy_from_slice(&self.g_bs[off0..off0 + cw]);
+
+                    for &tid in &q_ts[1..] {
+                        let off = (self.bs_idx[tid as usize] as usize) * self.w_per_doc + ((cs >> 6) as usize);
+                        let b = &self.g_bs[off..];
+                        let mut w = 0usize;
+                        while w + 4 <= cw {
+                            let cv = _mm256_loadu_si256(curr.as_ptr().add(w) as *const __m256i);
+                            let bv = _mm256_loadu_si256(b.as_ptr().add(w) as *const __m256i);
+                            _mm256_storeu_si256(curr.as_mut_ptr().add(w) as *mut __m256i, _mm256_and_si256(cv, bv));
+                            w += 4;
+                        }
+                        while w < cw { *curr.get_unchecked_mut(w) &= *b.get_unchecked(w); w += 1; }
+                    }
+                    self.emit_bits(curr, cs, cd, cw, &mut t_cnt, &mut t_sum, &mut top, &mut tc);
+                }
+            }
+            return fmt_res(t_cnt, t_sum, &top, tc, out);
+        }
+
+        let t0 = q_ts[0] as usize;
         for c in 0..NUM_C {
             let (cs, cd) = (self.doc_s[c], self.doc_e[c] - self.doc_s[c]);
             if cd == 0 { continue; }
@@ -321,21 +447,10 @@ impl<'a> Engine<'a> {
             let mut clen = 0usize;
             let mut in_bs = self.is_bs(t0);
 
-            let get_c_bs = |tid: usize, buf: &mut [u64; MAX_W]| {
-                if tid == u16::MAX as usize {
-                    buf[..cw].fill(0);
-                } else if self.is_bs(tid) {
-                    let off = (self.bs_idx[tid] as usize) * self.w_per_doc + ((cs >> 6) as usize);
-                    buf[..cw].copy_from_slice(&self.g_bs[off..off + cw]); } else {
-                    buf[..cw].fill(0);
-                    for &ld in &self.g_u16[self.range(c, tid)] {
-                        *buf.get_unchecked_mut((ld as usize) >> 6) |= 1u64 << (ld & 63);
-                    }
-                }
-            };
-
             if in_bs {
-                get_c_bs(t0, curr); } else {
+                let off = (self.bs_idx[t0] as usize) * self.w_per_doc + ((cs >> 6) as usize);
+                curr[..cw].copy_from_slice(&self.g_bs[off..off + cw]);
+            } else {
                 let r0 = self.range(c, t0);
                 clen = r0.len();
                 clist[..clen].copy_from_slice(&self.g_u16[r0]);
@@ -388,10 +503,7 @@ impl<'a> Engine<'a> {
                         for &ld in &self.g_u16[r] {
                             let idx = (ld as usize) >> 6;
                             let bit = 1u64 << (ld & 63);
-                            if (*curr.get_unchecked(idx) & bit) != 0 {
-                                clist[w] = ld;
-                                w += 1;
-                            }
+                            if (*curr.get_unchecked(idx) & bit) != 0 { clist[w] = ld; w += 1; }
                         }
                         clen = w;
                         in_bs = false;
@@ -405,10 +517,10 @@ impl<'a> Engine<'a> {
                         for i in 0..clen {
                             let d = (cs + clist[i] as u32) as usize;
                             if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) == exp {
-                                clist[w] = clist[i];
-                                w += 1;
+                                clist[w] = clist[i]; w += 1;
                             }
-                        } } else {
+                        }
+                    } else {
                         let (mut i, mut j) = (0usize, r.start);
                         while i < clen && j < r.end {
                             let (cv, gv) = (clist[i], self.g_u16[j]);
@@ -422,35 +534,15 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            let mut add_res = |d: u32| {
-                t_cnt += 1;
-                t_sum += d as u64;
-                if tc < 10 { top[tc] = d; tc += 1; }
-            };
-
             if !in_bs {
-                for i in 0..clen { add_res(cs + clist[i] as u32); } } else {
-                if (cd & 63) != 0 { *curr.get_unchecked_mut(cw - 1) &= (1u64 << (cd & 63)) - 1; }
-                let mut w = 0usize;
-                while w + 4 <= cw {
-                    let v4 = _mm256_loadu_si256(curr.as_ptr().add(w) as *const __m256i);
-                    if _mm256_testz_si256(v4, v4) != 0 {
-                        w += 4;
-                        continue;
-                    }
-                    for i in 0..4 {
-                        let mut v = *curr.get_unchecked(w + i);
-                        let base = cs + (((w + i) as u32) << 6);
-                        while v != 0 { add_res(base + v.trailing_zeros()); v &= v - 1; }
-                    }
-                    w += 4;
+                for i in 0..clen {
+                    let d = cs + clist[i] as u32;
+                    t_cnt += 1;
+                    t_sum += d as u64;
+                    if tc < 10 { top[tc] = d; tc += 1; }
                 }
-                while w < cw {
-                    let mut v = *curr.get_unchecked(w);
-                    let base = cs + ((w as u32) << 6);
-                    while v != 0 { add_res(base + v.trailing_zeros()); v &= v - 1; }
-                    w += 1;
-                }
+            } else {
+                self.emit_bits(curr, cs, cd, cw, &mut t_cnt, &mut t_sum, &mut top, &mut tc);
             }
         }
         fmt_res(t_cnt, t_sum, &top, tc, out);
@@ -461,7 +553,9 @@ impl<'a> Engine<'a> {
         let (k, mut nd, mut dist) = (q.k as usize, 0usize, [0usize; 16]);
         let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + k];
         let mut add_dist = |t: usize| {
-            if t == u32::MAX as usize || TINFO[t].3 == 0 { false } else {
+            if t == u32::MAX as usize || TINFO[t].3 == 0 {
+                false
+            } else {
                 if !dist[..nd].contains(&t) { dist[nd] = t; nd += 1; }
                 true
             }
@@ -476,25 +570,25 @@ impl<'a> Engine<'a> {
             }
         }
         dist[..nd].sort_unstable_by_key(|&t| TINFO[t].3);
-        let mut pt = [TInfo::default(); 8];
-        for i in 0..k { pt[i] = *TINFO.get_unchecked(q_ts[i] as usize); }
+
+        let (mut pw0, mut pw1, mut plen, mut poff) = ([0u64; 8], [0u64; 8], [0usize; 8], [0usize; 8]);
+        for i in 0..k {
+            let ti = *TINFO.get_unchecked(q_ts[i] as usize);
+            pw0[i] = ti.0; plen[i] = ti.2 as usize; poff[i] = ti.1 as usize;
+            if plen[i] > 8 {
+                let mut w1 = 0u64;
+                ptr::copy_nonoverlapping(self.q_buf.as_ptr().add(ti.1 as usize + 8), &mut w1 as *mut _ as *mut u8, (plen[i] - 8).min(8));
+                pw1[i] = w1;
+            }
+        }
 
         let check_match = |j: usize, l: usize, w0: u64, w1: u64, tail: &[u8]| -> bool {
-            if l != pt[j].2 as usize || w0 != pt[j].0 { return false; }
-            if l <= 8 { return true; }
-            let (q_ptr, off) = (self.q_buf.as_ptr().add(pt[j].1 as usize + 8), l - 8);
-            let w1_b = w1.to_ne_bytes();
-            if off <= 8 {
-                std::slice::from_raw_parts(q_ptr, off) == &w1_b[..off] } else {
-                std::slice::from_raw_parts(q_ptr, 8) == &w1_b[..8] && std::slice::from_raw_parts(q_ptr.add(8), off - 8) == &tail[..off - 8]
-            }
+            l == plen[j] && w0 == pw0[j] && (l <= 8 || (w1 == pw1[j] && (l <= 16 || &self.q_buf[poff[j] + 16..poff[j] + l] == &tail[..l - 16])))
         };
 
-        let first_ch = (pt[0].0 & 0xFF) as u8;
+        let first_ch = (pw0[0] & 0xFF) as u8;
         let first_up = if first_ch >= b'a' && first_ch <= b'z' { first_ch - 32 } else { first_ch };
-        let v_lo = _mm256_set1_epi8(first_ch as i8);
-        let v_up = _mm256_set1_epi8(first_up as i8);
-        let v_nl = _mm256_set1_epi8(b'\n' as i8);
+        let (v_lo, v_up, v_nl) = (_mm256_set1_epi8(first_ch as i8), _mm256_set1_epi8(first_up as i8), _mm256_set1_epi8(b'\n' as i8));
 
         let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
         let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
@@ -508,7 +602,8 @@ impl<'a> Engine<'a> {
                 let r = self.range(c, rare);
                 clen = r.len();
                 if clen == 0 { continue; }
-                cand[..clen].copy_from_slice(&self.g_u16[r]); } else {
+                cand[..clen].copy_from_slice(&self.g_u16[r]);
+            } else {
                 let cw = ((cd + 63) >> 6) as usize;
                 let src = &self.g_bs[(self.bs_idx[rare] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
                 for w in 0..cw {
@@ -530,7 +625,8 @@ impl<'a> Engine<'a> {
                     for i in 0..clen {
                         let d = (cs + cand[i] as u32) as usize;
                         if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) != 0 { cand[w] = cand[i]; w += 1; }
-                    } } else {
+                    }
+                } else {
                     let r = self.range(c, ot);
                     let (mut i, mut j) = (0usize, r.start);
                     while i < clen && j < r.end {
@@ -543,8 +639,21 @@ impl<'a> Engine<'a> {
                 clen = w;
             }
 
-            let d_ptr = self.d_buf.as_ptr();
-            let d_len = self.d_buf.len();
+            let (d_ptr, d_len) = (self.d_buf.as_ptr(), self.d_buf.len());
+            let try_match = |cand_p: usize| -> bool {
+                let mut tp = cand_p;
+                let mut tail = [0u8; 16];
+                let (w0, w1, l) = read_tok(self.d_buf, &mut tp, &mut tail);
+                if !check_match(0, l, w0, w1, &tail) { return false; }
+                for j in 1..k {
+                    while *CMAP.get_unchecked(*self.d_buf.get_unchecked(tp) as usize) == 0 { tp += 1; }
+                    if *self.d_buf.get_unchecked(tp) == b'\n' { return false; }
+                    let mut sub_tail = [0u8; 16];
+                    let (sw0, sw1, sl) = read_tok(self.d_buf, &mut tp, &mut sub_tail);
+                    if !check_match(j, sl, sw0, sw1, &sub_tail) { return false; }
+                }
+                true
+            };
 
             for ci in 0..clen {
                 let d = cs + cand[ci] as u32;
@@ -556,8 +665,7 @@ impl<'a> Engine<'a> {
                         let chunk = _mm256_loadu_si256(d_ptr.add(sp) as *const __m256i);
                         let m_ch = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v_lo), _mm256_cmpeq_epi8(chunk, v_up));
                         let m_nl = _mm256_cmpeq_epi8(chunk, v_nl);
-                        let mask_ch = _mm256_movemask_epi8(m_ch) as u32;
-                        let mask_nl = _mm256_movemask_epi8(m_nl) as u32;
+                        let (mask_ch, mask_nl) = (_mm256_movemask_epi8(m_ch) as u32, _mm256_movemask_epi8(m_nl) as u32);
 
                         if mask_ch == 0 && mask_nl == 0 { sp += 32; continue; }
                         let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() } else { 32 };
@@ -567,42 +675,20 @@ impl<'a> Engine<'a> {
                             let bit = valid_ch.trailing_zeros() as usize;
                             valid_ch &= valid_ch - 1;
                             let cand_p = sp + bit;
-                            if *CMAP.get_unchecked(*d_ptr.add(cand_p - 1) as usize) <= 1 {
-                                let mut tp = cand_p;
-                                let mut tail = [0u8; 16];
-                                let (w0, w1, l) = read_tok(self.d_buf, &mut tp, &mut tail);
-                                if check_match(0, l, w0, w1, &tail) {
-                                    let mut m_all = true;
-                                    for j in 1..k {
-                                        while *CMAP.get_unchecked(*self.d_buf.get_unchecked(tp) as usize) == 0 { tp += 1; }
-                                        if *self.d_buf.get_unchecked(tp) == b'\n' { m_all = false; break; }
-                                        let mut sub_tail = [0u8; 16];
-                                        let (sw0, sw1, sl) = read_tok(self.d_buf, &mut tp, &mut sub_tail);
-                                        if !check_match(j, sl, sw0, sw1, &sub_tail) { m_all = false; break; }
-                                    }
-                                    if m_all { matched = true; break 'doc_scan; }
-                                }
+                            if *CMAP.get_unchecked(*d_ptr.add(cand_p - 1) as usize) <= 1 && try_match(cand_p) {
+                                matched = true;
+                                break 'doc_scan;
                             }
                         }
 
                         if nl_pos < 32 { break 'doc_scan; }
-                        sp += 32; } else {
+                        sp += 32;
+                    } else {
                         while *CMAP.get_unchecked(*self.d_buf.get_unchecked(sp) as usize) == 0 { sp += 1; }
                         if *self.d_buf.get_unchecked(sp) == b'\n' { break 'doc_scan; }
+                        if try_match(sp) { matched = true; break 'doc_scan; }
                         let mut tail = [0u8; 16];
-                        let (w0, w1, l) = read_tok(self.d_buf, &mut sp, &mut tail);
-                        if check_match(0, l, w0, w1, &tail) {
-                            let (mut xp, mut j) = (sp, 1usize);
-                            while j < k {
-                                while *CMAP.get_unchecked(*self.d_buf.get_unchecked(xp) as usize) == 0 { xp += 1; }
-                                if *self.d_buf.get_unchecked(xp) == b'\n' { break; }
-                                let mut jtail = [0u8; 16];
-                                let (jw0, jw1, jl) = read_tok(self.d_buf, &mut xp, &mut jtail);
-                                if !check_match(j, jl, jw0, jw1, &jtail) { break; }
-                                j += 1;
-                            }
-                            if j == k { matched = true; break 'doc_scan; }
-                        }
+                        read_tok(self.d_buf, &mut sp, &mut tail);
                     }
                 }
 
@@ -647,8 +733,7 @@ unsafe fn pass2_worker(
 ) {
     let co_ptr = c_off_ptr.add(c * nt);
     let mut seen = [u16::MAX; 80000];
-    let (mut d, de) = (doc_s[c], doc_e[c]);
-    let mut ld = 0u16;
+    let (mut d, de, mut ld) = (doc_s[c], doc_e[c], 0u16);
     while d < de {
         let mut p = *doc_ts_ptr.add(d as usize) as usize;
         scan_doc(d_buf, &mut p, q_buf, rep_map, |t| {
@@ -656,8 +741,8 @@ unsafe fn pass2_worker(
                 *seen.get_unchecked_mut(t) = ld;
                 let bi = *bs_idx.get_unchecked(t);
                 if bi != u16::MAX {
-                    let d_idx = (bi as usize) * w_per_doc + ((d as usize) >> 6);
-                    *g_bs_ptr.add(d_idx) |= 1u64 << (d & 63); } else {
+                    *g_bs_ptr.add((bi as usize) * w_per_doc + ((d as usize) >> 6)) |= 1u64 << (d & 63);
+                } else {
                     let cur = *co_ptr.add(t);
                     *g_u16_ptr.add(cur as usize) = ld;
                     *co_ptr.add(t) = cur + 1;
@@ -677,11 +762,8 @@ unsafe fn run_all() {
     let mut args = std::env::args().skip(1);
     let (mut d_dir, mut o_dir) = ("/data".into(), "/out".into());
     while let Some(a) = args.next() {
-        match a.as_str() {
-            "--data" => d_dir = args.next().unwrap(),
-            "--out" => o_dir = args.next().unwrap(),
-            _ => {}
-        }
+        if a == "--data" { d_dir = args.next().unwrap(); }
+        else if a == "--out" { o_dir = args.next().unwrap(); }
     }
 
     let q_buf = map_file(&format!("{}/queries.txt", d_dir));
@@ -769,15 +851,14 @@ unsafe fn run_all() {
     }
 
     let nt = N_TERMS;
-    let mut sc = vec![0u32; NUM_C * nt];
-    let sc_ptr = sc.as_mut_ptr() as usize;
+    let sc_count = NUM_C * nt;
+    let sc_ptr = alloc_mmap::<u32>(sc_count);
+    let sc_ptr_val = sc_ptr as usize;
     let doc_ts_ptr = doc_ts.as_mut_ptr() as usize;
 
     let w_per_doc = ((total_docs + 63) >> 6) as usize;
     let mut c_base = [0u32; NUM_C];
     let mut bs_idx = vec![u16::MAX; nt];
-    let mut g_bs: Vec<u64> = Vec::new();
-    let mut g_u16: Vec<u16> = Vec::new();
 
     let g_bs_ptr = AtomicUsize::new(0);
     let g_u16_ptr = AtomicUsize::new(0);
@@ -812,16 +893,22 @@ unsafe fn run_all() {
             std::thread::Builder::new()
                 .stack_size(196608)
                 .spawn_scoped(s, move || {
-                    pass1_worker(tid, nt, sc_ptr as *mut u32, doc_ts_ptr as *mut u32, d_buf, q_buf, r_ref, ds_ref, cb_ref);
+                    pass1_worker(tid, nt, sc_ptr_val as *mut u32, doc_ts_ptr as *mut u32, d_buf, q_buf, r_ref, ds_ref, cb_ref);
                     ready_ref.fetch_add(1, Ordering::Release);
                     while phase_ref.load(Ordering::Acquire) < 1 { std::hint::spin_loop(); }
 
                     let bi_slice = std::slice::from_raw_parts(bs_idx_ptr as *const u16, nt);
-                    pass2_worker(tid, nt, w_per_doc, g_bs_p.load(Ordering::Relaxed) as *mut u64, g_u16_p.load(Ordering::Relaxed) as *mut u16, sc_ptr as *mut u32, bi_slice, d_buf, q_buf, r_ref, ds_ref, de_ref, doc_ts_ptr as *const u32);
+                    pass2_worker(
+                        tid, nt, w_per_doc,
+                        g_bs_p.load(Ordering::Relaxed) as *mut u64,
+                        g_u16_p.load(Ordering::Relaxed) as *mut u16,
+                        sc_ptr_val as *mut u32,
+                        bi_slice, d_buf, q_buf, r_ref, ds_ref, de_ref, doc_ts_ptr as *const u32,
+                    );
                     ready_ref.fetch_add(1, Ordering::Release);
                     while phase_ref.load(Ordering::Acquire) < 2 { std::hint::spin_loop(); }
 
-                    let c_off_slice = std::slice::from_raw_parts(sc_ptr as *const u32, NUM_C * nt);
+                    let c_off_slice = std::slice::from_raw_parts(sc_ptr_val as *const u32, NUM_C * nt);
                     let g_bs_slice = std::slice::from_raw_parts(g_bs_p.load(Ordering::Relaxed) as *const u64, g_bs_l.load(Ordering::Relaxed));
                     let g_u16_slice = std::slice::from_raw_parts(g_u16_p.load(Ordering::Relaxed) as *const u16, g_u16_l.load(Ordering::Relaxed));
                     let doc_ts_slice = std::slice::from_raw_parts(doc_ts_ptr as *const u32, total_docs as usize);
@@ -843,13 +930,14 @@ unsafe fn run_all() {
                 .unwrap();
         }
 
-        pass1_worker(0, nt, sc_ptr as *mut u32, doc_ts_ptr as *mut u32, d_buf, q_buf, &rep_map, &doc_s, &c_byte);
+        pass1_worker(0, nt, sc_ptr_val as *mut u32, doc_ts_ptr as *mut u32, d_buf, q_buf, &rep_map, &doc_s, &c_byte);
         while ready.load(Ordering::Acquire) < NUM_C - 1 { std::hint::spin_loop(); }
 
+        let sc_slice = std::slice::from_raw_parts_mut(sc_ptr, sc_count);
         let mut n_bs = 0usize;
         for i in 0..nt {
             let mut df = 0u32;
-            for c in 0..NUM_C { df += sc[c * nt + i]; }
+            for c in 0..NUM_C { df += sc_slice[c * nt + i]; }
             TINFO[i].3 = df.min(65535) as u16;
             if df > BS_TH { bs_idx[i] = n_bs as u16; n_bs += 1; }
         }
@@ -859,33 +947,40 @@ unsafe fn run_all() {
             c_base[c] = tot_u16;
             let c_base_off = c * nt;
             for i in 0..nt {
-                let cnt = sc[c_base_off + i];
-                sc[c_base_off + i] = tot_u16;
+                let cnt = sc_slice[c_base_off + i];
+                sc_slice[c_base_off + i] = tot_u16;
                 if bs_idx[i] == u16::MAX { tot_u16 += cnt; }
             }
         }
 
-        g_bs = vec![0u64; n_bs * w_per_doc];
-        g_u16 = vec![0u16; tot_u16 as usize];
-        g_bs_ptr.store(g_bs.as_mut_ptr() as usize, Ordering::Relaxed);
-        g_u16_ptr.store(g_u16.as_mut_ptr() as usize, Ordering::Relaxed);
-        g_bs_len.store(n_bs * w_per_doc, Ordering::Relaxed);
-        g_u16_len.store(tot_u16 as usize, Ordering::Relaxed);
+        let g_bs_total = n_bs * w_per_doc;
+        let g_u16_total = tot_u16 as usize;
+        let raw_bs_ptr = alloc_mmap::<u64>(g_bs_total);
+        let raw_u16_ptr = alloc_mmap::<u16>(g_u16_total);
+
+        g_bs_ptr.store(raw_bs_ptr as usize, Ordering::Relaxed);
+        g_u16_ptr.store(raw_u16_ptr as usize, Ordering::Relaxed);
+        g_bs_len.store(g_bs_total, Ordering::Relaxed);
+        g_u16_len.store(g_u16_total, Ordering::Relaxed);
 
         ready.store(0, Ordering::Release);
         phase.store(1, Ordering::Release);
 
-        pass2_worker(0, nt, w_per_doc, g_bs.as_mut_ptr(), g_u16.as_mut_ptr(), sc.as_mut_ptr(), &bs_idx, d_buf, q_buf, &rep_map, &doc_s, &doc_e, doc_ts.as_ptr());
+        pass2_worker(0, nt, w_per_doc, raw_bs_ptr, raw_u16_ptr, sc_ptr_val as *mut u32, &bs_idx, d_buf, q_buf, &rep_map, &doc_s, &doc_e, doc_ts.as_ptr());
         while ready.load(Ordering::Acquire) < NUM_C - 1 { std::hint::spin_loop(); }
 
-        madvise(VTAB.0.as_mut_ptr() as *mut u8, std::mem::size_of_val(&VTAB), 4);
-        madvise(BLOOM.0.as_mut_ptr() as *mut u8, std::mem::size_of_val(&BLOOM), 4);
+        madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
+        madvise(BLOOM.0.as_mut_ptr() as *mut u8, size_of::<AlignedBloom>(), 4);
 
         phase.store(2, Ordering::Release);
 
+        let c_off_slice = std::slice::from_raw_parts(sc_ptr_val as *const u32, NUM_C * nt);
+        let g_bs_slice = std::slice::from_raw_parts(raw_bs_ptr as *const u64, g_bs_total);
+        let g_u16_slice = std::slice::from_raw_parts(raw_u16_ptr as *const u16, g_u16_total);
+
         let eng = Engine {
-            c_off: &sc, c_base: &c_base, bs_idx: &bs_idx, doc_s: &doc_s, doc_e: &doc_e,
-            w_per_doc, g_bs: &g_bs, g_u16: &g_u16, rep_map: &rep_map, doc_ts: &doc_ts,
+            c_off: c_off_slice, c_base: &c_base, bs_idx: &bs_idx, doc_s: &doc_s, doc_e: &doc_e,
+            w_per_doc, g_bs: g_bs_slice, g_u16: g_u16_slice, rep_map: &rep_map, doc_ts: &doc_ts,
             d_buf, q_buf, q_terms: &q_terms, nt,
         };
         let q_end = chunk_q.min(queries.len());
@@ -895,9 +990,9 @@ unsafe fn run_all() {
         }
     });
 
-    drop(g_bs);
-    drop(g_u16);
-    drop(sc);
+    free_mmap(sc_ptr, sc_count);
+    free_mmap(g_bs_ptr.load(Ordering::Relaxed) as *mut u64, g_bs_len.load(Ordering::Relaxed));
+    free_mmap(g_u16_ptr.load(Ordering::Relaxed) as *mut u16, g_u16_len.load(Ordering::Relaxed));
     drop(doc_ts);
     drop(queries);
     drop(q_terms);
