@@ -18,6 +18,7 @@ struct SharedData {
     u: ([u8; 2304], [[u8; 163840]; 12]),
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
+static M_OFF: [u8; 16] = [33, 0, 0, 0, 0, 36, 0, 0, 34, 33, 32, 0, 35, 0, 0, 32];
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
     let (mut b, mut i) = ([b' '; 12], 10);
@@ -60,8 +61,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
             (lhw, hid) = (hw, intern(0, p, 13, hw));
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
-        let mut ep = p.add(32 + (*p.add(32) != b'/') as usize);
-        while *ep != b'/' { ep = ep.add(1); }
+        let mw = (p.add(28) as *const u16).read_unaligned();
+        let ep = p.add(M_OFF[(((mw >> 11) ^ (mw.wrapping_mul(33))) & 15) as usize] as usize);
         let m = if ep.add(64) <= ec { sp_m(ep) | (sp_m(ep.add(32)) << 32) } else { 0 };
         let el = if m != 0 { m.trailing_zeros() as usize } else { find(ep, b' ') };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
@@ -73,17 +74,10 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let eid = intern(1, ep, el as u8, h);
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
-        let lp = st_p.add(4);
-        let sub = if lp.add(8) <= ec { u8_at(lp).wrapping_sub(0x3030_3030_3030_3030) } else { 0 };
-        let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
-        if sub & 0x8080_8080_8080_8080 != 0 {
-            let tz = (sub & 0x8080_8080_8080_8080).trailing_zeros();
-            let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
-            let w2 = (w.wrapping_mul(6553601) >> 16 & 0xFFFF_0000_FFFF).wrapping_mul(42949672960001);
-            (c, lat) = (lp.add((tz >> 3) as usize), (w2 >> 32) as u32);
-        } else {
-            while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
-        }
+        let mut c = st_p.add(4);
+        let mut lat = (*c - b'0') as u32;
+        c = c.add(1);
+        while *c >= b'0' { lat = (lat << 3) + (lat << 1) + (*c - b'0') as u32; c = c.add(1); }
         p = c.add(1 + (*c == b'\r') as usize);
         if cur_f == 256 {
             (cur_b >= 0).then(|| (*s).w.1[cur_b as usize] = 256);
