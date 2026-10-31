@@ -1,5 +1,5 @@
 //! Speed Demon 2026 - Track D (Traverse)
-//! Ultra-Fast Bit-Packed Dual-CSR Bidirectional Dijkstra with 8-byte DistPair.
+//! Ultra-Fast Bit-Packed Dual-CSR Bidirectional Dijkstra with 2MB FastDistMap.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -14,6 +14,7 @@ extern "C" {
     fn munmap(a: *mut u8, l: usize) -> i32;
     fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
     fn close(fd: i32) -> i32;
+    fn mallopt(p: i32, v: i32) -> i32;
 }
 
 const W_BITS: u32 = 11;
@@ -21,6 +22,9 @@ const W_SENTINEL: u32 = (1 << W_BITS) - 1; // 2047
 const V_BITS: u32 = 21;
 const V_MASK: u32 = (1 << V_BITS) - 1;
 const INF32: u32 = u32::MAX;
+
+const H_SZ: usize = 131072;
+const H_MSK: usize = H_SZ - 1;
 
 #[derive(Clone, Copy)]
 struct Query {
@@ -30,10 +34,54 @@ struct Query {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C, align(8))]
-struct DistPair {
+#[repr(C, align(16))]
+struct Slot {
+    v: u32,
     fwd: u32,
     rev: u32,
+    epoch: u32,
+}
+
+struct FastDistMap {
+    slots: Vec<Slot>,
+    epoch: u32,
+}
+
+impl FastDistMap {
+    fn new() -> Self {
+        Self {
+            slots: vec![Slot { v: u32::MAX, fwd: INF32, rev: INF32, epoch: 0 }; H_SZ],
+            epoch: 1,
+        }
+    }
+    #[inline(always)]
+    fn next_query(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            for s in &mut self.slots { s.epoch = 0; }
+            self.epoch = 1;
+        }
+    }
+    #[inline(always)]
+    fn get_slot(&mut self, v: u32) -> *mut Slot {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        unsafe {
+            let base = self.slots.as_mut_ptr();
+            loop {
+                let slot = base.add(idx);
+                if (*slot).epoch != ep {
+                    (*slot).epoch = ep;
+                    (*slot).v = v;
+                    (*slot).fwd = INF32;
+                    (*slot).rev = INF32;
+                    return slot;
+                }
+                if (*slot).v == v { return slot; }
+                idx = (idx + 1) & H_MSK;
+            }
+        }
+    }
 }
 
 struct MinHeap4 {
@@ -46,13 +94,9 @@ impl MinHeap4 {
         Self { data: Vec::with_capacity(cap) }
     }
     #[inline(always)]
-    fn clear(&mut self) {
-        self.data.clear();
-    }
+    fn clear(&mut self) { self.data.clear(); }
     #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
+    fn is_empty(&self) -> bool { self.data.is_empty() }
     #[inline(always)]
     fn min_key(&self) -> u32 {
         if self.data.is_empty() { INF32 } else { unsafe { (*self.data.get_unchecked(0) >> 32) as u32 } }
@@ -164,6 +208,11 @@ fn solve_query_64(
 }
 
 fn main() {
+    unsafe {
+        mallopt(-8, 2); // M_ARENA_MAX = 2
+        mallopt(-4, 0); // M_TRIM_THRESHOLD = 0
+    }
+
     let (data_dir, out_dir) = {
         let args: Vec<String> = std::env::args().collect();
         let mut d = "/data".to_string();
@@ -347,7 +396,6 @@ fn main() {
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
 
-    // Cap query concurrency to physical P-cores to eliminate SMT cache contention
     let q_threads = nt.min(6).min(queries.len());
     let next_query = AtomicUsize::new(0);
 
@@ -363,12 +411,10 @@ fn main() {
             let (next_ref, q_ref) = (&next_query, &queries);
 
             scope.spawn(move || {
-                let mut dist = vec![DistPair { fwd: INF32, rev: INF32 }; (n + 1) as usize];
-                let mut dirty = Vec::with_capacity(16384);
+                let mut dist_map = FastDistMap::new();
                 let mut heap_f = MinHeap4::with_capacity(16384);
                 let mut heap_b = MinHeap4::with_capacity(16384);
 
-                let d_ptr = dist.as_mut_ptr();
                 let (ef_ptr, er_ptr) = (ef_addr as *const u32, er_addr as *const u32);
                 let (hf_ptr, hr_ptr) = (hf_addr as *const u32, hr_addr as *const u32);
                 let ans_ptr = answers_addr as *mut i64;
@@ -393,16 +439,16 @@ fn main() {
                         }
                     }
 
+                    dist_map.next_query();
                     heap_f.clear();
                     heap_b.clear();
-                    dirty.clear();
 
                     unsafe {
-                        (*d_ptr.add(s)).fwd = 0;
-                        (*d_ptr.add(t)).rev = 0;
+                        let s_slot = dist_map.get_slot(s as u32);
+                        (*s_slot).fwd = 0;
+                        let t_slot = dist_map.get_slot(t as u32);
+                        (*t_slot).rev = 0;
                     }
-                    dirty.push(s as u32);
-                    dirty.push(t as u32);
                     heap_f.push(0, s as u32);
                     heap_b.push(0, t as u32);
 
@@ -420,14 +466,14 @@ fn main() {
                             let is_fwd = heap_f.data.len() <= heap_b.data.len();
                             if is_fwd {
                                 let (d, u) = heap_f.pop();
+                                let u_slot = dist_map.get_slot(u);
+                                if d > (*u_slot).fwd { continue; }
                                 let u = u as usize;
-                                let pair = d_ptr.add(u);
-                                if d > (*pair).fwd { continue; }
                                 let e_start = *hf_ptr.add(u) as usize;
                                 let e_end = *hf_ptr.add(u + 1) as usize;
                                 for e in e_start..e_end {
                                     let packed_edge = *ef_ptr.add(e);
-                                    let v = (packed_edge & V_MASK) as usize;
+                                    let v = packed_edge & V_MASK;
                                     let mut w = packed_edge >> V_BITS;
                                     if has_overflow && w == W_SENTINEL {
                                         touched_overflow = true;
@@ -438,13 +484,12 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    let v_pair = d_ptr.add(v);
-                                    let cur_fwd = (*v_pair).fwd;
+                                    let v_slot = dist_map.get_slot(v);
+                                    let cur_fwd = (*v_slot).fwd;
                                     if nd < cur_fwd {
-                                        let cur_rev = (*v_pair).rev;
-                                        if cur_fwd == INF32 && cur_rev == INF32 { dirty.push(v as u32); }
-                                        (*v_pair).fwd = nd;
-                                        heap_f.push(nd, v as u32);
+                                        let cur_rev = (*v_slot).rev;
+                                        (*v_slot).fwd = nd;
+                                        heap_f.push(nd, v);
                                         if cur_rev != INF32 {
                                             let cand = nd.saturating_add(cur_rev);
                                             if cand < mu { mu = cand; }
@@ -453,14 +498,14 @@ fn main() {
                                 }
                             } else {
                                 let (d, u) = heap_b.pop();
+                                let u_slot = dist_map.get_slot(u);
+                                if d > (*u_slot).rev { continue; }
                                 let u = u as usize;
-                                let pair = d_ptr.add(u);
-                                if d > (*pair).rev { continue; }
                                 let e_start = *hr_ptr.add(u) as usize;
                                 let e_end = *hr_ptr.add(u + 1) as usize;
                                 for e in e_start..e_end {
                                     let packed_edge = *er_ptr.add(e);
-                                    let v = (packed_edge & V_MASK) as usize;
+                                    let v = packed_edge & V_MASK;
                                     let mut w = packed_edge >> V_BITS;
                                     if has_overflow && w == W_SENTINEL {
                                         touched_overflow = true;
@@ -471,13 +516,12 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    let v_pair = d_ptr.add(v);
-                                    let cur_rev = (*v_pair).rev;
+                                    let v_slot = dist_map.get_slot(v);
+                                    let cur_rev = (*v_slot).rev;
                                     if nd < cur_rev {
-                                        let cur_fwd = (*v_pair).fwd;
-                                        if cur_rev == INF32 && cur_fwd == INF32 { dirty.push(v as u32); }
-                                        (*v_pair).rev = nd;
-                                        heap_b.push(nd, v as u32);
+                                        let cur_fwd = (*v_slot).fwd;
+                                        (*v_slot).rev = nd;
+                                        heap_b.push(nd, v);
                                         if cur_fwd != INF32 {
                                             let cand = nd.saturating_add(cur_fwd);
                                             if cand < mu { mu = cand; }
@@ -489,14 +533,9 @@ fn main() {
 
                         let mut ans_val = if mu == INF32 { -1 } else { mu as i64 };
                         if ans_val == -1 && touched_overflow {
-                            // Exact 64-bit solver only when giant edges (>= 2^31) were touched!
                             ans_val = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow_ref);
                         }
                         *ans_ptr.add(q.id as usize) = ans_val;
-
-                        for &v in &dirty {
-                            *d_ptr.add(v as usize) = DistPair { fwd: INF32, rev: INF32 };
-                        }
                     }
                 }
             });
