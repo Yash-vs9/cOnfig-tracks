@@ -7,33 +7,21 @@ use std::ptr::copy_nonoverlapping as copy;
 use std::slice::from_raw_parts as slc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier};
-extern "C" {
-    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-}
-#[repr(transparent)]
-struct Global<T>(UnsafeCell<T>);
+extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; }
+#[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
-    k: [AtomicU64; 16640],
-    c: [AtomicU32; 163844],
-    p: [usize; 2304],
-    q: [u32; 13312 * 256],
-    g: [u32; 65536],
-    n: [i32; 13312],
-    h: [[[i32; 128]; 12]; 2],
-    w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]),
-    u: ([u8; 2304], [[u8; 163840]; 12]),
+    k: [AtomicU64; 16640], c: [AtomicU32; 163844], p: [usize; 2304],
+    q: [u32; 13312 * 256], g: [u32; 65536], n: [i32; 13312], h: [[[i32; 128]; 12]; 2],
+    w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]), u: ([u8; 2304], [[u8; 163840]; 12]),
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
     let (mut b, mut i) = ([b' '; 12], 10);
     b[10] = b'0' + (v % 10) as u8;
-    while v >= 10 {
-        (v, i) = (v / 10, i - 1);
-        b[i] = b'0' + (v % 10) as u8;
-    }
+    while v >= 10 { (v, i) = (v / 10, i - 1); b[i] = b'0' + (v % 10) as u8; }
     copy(b.as_ptr().add(i), p, 12 - i);
     p.add(12 - i)
 }
@@ -46,11 +34,7 @@ unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
     let (b_kv, b_id, mut idx) = ((1 - ci) << 14, (1 - ci) << 11, ((h >> 16) as usize) & mask);
     let mut kv = (*s).k[b_kv + idx].load(Acquire);
     while (kv ^ h) >= 65536 {
-        if kv == 0
-            && (*s).k[b_kv + idx]
-                .compare_exchange(0, 1, AcqRel, Acquire)
-                .is_ok()
-        {
+        if kv == 0 && (*s).k[b_kv + idx].compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
             ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
             (*s).k[b_kv + idx].store(h | ((j - b_id) as u64), Release);
@@ -63,38 +47,27 @@ unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
 unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier) {
     let (s, lim, sv) = (S.0.get(), bp as usize + sz, _mm256_set1_epi8(b' ' as i8));
-    let find = |q: *const u8, b| {
-        slc(q, lim - q as usize)
-            .iter()
-            .position(|&c| c == b)
-            .unwrap()
-    };
-    let sk = |i: usize| {
-        bp.add(if i > 0 && i < sz {
-            i + find(bp.add(i - 1), b'\n')
-        } else {
-            i
-        })
-    };
+    let find = |q: *const u8, b| slc(q, lim - q as usize).iter().position(|&c| c == b).unwrap();
+    let sk = |i: usize| bp.add(if i > 0 && i < sz { i + find(bp.add(i - 1), b'\n') } else { i });
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv));
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
+    let (mut cur_b, mut cur_f) = (-1i32, 256usize);
     while p < ec {
         let hw = (p.add(5) as *const u64).read_unaligned();
-        (hw != lhw).then(|| (lhw, hid) = (hw, intern(0, p, 13, hw)));
-        let ep = p.add(
-            32 + if *p.add(32) == b'/' {
-                0
-            } else {
-                find(p.add(32), b'/')
-            },
-        );
+        if hw != lhw {
+            if cur_b >= 0 { ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16); }
+            (lhw, hid) = (hw, intern(0, p, 13, hw));
+            (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
+        }
+        let ep = p.add(if *p.add(32) == b'/' { 32 } else {
+            let mut o = 33; while *p.add(o) != b'/' { o += 1; } o
+        });
         let m = if ep.add(32) <= ec { sp_m(ep) as u32 } else { 0 };
-        let el = if m != 0 {
-            m.trailing_zeros() as usize
-        } else {
-            find(ep, b' ')
-        };
+        let el = if m != 0 { m.trailing_zeros() as usize } else if ep.add(64) <= ec {
+            let m2 = sp_m(ep.add(32)) as u32;
+            if m2 != 0 { 32 + m2.trailing_zeros() as usize } else { find(ep, b' ') }
+        } else { find(ep, b' ') };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| (ep.add(o) as *const u64).read_unaligned() & m8;
         let (w0, w1, w2, w3) = (rd(0), rd(d.min(8)), rd(d.saturating_sub(8)), rd(d));
@@ -102,62 +75,40 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let h2 = (w0 ^ w2).wrapping_mul(0x9e3779b97f4a7c15) ^ w1.rotate_left(17) ^ w3;
         let h = (((h1 << 32) ^ h2 ^ ((el as u64) << 40)) & !0xFFFF) | (1 << 63);
         let kv = (*s).k[((h >> 16) as usize) & 16383].load(Relaxed);
-        let eid = if (kv ^ h) < 65536 {
-            kv as u16 as usize
-        } else {
-            intern(1, ep, el as u8, h)
-        };
+        let eid = if (kv ^ h) < 65536 { kv as u16 as usize } else { intern(1, ep, el as u8, h) };
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let (mut c, mut lat) = (st_p.add(5), (*st_p.add(4) - b'0') as u32);
-        while *c >= b'0' {
-            (lat, c) = (lat * 10 + (*c - b'0') as u32, c.add(1));
-        }
+        while *c >= b'0' { lat = (lat << 3) + (lat << 1) + (*c - b'0') as u32; c = c.add(1); }
         p = c.add(1 + (*c == b'\r') as usize);
-        let (mut b, mut f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
-        if f == 256 {
-            (b >= 0).then(|| (*s).w.1[b as usize] = 256);
+        if cur_f == 256 {
+            if cur_b >= 0 { (*s).w.1[cur_b as usize] = 256; }
             let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
             (*s).n[nb as usize] = -1;
-            *(if b < 0 {
-                &mut (*s).h[0][t][hid]
-            } else {
-                &mut (*s).n[b as usize]
-            }) = nb;
-            ((*s).h[1][t][hid], b, f) = (nb, nb, 0);
+            *(if cur_b < 0 { &mut (*s).h[0][t][hid] } else { &mut (*s).n[cur_b as usize] }) = nb;
+            (cur_b, cur_f) = (nb, 0);
         }
         let mut hb = lat;
         if lat >= 1 << 20 {
             hb = 0x10_0000 | (*s).c[163843].fetch_add(1, Relaxed);
             (*s).g[(hb & 0xFFFF) as usize] = lat;
         }
-        ((*s).q[b as usize * 256 + f], (*s).w.0[t][hid]) = ((hb << 11) | eid as u32, f as u16 + 1);
+        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
     }
-    for i in 0..128 {
-        ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]);
-    }
+    if cur_b >= 0 { ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16); }
+    for i in 0..128 { ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]); }
     bar.wait();
-    let (nh, ne) = (
-        (*s).c[163840].load(Relaxed) as usize,
-        (*s).c[163841].load(Relaxed) as usize,
-    );
+    let (nh, ne) = ((*s).c[163840].load(Relaxed) as usize, (*s).c[163841].load(Relaxed) as usize);
     if t == 0 {
         let (p_arr, u0_arr) = ((*s).p.as_ptr(), (*s).u.0.as_ptr());
         let gs = |i: usize| slc(*p_arr.add(i) as *const u8, *u0_arr.add(i) as _);
-        (*s).w.2[2048..2048 + nh]
-            .sort_unstable_by(|&x, &y| gs(2048 + x as usize).cmp(gs(2048 + y as usize)));
+        (*s).w.2[2048..2048 + nh].sort_unstable_by(|&x, &y| gs(2048 + x as usize).cmp(gs(2048 + y as usize)));
         (*s).w.2[..ne].sort_unstable_by(|&x, &y| gs(x as usize).cmp(gs(y as usize)));
     }
     bar.wait();
     let (mut cnt, mut off, mut lats, mut bh) = ([0u32; 2048], [0u32; 2048], vec![], 0);
     let g_ptr = (*s).g.as_ptr();
-    let val = |v: u32| {
-        if (v as i32) < 0 {
-            *g_ptr.add((v >> 11) as u16 as usize)
-        } else {
-            v >> 11
-        }
-    };
+    let val = |v: u32| if (v as i32) < 0 { *g_ptr.add((v >> 11) as u16 as usize) } else { v >> 11 };
     while bh < nh {
         let (hi, out_b) = (bh + t, (*s).u.1[t].as_mut_ptr());
         let mut ptr = out_b;
@@ -189,27 +140,20 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
                 (n > 32).then(|| l.select_nth_unstable(i50));
                 (n > 32 && i95 > i50).then(|| l[i50 + 1..].select_nth_unstable(i95 - i50 - 1));
                 (n > 32 && i99 > i95).then(|| l[i95 + 1..].select_nth_unstable(i99 - i95 - 1));
-                let (err, el) = (
-                    (*s).c[h_id * 2048 + eid].load(Relaxed),
-                    (*s).u.0[eid] as usize,
-                );
+                let (err, el) = ((*s).c[h_id * 2048 + eid].load(Relaxed), (*s).u.0[eid] as usize);
                 copy((*s).p[2048 + h_id] as *const u8, ptr, 13);
                 copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
                 copy((*s).p[eid] as *const u8, ptr.add(21), el);
                 *ptr.add(21 + el) = b' ';
                 ptr = ptr.add(22 + el);
                 let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
-                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] {
-                    ptr = fmt_u32_sp(ptr, v);
-                }
+                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
                 *ptr.sub(1) = b'\n';
             }
         }
         (*s).p[2176 + t] = ptr as usize - out_b as usize;
         bar.wait();
-        for k in 0..if t == 0 { 12 } else { 0 } {
-            out.write_all(&(*s).u.1[k][..(*s).p[2176 + k]]).unwrap();
-        }
+        for k in 0..if t == 0 { 12 } else { 0 } { out.write_all(&(*s).u.1[k][..(*s).p[2176 + k]]).unwrap(); }
         bar.wait();
         bh += 12;
     }
@@ -219,9 +163,7 @@ fn main() {
         let mut a = std::env::args().skip(1);
         let in_p = a.next().unwrap_or_else(|| "/data/requests.log".into());
         let out_p = a.next().unwrap_or_else(|| "/out/summary.txt".into());
-        let (Ok(inf), Ok(outf)) = (File::open(&in_p), File::create(&out_p)) else {
-            return;
-        };
+        let (Ok(inf), Ok(outf)) = (File::open(&in_p), File::create(&out_p)) else { return; };
         let sz = inf.metadata().map(|m| m.len() as usize).unwrap_or(0);
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
@@ -229,9 +171,7 @@ fn main() {
             let bar = Barrier::new(12);
             let (outf, bar) = (&outf, &bar);
             std::thread::scope(|sc| {
-                for t in 0..12 {
-                    sc.spawn(move || work(t, base as _, sz, outf, bar));
-                }
+                for t in 0..12 { sc.spawn(move || work(t, base as _, sz, outf, bar)); }
             });
         }
     }
