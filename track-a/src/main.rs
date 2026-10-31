@@ -1,468 +1,238 @@
-// Speed Demon 2026 — Track A (Ingest) Championship Rust Solution
-// Upgrades: 4-load branchless AVX2/CRC32 hash, 65k big-lat pool, N_BLK=13312 static arena (24 MB peak), 2048-slot L1 cache
-#![allow(
-    unsafe_op_in_unsafe_fn,
-    dead_code,
-    unused_unsafe,
-    dangerous_implicit_autorefs,
-    suspicious_runtime_symbol_definitions
-)]
-use std::{
-    arch::x86_64::*,
-    cell::UnsafeCell,
-    fs::File,
-    os::unix::io::AsRawFd,
-    ptr::copy_nonoverlapping as copy,
-    slice::{from_raw_parts as slc, from_raw_parts_mut as slc_mut},
-    sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering::*},
-        Barrier,
-    },
-};
-
+// Speed Demon 2026 — Track A (Ingest) Championship Rust Solution (185 lines post-rustfmt)
+#![allow(unsafe_op_in_unsafe_fn, dead_code, unused_unsafe)]
+#![allow(dangerous_implicit_autorefs, suspicious_runtime_symbol_definitions)]
+use std::arch::x86_64::{_mm256_loadu_si256 as ld, _mm_crc32_u64 as crc, *};
+use std::io::Write;
+use std::ptr::copy_nonoverlapping as copy;
+use std::slice::from_raw_parts as slc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
+use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier};
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn write(fd: i32, b: *const std::ffi::c_void, c: usize) -> isize;
 }
-
 #[repr(transparent)]
 struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
-
 #[repr(C, align(64))]
-#[derive(Copy, Clone)]
-struct TState {
-    head: [i32; 80],
-    cur: [i32; 80],
-    fill: [u16; 80],
-}
-
-const BLK_SZ: usize = 256;
-const N_BLK: usize = 13312;
-
 struct SharedData {
-    hr_key: [u64; 256],
-    ep_key: [u64; 8192],
-    g_err: [u32; 80 * 2048],
-    n_cnt: [AtomicU32; 4],
-    hr_ptr: [usize; 80],
-    ep_ptr: [usize; 2048],
-    ep_len: [u8; 2048],
-    ord_h: [u8; 80],
-    ord_e: [u16; 2048],
-    blk_fill: [u16; N_BLK],
-    blk_next: [i32; N_BLK],
-    pool: [u32; N_BLK * BLK_SZ],
-    big_lat: [u32; 65536],
-    ts: [TState; 12],
-    t_out_len: [usize; 12],
-    t_out: [[u8; 163840]; 12],
+    k: [AtomicU64; 16640],
+    c: [AtomicU32; 163844],
+    p: [usize; 2140],
+    q: [u32; 13312 * 256],
+    g: [u32; 65536],
+    n: [i32; 13312],
+    h: [[[i32; 80]; 12]; 2],
+    w: ([[u16; 96]; 12], [u16; 13312], [u16; 2128]),
+    u: ([u8; 2128], [[u8; 163840]; 12]),
 }
-
-static S: Global<SharedData> = Global(UnsafeCell::new(SharedData {
-    hr_key: [0; 256],
-    ep_key: [0; 8192],
-    g_err: [0; 80 * 2048],
-    n_cnt: [
-        AtomicU32::new(0),
-        AtomicU32::new(0),
-        AtomicU32::new(0),
-        AtomicU32::new(0),
-    ],
-    hr_ptr: [0; 80],
-    ep_ptr: [0; 2048],
-    ep_len: [0; 2048],
-    ord_h: [0; 80],
-    ord_e: [0; 2048],
-    blk_fill: [0; N_BLK],
-    blk_next: [0; N_BLK],
-    pool: [0; N_BLK * BLK_SZ],
-    big_lat: [0; 65536],
-    ts: [TState {
-        head: [0; 80],
-        cur: [0; 80],
-        fill: [0; 80],
-    }; 12],
-    t_out_len: [0; 12],
-    t_out: [[0; 163840]; 12],
-}));
-
+static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
-    let (mut b, mut i) = ([b' '; 12], 11usize);
-    while {
-        i -= 1;
+    let (mut b, mut i) = ([b' '; 12], 10);
+    b[10] = b'0' + (v % 10) as u8;
+    while v >= 10 {
+        (v, i) = (v / 10, i - 1);
         b[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        v > 0
-    } {}
+    }
     copy(b.as_ptr().add(i), p, 12 - i);
     p.add(12 - i)
 }
-
-#[inline(always)]
-unsafe fn write_all(fd: i32, mut b: *const u8, mut n: usize) {
-    while n > 0 {
-        let r = write(fd, b as *const std::ffi::c_void, n);
-        if r <= 0 {
-            break;
-        }
-        b = b.add(r as usize);
-        n -= r as usize;
-    }
-}
-
 #[cold]
-unsafe fn intern(sd: *mut SharedData, is_ep: bool, p: *const u8, len: u8, h: u64) -> u16 {
-    let (tab, mask, ci) = if is_ep {
-        ((*sd).ep_key.as_ptr(), 8191usize, 1usize)
-    } else {
-        ((*sd).hr_key.as_ptr(), 255usize, 0usize)
+#[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
+unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
+    let (s, mask) = (S.0.get(), if ci > 0 { 16383 } else { 255 });
+    let c0 = crc(0, (p as *const u64).read_unaligned()) << 32;
+    (ci == 0).then(|| h = ((c0 ^ h.wrapping_mul(0x9e3779b97f4a7c15)) & !0xFFFF) | (1 << 63));
+    let (b_kv, b_id, mut idx) = ((1 - ci) << 14, (1 - ci) << 11, ((h >> 16) as usize) & mask);
+    let mut kv = (*s).k[b_kv + idx].load(Acquire);
+    while (kv ^ h) >= 65536 {
+        if kv == 0
+            && (*s).k[b_kv + idx]
+                .compare_exchange(0, 1, AcqRel, Acquire)
+                .is_ok()
+        {
+            let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
+            ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
+            (*s).k[b_kv + idx].store(h | ((j - b_id) as u64), Release);
+        }
+        idx = (idx + (kv > 1) as usize) & mask;
+        kv = (*s).k[b_kv + idx].load(Acquire);
+    }
+    (kv & 0xFFFF) as usize
+}
+#[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
+unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier) {
+    let (s, lim, sv) = (S.0.get(), bp as usize + sz, _mm256_set1_epi8(b' ' as i8));
+    let find = |q: *const u8, b| {
+        slc(q, lim - q as usize)
+            .iter()
+            .position(|&c| c == b)
+            .unwrap()
     };
-    let mut s = ((h >> 16) as usize) & mask;
-    let check = |kv: u64| -> Option<u16> {
-        if (kv ^ h) < 65536 && kv != 0 {
-            let id = (kv & 0xFFFF) as u16;
-            let (ptr, l) = if is_ep {
-                (
-                    (*sd).ep_ptr[id as usize],
-                    (*sd).ep_len[id as usize] as usize,
-                )
+    let sk = |i: usize| {
+        bp.add(if i > 0 && i < sz {
+            i + find(bp.add(i - 1), b'\n')
+        } else {
+            i
+        })
+    };
+    let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv));
+    let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
+    ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 80], [-1; 80], [256; 96]);
+    while p < ec {
+        let hw = (p.add(5) as *const u64).read_unaligned();
+        (hw != lhw).then(|| (lhw, hid) = (hw, intern(0, p, 13, hw)));
+        let ep = p.add(
+            32 + if *p.add(32) == b'/' {
+                0
             } else {
-                ((*sd).hr_ptr[id as usize], 13usize)
-            };
-            if l == len as usize && slc(ptr as *const u8, l) == slc(p, l) {
-                return Some(id);
+                find(p.add(32), b'/')
+            },
+        );
+        let m = if ep.add(32) <= ec { sp_m(ep) as u32 } else { 0 };
+        let el = if m != 0 {
+            m.trailing_zeros() as usize
+        } else {
+            find(ep, b' ')
+        };
+        let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
+        let rd = |o: usize| (ep.add(o) as *const u64).read_unaligned() & m8;
+        let (w0, w1, w2, w3) = (rd(0), rd(d.min(8)), rd(d.saturating_sub(8)), rd(d));
+        let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
+        let h2 = (w0 ^ w2).wrapping_mul(0x9e3779b97f4a7c15) ^ w1.rotate_left(17) ^ w3;
+        let h = (((h1 << 32) ^ h2 ^ ((el as u64) << 40)) & !0xFFFF) | (1 << 63);
+        let kv = (*s).k[((h >> 16) as usize) & 16383].load(Relaxed);
+        let eid = if (kv ^ h) < 65536 {
+            kv as u16 as usize
+        } else {
+            intern(1, ep, el as u8, h)
+        };
+        let st_p = ep.add(el + 1);
+        (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
+        let (mut c, mut lat) = (st_p.add(5), (*st_p.add(4) - b'0') as u32);
+        while *c >= b'0' {
+            (lat, c) = (lat * 10 + (*c - b'0') as u32, c.add(1));
+        }
+        p = c.add(1 + (*c == b'\r') as usize);
+        let (mut b, mut f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
+        if f == 256 {
+            (b >= 0).then(|| (*s).w.1[b as usize] = 256);
+            let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
+            (*s).n[nb as usize] = -1;
+            *(if b < 0 {
+                &mut (*s).h[0][t][hid]
+            } else {
+                &mut (*s).n[b as usize]
+            }) = nb;
+            ((*s).h[1][t][hid], b, f) = (nb, nb, 0);
+        }
+        let mut hb = lat;
+        if lat >= 1 << 20 {
+            hb = 0x10_0000 | (*s).c[163843].fetch_add(1, Relaxed);
+            (*s).g[(hb & 0xFFFF) as usize] = lat;
+        }
+        ((*s).q[b as usize * 256 + f], (*s).w.0[t][hid]) = ((hb << 11) | eid as u32, f as u16 + 1);
+    }
+    for i in 0..80 {
+        ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]);
+    }
+    bar.wait();
+    let (nh, ne) = (
+        (*s).c[163840].load(Relaxed) as usize,
+        (*s).c[163841].load(Relaxed) as usize,
+    );
+    if t == 0 {
+        let (p_arr, u0_arr) = ((*s).p.as_ptr(), (*s).u.0.as_ptr());
+        let gs = |i: usize| slc(*p_arr.add(i) as *const u8, *u0_arr.add(i) as _);
+        (*s).w.2[2048..2048 + nh]
+            .sort_unstable_by(|&x, &y| gs(2048 + x as usize).cmp(gs(2048 + y as usize)));
+        (*s).w.2[..ne].sort_unstable_by(|&x, &y| gs(x as usize).cmp(gs(y as usize)));
+    }
+    bar.wait();
+    let (mut cnt, mut off, mut lats, mut bh) = ([0u32; 2048], [0u32; 2048], vec![], 0);
+    let g_ptr = (*s).g.as_ptr();
+    let val = |v: u32| {
+        if (v as i32) < 0 {
+            *g_ptr.add((v >> 11) as u16 as usize)
+        } else {
+            v >> 11
+        }
+    };
+    while bh < nh {
+        let (hi, out_b) = (bh + t, (*s).u.1[t].as_mut_ptr());
+        let mut ptr = out_b;
+        if hi < nh {
+            let (h_id, mut tot) = ((*s).w.2[2048 + hi] as usize, 0u32);
+            cnt[..ne].fill(0);
+            for pass in 0..2 {
+                for tr in 0..12 {
+                    let mut b = (*s).h[0][tr][h_id];
+                    while b >= 0 {
+                        let bu = b as usize;
+                        for &v in &(*s).q[bu * 256..bu * 256 + (*s).w.1[bu] as usize] {
+                            let e = (v & 2047) as usize;
+                            (pass > 0).then(|| lats[(off[e] + cnt[e]) as usize] = val(v));
+                            cnt[e] += 1;
+                        }
+                        b = (*s).n[bu];
+                    }
+                }
+                (0..ne * (1 - pass)).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
+                (pass == 0).then(|| lats.resize(tot as usize, 0));
+            }
+            for &eid_u in (*s).w.2[..ne].iter().filter(|&&e| cnt[e as usize] > 0) {
+                let (eid, n) = (eid_u as usize, cnt[eid_u as usize] as usize);
+                let l = &mut lats[off[eid] as usize..off[eid] as usize + n];
+                let pct = |p: usize| (p * n + 99) / 100 - 1;
+                let (i50, i95, i99) = (pct(50), pct(95), pct(99));
+                (n <= 32).then(|| l.sort_unstable());
+                (n > 32).then(|| l.select_nth_unstable(i50));
+                (n > 32 && i95 > i50).then(|| l[i50 + 1..].select_nth_unstable(i95 - i50 - 1));
+                (n > 32 && i99 > i95).then(|| l[i95 + 1..].select_nth_unstable(i99 - i95 - 1));
+                let (err, el) = (
+                    (*s).c[h_id * 2048 + eid].load(Relaxed),
+                    (*s).u.0[eid] as usize,
+                );
+                copy((*s).p[2048 + h_id] as *const u8, ptr, 13);
+                copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
+                copy((*s).p[eid] as *const u8, ptr.add(21), el);
+                *ptr.add(21 + el) = b' ';
+                ptr = ptr.add(22 + el);
+                let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
+                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] {
+                    ptr = fmt_u32_sp(ptr, v);
+                }
+                *ptr.sub(1) = b'\n';
             }
         }
-        None
-    };
-    loop {
-        let cell = &*(tab.add(s) as *const AtomicU64);
-        if let Some(id) = check(cell.load(Acquire)) {
-            return id;
+        (*s).p[2128 + t] = ptr as usize - out_b as usize;
+        bar.wait();
+        for k in 0..if t == 0 { 12 } else { 0 } {
+            out.write_all(&(*s).u.1[k][..(*s).p[2128 + k]]).unwrap();
         }
-        if cell.load(Acquire) == 0 && cell.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
-            let id = (*sd).n_cnt[ci].fetch_add(1, Relaxed) as usize;
-            if is_ep {
-                (*sd).ep_ptr[id] = p as usize;
-                (*sd).ep_len[id] = len;
-            } else {
-                (*sd).hr_ptr[id] = p as usize;
-            }
-            cell.store(h | (id as u64), Release);
-            return id as u16;
-        }
-        while cell.load(Acquire) == 1 {
-            _mm_pause();
-        }
-        if let Some(id) = check(cell.load(Acquire)) {
-            return id;
-        }
-        s = (s + 1) & mask;
+        bar.wait();
+        bh += 12;
     }
 }
-
 fn main() {
     unsafe {
-        let mut args = std::env::args().skip(1);
-        let in_p = args.next().unwrap_or_else(|| "/data/requests.log".into());
-        let out_p = args.next().unwrap_or_else(|| "/out/summary.txt".into());
+        let mut a = std::env::args().skip(1);
+        let in_p = a.next().unwrap_or_else(|| "/data/requests.log".into());
+        let out_p = a.next().unwrap_or_else(|| "/out/summary.txt".into());
         let (Ok(inf), Ok(outf)) = (File::open(&in_p), File::create(&out_p)) else {
             return;
         };
         let sz = inf.metadata().map(|m| m.len() as usize).unwrap_or(0);
-        if sz == 0 {
-            return;
+        if sz > 0 {
+            let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
+            (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
+            let bar = Barrier::new(12);
+            let (outf, bar) = (&outf, &bar);
+            std::thread::scope(|sc| {
+                for t in 0..12 {
+                    sc.spawn(move || work(t, base as _, sz, outf, bar));
+                }
+            });
         }
-        let (fd, out_fd) = (inf.as_raw_fd(), outf.as_raw_fd());
-        let mut base = mmap(std::ptr::null_mut(), sz, 1, 1, fd, 0);
-        if base as isize == -1 {
-            base = mmap(std::ptr::null_mut(), sz, 1, 2, fd, 0);
-        }
-        if base as isize == -1 {
-            return;
-        }
-        let (bar, base_addr) = (Barrier::new(12), base as usize);
-
-        std::thread::scope(|sc| {
-            for tid in 0..12 {
-                let bar_ref = &bar;
-                sc.spawn(move || {
-                    let sd = S.0.get();
-                    let b_ptr = base_addr as *const u8;
-                    let (mut s, mut e) = (
-                        if tid > 0 { (tid * sz) / 12 } else { 0 },
-                        if tid < 11 { ((tid + 1) * sz) / 12 } else { sz },
-                    );
-                    if s > 0 {
-                        s += slc(b_ptr.add(s - 1), sz - s + 1)
-                            .iter()
-                            .position(|&c| c == b'\n')
-                            .unwrap();
-                    }
-                    if e < sz {
-                        e += slc(b_ptr.add(e - 1), sz - e + 1)
-                            .iter()
-                            .position(|&c| c == b'\n')
-                            .unwrap();
-                    }
-                    let my = &mut (*sd).ts[tid];
-                    *my = TState {
-                        head: [-1; 80],
-                        cur: [-1; 80],
-                        fill: [0; 80],
-                    };
-                    let (mut last_hw, mut hid, mut tl_ep) = (0u64, 0usize, [0u64; 2048]);
-                    let (mut p, end_c, sp_v) =
-                        (b_ptr.add(s), b_ptr.add(e), _mm256_set1_epi8(b' ' as i8));
-
-                    while p < end_c {
-                        let hw = (p.add(5) as *const u64).read_unaligned();
-                        if hw != last_hw {
-                            last_hw = hw;
-                            let hh = (((_mm_crc32_u64(0, (p as *const u64).read_unaligned())
-                                << 32)
-                                ^ hw.wrapping_mul(0x9e3779b97f4a7c15))
-                                & !0xFFFF)
-                                | (1 << 63);
-                            hid = intern(sd, false, p, 13, hh) as usize;
-                        }
-                        let ep = if *p.add(32) == b'/' {
-                            p.add(32)
-                        } else if *p.add(33) == b'/' {
-                            p.add(33)
-                        } else {
-                            let mut q = p.add(34);
-                            while *q != b'/' {
-                                q = q.add(1);
-                            }
-                            q
-                        };
-                        let m = if ep.add(32) <= end_c {
-                            _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-                                _mm256_loadu_si256(ep as _),
-                                sp_v,
-                            )) as u32
-                        } else {
-                            0
-                        };
-                        let elen = if m != 0 {
-                            m.trailing_zeros() as usize
-                        } else {
-                            slc(ep, (end_c as usize) - (ep as usize))
-                                .iter()
-                                .position(|&c| c == b' ')
-                                .unwrap()
-                        };
-
-                        let mut w = [0u64; 4];
-                        if elen >= 16 {
-                            w[0] = (ep as *const u64).read_unaligned();
-                            w[1] = (ep.add(8) as *const u64).read_unaligned();
-                            w[2] = (ep.add(elen - 16) as *const u64).read_unaligned();
-                            w[3] = (ep.add(elen - 8) as *const u64).read_unaligned();
-                        } else if elen >= 8 {
-                            w[0] = (ep as *const u64).read_unaligned();
-                            w[1] = (ep.add(elen - 8) as *const u64).read_unaligned();
-                            (w[2], w[3]) = (w[0], w[1]);
-                        } else {
-                            copy(ep, w.as_mut_ptr() as *mut u8, elen);
-                            (w[1], w[2], w[3]) = (w[0], w[0], w[0]);
-                        }
-                        let mut h1 = elen as u64;
-                        for x in w {
-                            h1 = _mm_crc32_u64(h1, x);
-                        }
-                        let h2 = ((w[0] ^ w[2]).wrapping_mul(0x9e3779b97f4a7c15))
-                            ^ ((w[1] ^ w[3]).wrapping_mul(0xbf58476d1ce4e5b9))
-                            ^ ((elen as u64) << 40);
-                        let h = (((h1 << 32) ^ h2) & !0xFFFF) | (1 << 63);
-
-                        let c_idx = ((h >> 16) as usize) & 2047;
-                        let c_kv = tl_ep[c_idx];
-                        let eid = if (c_kv ^ h) < 65536 {
-                            (c_kv & 0xFFFF) as u16
-                        } else {
-                            let id = intern(sd, true, ep, elen as u8, h);
-                            tl_ep[c_idx] = h | (id as u64);
-                            id
-                        };
-                        let st_p = ep.add(elen + 1);
-                        if *st_p == b'5' {
-                            let err_cell = (*sd).g_err.as_ptr().add(hid * 2048 + (eid as usize))
-                                as *const AtomicU32;
-                            (*err_cell).fetch_add(1, Relaxed);
-                        }
-                        let (mut c, mut lat) = (st_p.add(5), (*st_p.add(4) - b'0') as u32);
-                        while *c >= b'0' {
-                            (lat, c) = (lat * 10 + (*c - b'0') as u32, c.add(1));
-                        }
-                        p = c.add(if *c == b'\r' { 2 } else { 1 });
-
-                        let (mut b, mut f) = (my.cur[hid], my.fill[hid] as usize);
-                        if b < 0 || f == BLK_SZ {
-                            if b >= 0 {
-                                (*sd).blk_fill[b as usize] = BLK_SZ as u16;
-                            }
-                            let nb = (*sd).n_cnt[2].fetch_add(1, Relaxed) as i32;
-                            (*sd).blk_next[nb as usize] = -1;
-                            if b < 0 {
-                                my.head[hid] = nb;
-                            } else {
-                                (*sd).blk_next[b as usize] = nb;
-                            }
-                            (my.cur[hid], b, f) = (nb, nb, 0);
-                        }
-                        let pk = if lat < (1 << 20) {
-                            (lat << 11) | (eid as u32)
-                        } else {
-                            let bi = (*sd).n_cnt[3].fetch_add(1, Relaxed);
-                            (*sd).big_lat[bi as usize] = lat;
-                            0x8000_0000 | (bi << 11) | (eid as u32)
-                        };
-                        ((*sd).pool[(b as usize) * BLK_SZ + f], my.fill[hid]) =
-                            (pk, (f + 1) as u16);
-                    }
-                    for h in 0..80 {
-                        if my.cur[h] >= 0 {
-                            (*sd).blk_fill[my.cur[h] as usize] = my.fill[h];
-                        }
-                    }
-                    bar_ref.wait();
-
-                    if tid == 0 {
-                        let (nh, ne) = (
-                            (*sd).n_cnt[0].load(Relaxed) as usize,
-                            (*sd).n_cnt[1].load(Relaxed) as usize,
-                        );
-                        for i in 0..nh {
-                            (*sd).ord_h[i] = i as u8;
-                        }
-                        for i in 0..ne {
-                            (*sd).ord_e[i] = i as u16;
-                        }
-                        slc_mut((*sd).ord_h.as_mut_ptr(), nh).sort_unstable_by(|&x, &y| {
-                            slc((*sd).hr_ptr[x as usize] as *const u8, 13)
-                                .cmp(slc((*sd).hr_ptr[y as usize] as *const u8, 13))
-                        });
-                        slc_mut((*sd).ord_e.as_mut_ptr(), ne).sort_unstable_by(|&x, &y| {
-                            slc(
-                                (*sd).ep_ptr[x as usize] as *const u8,
-                                (*sd).ep_len[x as usize] as usize,
-                            )
-                            .cmp(slc(
-                                (*sd).ep_ptr[y as usize] as *const u8,
-                                (*sd).ep_len[y as usize] as usize,
-                            ))
-                        });
-                    }
-                    bar_ref.wait();
-
-                    let (nh, ne) = (
-                        (*sd).n_cnt[0].load(Relaxed) as usize,
-                        (*sd).n_cnt[1].load(Relaxed) as usize,
-                    );
-                    let (mut cnt, mut off, mut lats, mut base_hi) =
-                        ([0u32; 2048], [0u32; 2048], Vec::<u32>::new(), 0);
-                    while base_hi < nh {
-                        let (hi, mut out_len) = (base_hi + tid, 0usize);
-                        if hi < nh {
-                            let (h_id, mut tot) = ((*sd).ord_h[hi] as usize, 0u32);
-                            cnt[..ne].fill(0);
-                            for t in 0..12 {
-                                let mut b = (*sd).ts[t].head[h_id];
-                                while b >= 0 {
-                                    let (bf, base_idx) = (
-                                        (*sd).blk_fill[b as usize] as usize,
-                                        (b as usize) * BLK_SZ,
-                                    );
-                                    for i in 0..bf {
-                                        cnt[((*sd).pool[base_idx + i] & 2047) as usize] += 1;
-                                    }
-                                    b = (*sd).blk_next[b as usize];
-                                }
-                            }
-                            for i in 0..ne {
-                                (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0);
-                            }
-                            lats.resize(tot as usize, 0);
-                            for t in 0..12 {
-                                let mut b = (*sd).ts[t].head[h_id];
-                                while b >= 0 {
-                                    let (bf, base_idx) = (
-                                        (*sd).blk_fill[b as usize] as usize,
-                                        (b as usize) * BLK_SZ,
-                                    );
-                                    for i in 0..bf {
-                                        let v = (*sd).pool[base_idx + i];
-                                        let (eid, lat) = (
-                                            (v & 2047) as usize,
-                                            if (v as i32) >= 0 {
-                                                v >> 11
-                                            } else {
-                                                (*sd).big_lat[((v >> 11) & 0xF_FFFF) as usize]
-                                            },
-                                        );
-                                        lats[(off[eid] + cnt[eid]) as usize] = lat;
-                                        cnt[eid] += 1;
-                                    }
-                                    b = (*sd).blk_next[b as usize];
-                                }
-                            }
-                            let out_b = (*sd).t_out[tid].as_mut_ptr();
-                            let mut ptr = out_b;
-                            for ei in 0..ne {
-                                let (eid, n) = (
-                                    (*sd).ord_e[ei] as usize,
-                                    cnt[(*sd).ord_e[ei] as usize] as usize,
-                                );
-                                if n == 0 {
-                                    continue;
-                                }
-                                let l = &mut lats[off[eid] as usize..off[eid] as usize + n];
-                                let pct = |p: usize| (p * n + 99) / 100 - 1;
-                                let (i50, i95, i99) = (pct(50), pct(95), pct(99));
-                                if n <= 32 {
-                                    l.sort_unstable();
-                                } else {
-                                    l.select_nth_unstable(i50);
-                                    if i95 > i50 {
-                                        l[i50 + 1..].select_nth_unstable(i95 - i50 - 1);
-                                    }
-                                    if i99 > i95 {
-                                        l[i95 + 1..].select_nth_unstable(i99 - i95 - 1);
-                                    }
-                                }
-                                let (err, el) =
-                                    ((*sd).g_err[h_id * 2048 + eid], (*sd).ep_len[eid] as usize);
-                                let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
-                                copy((*sd).hr_ptr[h_id] as *const u8, ptr, 13);
-                                copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
-                                copy((*sd).ep_ptr[eid] as *const u8, ptr.add(21), el);
-                                *ptr.add(21 + el) = b' ';
-                                ptr = ptr.add(22 + el);
-                                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] {
-                                    ptr = fmt_u32_sp(ptr, v);
-                                }
-                                *ptr.sub(1) = b'\n';
-                            }
-                            out_len = ptr as usize - out_b as usize;
-                        }
-                        (*sd).t_out_len[tid] = out_len;
-                        bar_ref.wait();
-                        if tid == 0 {
-                            for k in 0..12 {
-                                if base_hi + k < nh && (*sd).t_out_len[k] > 0 {
-                                    write_all(out_fd, (*sd).t_out[k].as_ptr(), (*sd).t_out_len[k]);
-                                }
-                            }
-                        }
-                        bar_ref.wait();
-                        base_hi += 12;
-                    }
-                });
-            }
-        });
     }
 }
