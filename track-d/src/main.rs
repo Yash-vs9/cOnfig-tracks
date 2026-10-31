@@ -1,17 +1,26 @@
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+const MADV_DONTNEED: i32 = 4;
 const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 131072;
+
+const H_SZ: usize = 65536;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 17;
-const H_MAX_LOAD: u32 = 85000;
-const BUF_SZ: usize = 128 * 1024;
+const H_SHIFT: u32 = 32 - 16;
+const H_MAX_LOAD: u32 = 45000;
 
 #[derive(Clone, Copy)]
 struct Query(u32, u32, u32);
@@ -25,10 +34,11 @@ struct FastDistMap {
     epoch: u32,
     used: u32,
 }
+
 impl FastDistMap {
     fn new() -> Self {
         Self {
-            slots: unsafe { std::mem::transmute(vec![0u128; H_SZ]) },
+            slots: vec![Slot::default(); H_SZ],
             epoch: 1,
             used: 0,
         }
@@ -120,7 +130,10 @@ impl FastDistMap {
                 if nd < *my_d {
                     let opp_d = if IS_FWD { (*slot).2 } else { (*slot).1 };
                     if opp_d != INF {
-                        *mu = (*mu).min(nd.saturating_add(opp_d));
+                        let cand = nd.saturating_add(opp_d);
+                        if cand < *mu {
+                            *mu = cand;
+                        }
                     }
                     if nd.saturating_add(top_opp) < *mu {
                         *my_d = nd;
@@ -228,8 +241,6 @@ fn solve_query_64(
     er: *const u32,
     oflow: &[(u32, u32)],
 ) -> i64 {
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap};
     let (mut dist_f, mut dist_b) = (HashMap::with_capacity(2048), HashMap::with_capacity(2048));
     let (mut q_f, mut q_b) = (BinaryHeap::new(), BinaryHeap::new());
     dist_f.insert(s as u32, 0u64);
@@ -239,14 +250,7 @@ fn solve_query_64(
     let mut mu = u64::MAX;
     unsafe {
         while !q_f.is_empty() && !q_b.is_empty() {
-            if q_f
-                .peek()
-                .unwrap()
-                .0
-                 .0
-                .saturating_add(q_b.peek().unwrap().0 .0)
-                >= mu
-            {
+            if q_f.peek().unwrap().0 .0.saturating_add(q_b.peek().unwrap().0 .0) >= mu {
                 break;
             }
             let is_fwd = q_f.len() <= q_b.len();
@@ -289,260 +293,178 @@ fn solve_query_64(
     }
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let (d_def, o_def) = ("/data".to_string(), "/out".to_string());
-    let data_dir = args
-        .iter()
-        .position(|a| a == "--data")
-        .map(|i| &args[i + 1])
-        .or_else(|| args.get(1))
-        .unwrap_or(&d_def);
-    let out_dir = args
-        .iter()
-        .position(|a| a == "--out")
-        .map(|i| &args[i + 1])
-        .or_else(|| args.get(2))
-        .unwrap_or(&o_def);
-    let gf = File::open(format!("{}/graph.txt", data_dir)).expect("graph");
-    let gsize = gf.metadata().expect("meta").len() as usize;
+    let data_dir = args.iter().position(|a| a == "--data").map(|i| &args[i + 1]).or_else(|| args.get(1)).unwrap_or(&d_def);
+    let out_dir = args.iter().position(|a| a == "--out").map(|i| &args[i + 1]).or_else(|| args.get(2)).unwrap_or(&o_def);
 
-    let mut header = [0u8; 64];
-    let _ = gf.read_at(&mut header, 0);
-    let mut p = header.as_ptr();
-    let n = unsafe { parse_u32(&mut p) };
-    unsafe {
-        p = p.add(1);
-    }
-    let _m = unsafe { parse_u32(&mut p) };
-    unsafe {
-        if *p == b'\r' {
-            p = p.add(1);
+    let gpath = format!("{}/graph.txt", data_dir);
+    let gf = File::open(&gpath)?;
+    let gsize = gf.metadata()?.len() as usize;
+
+    let (head_fwd, head_rev, edges_fwd, edges_rev, overflow_map) = unsafe {
+        let ptr = mmap(std::ptr::null_mut(), gsize, 1, 1, gf.as_raw_fd(), 0);
+        assert_ne!(ptr as isize, -1);
+
+        let mut cur = ptr as *const u8;
+        let end = (ptr as *const u8).add(gsize);
+        let n = parse_u32(&mut cur);
+        while *cur != b'\n' {
+            cur = cur.add(1);
         }
-        p = p.add(1);
-    }
-    let edge_start = (p as usize) - (header.as_ptr() as usize);
+        cur = cur.add(1);
+        let edge_start = cur;
 
-    let mut tail = [0u8; 64];
-    let tail_start = gsize.saturating_sub(64);
-    let tr = gf.read_at(&mut tail, tail_start as u64).unwrap_or(0);
-    let mut g_end = tail_start + tr;
-    while g_end > tail_start && tail[g_end - tail_start - 1] < b'0' {
-        g_end -= 1;
-    }
-
-    let nt = 12;
-    let edge_bytes = g_end - edge_start;
-    let mut bounds = vec![g_end; nt + 1];
-    bounds[0] = edge_start;
-    for t in 1..nt {
-        let mut off = edge_start + (edge_bytes * t) / nt;
-        let mut probe = [0u8; 128];
-        let pr = gf
-            .read_at(&mut probe, off.saturating_sub(1) as u64)
-            .unwrap_or(0);
-        let mut s = 0;
-        while s + 1 < pr && off < g_end && probe[s] != b'\n' {
-            off += 1;
-            s += 1;
+        let edge_bytes = (end as usize) - (edge_start as usize);
+        let nt = 12;
+        let mut bounds = vec![end; nt + 1];
+        bounds[0] = edge_start;
+        for t in 1..nt {
+            let mut off = edge_start.add((edge_bytes * t) / nt);
+            while off < end && *off != b'\n' {
+                off = off.add(1);
+            }
+            if off < end && *off == b'\n' {
+                off = off.add(1);
+            }
+            bounds[t] = off.min(end);
         }
-        bounds[t] = off.min(g_end);
-    }
 
-    let head_fwd: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; (n + 1) as usize]) };
-    let head_rev: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; (n + 1) as usize]) };
+        let head_fwd: Vec<AtomicU32> = std::mem::transmute(vec![0u32; (n + 1) as usize]);
+        let head_rev: Vec<AtomicU32> = std::mem::transmute(vec![0u32; (n + 1) as usize]);
 
-    // Pass 1: count BOTH hf and hr, skipping w
-    std::thread::scope(|scope| {
-        for t in 0..nt {
-            let (start, finish, hf, hr, gf_ref) =
-                (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
-            scope.spawn(move || {
-                let mut buf = vec![0u8; BUF_SZ + 64];
-                let (mut off, mut left) = (start, 0usize);
-                while off < finish {
-                    let to_read = (finish - off).min(BUF_SZ);
-                    let got = gf_ref
-                        .read_at(&mut buf[left..left + to_read], off as u64)
-                        .unwrap_or(0);
-                    if got == 0 {
-                        break;
-                    }
-                    off += got;
-                    let total = left + got;
-                    let mut vend = total;
-                    if off < finish {
-                        while vend > 0 && buf[vend - 1] != b'\n' {
-                            vend -= 1;
+        std::thread::scope(|scope| {
+            for t in 0..nt {
+                let (start_addr, finish_addr) = (bounds[t] as usize, bounds[t + 1] as usize);
+                let (hf, hr) = (&head_fwd, &head_rev);
+                scope.spawn(move || {
+                    let mut p = start_addr as *const u8;
+                    let finish = finish_addr as *const u8;
+                    let mut last_adv = (start_addr + 4095) & !4095;
+                    const CHUNK: usize = 1024 * 1024;
+                    while p < finish {
+                        let u = parse_u32(&mut p);
+                        p = p.add(1);
+                        let v = parse_u32(&mut p);
+                        while *p != b'\n' {
+                            p = p.add(1);
                         }
-                    } else if vend == total {
-                        buf[total] = b'\n';
-                    }
-                    unsafe {
-                        let (mut cur, end_p) = (buf.as_ptr(), buf.as_ptr().add(vend));
-                        while cur < end_p {
-                            let u = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let v = parse_u32(&mut cur);
-                            while *cur != b'\n' {
-                                cur = cur.add(1);
-                            }
-                            cur = cur.add(1);
-                            if u != v {
-                                hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
-                                hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
+                        p = p.add(1);
+                        if u != v {
+                            hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
+                            hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        let cur_addr = p as usize;
+                        if cur_addr - last_adv >= CHUNK {
+                            let page_end = cur_addr & !4095;
+                            if page_end > last_adv {
+                                madvise(last_adv as *mut u8, page_end - last_adv, MADV_DONTNEED);
+                                last_adv = page_end;
                             }
                         }
                     }
-                    left = total - vend;
-                    if left > 0 {
-                        buf.copy_within(vend..total, 0);
+                    let final_end = finish_addr & !4095;
+                    if final_end > last_adv {
+                        madvise(last_adv as *mut u8, final_end - last_adv, MADV_DONTNEED);
                     }
-                }
-            });
+                });
+            }
+        });
+
+        let (mut accum_fwd, mut accum_rev) = (0u32, 0u32);
+        for a in &head_fwd {
+            let d = a.load(Ordering::Relaxed);
+            a.store(accum_fwd, Ordering::Relaxed);
+            accum_fwd += d;
         }
-    });
+        for a in &head_rev {
+            let d = a.load(Ordering::Relaxed);
+            a.store(accum_rev, Ordering::Relaxed);
+            accum_rev += d;
+        }
 
-    let (mut accum_fwd, mut accum_rev) = (0u32, 0u32);
-    for a in &head_fwd {
-        let d = a.load(Ordering::Relaxed);
-        a.store(accum_fwd, Ordering::Relaxed);
-        accum_fwd += d;
-    }
-    for a in &head_rev {
-        let d = a.load(Ordering::Relaxed);
-        a.store(accum_rev, Ordering::Relaxed);
-        accum_rev += d;
-    }
+        let mut edges_fwd = vec![0u32; accum_fwd as usize];
+        let mut edges_rev = vec![0u32; accum_rev as usize];
+        let ef_addr = edges_fwd.as_mut_ptr() as usize;
+        let er_addr = edges_rev.as_mut_ptr() as usize;
 
-    let mut edges_fwd = vec![0u32; accum_fwd as usize];
-    let mut edges_rev = vec![0u32; accum_rev as usize];
-    let ef_addr = edges_fwd.as_mut_ptr() as usize;
-    let er_addr = edges_rev.as_mut_ptr() as usize;
-
-    // Pass 2: populate edges_fwd ONLY from file!
-    let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
-        let mut handlers = Vec::with_capacity(nt);
-        for t in 0..nt {
-            let (start, finish, hf, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &gf);
-            handlers.push(scope.spawn(move || {
-                let mut local_oflow = Vec::new();
-                let mut buf = vec![0u8; BUF_SZ + 64];
-                let (mut off, mut left) = (start, 0usize);
-                let ef_ptr = ef_addr as *mut u32;
-                while off < finish {
-                    let to_read = (finish - off).min(BUF_SZ);
-                    let got = gf_ref
-                        .read_at(&mut buf[left..left + to_read], off as u64)
-                        .unwrap_or(0);
-                    if got == 0 {
-                        break;
-                    }
-                    off += got;
-                    let total = left + got;
-                    let mut vend = total;
-                    if off < finish {
-                        while vend > 0 && buf[vend - 1] != b'\n' {
-                            vend -= 1;
+        let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
+            let mut handlers = Vec::with_capacity(nt);
+            for t in 0..nt {
+                let (start_addr, finish_addr) = (bounds[t] as usize, bounds[t + 1] as usize);
+                let (hf, hr) = (&head_fwd, &head_rev);
+                handlers.push(scope.spawn(move || {
+                    let mut local_oflow = Vec::new();
+                    let ef_ptr = ef_addr as *mut u32;
+                    let er_ptr = er_addr as *mut u32;
+                    let mut p = start_addr as *const u8;
+                    let finish = finish_addr as *const u8;
+                    let mut last_adv = (start_addr + 4095) & !4095;
+                    const CHUNK: usize = 1024 * 1024;
+                    while p < finish {
+                        let u = parse_u32(&mut p);
+                        p = p.add(1);
+                        let v = parse_u32(&mut p);
+                        p = p.add(1);
+                        let w = parse_u32(&mut p);
+                        if *p == b'\r' {
+                            p = p.add(1);
                         }
-                    } else if vend == total {
-                        buf[total] = b'\n';
-                    }
-                    unsafe {
-                        let (mut cur, end_p) = (buf.as_ptr(), buf.as_ptr().add(vend));
-                        while cur < end_p {
-                            let u = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let v = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let w = parse_u32(&mut cur);
-                            if *cur == b'\r' {
-                                cur = cur.add(1);
+                        p = p.add(1);
+                        if u != v {
+                            let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
+                            let ifwd =
+                                hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed)
+                                    as usize;
+                            *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
+                            let irev =
+                                hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed)
+                                    as usize;
+                            *er_ptr.add(irev) = (pw << 21) | (u & V_MASK);
+                            if pw == W_SENTINEL {
+                                local_oflow.push((ifwd as u32, w));
+                                local_oflow.push(((1u32 << 31) | (irev as u32), w));
                             }
-                            cur = cur.add(1);
-                            if u != v {
-                                let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
-                                let ifwd =
-                                    hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed)
-                                        as usize;
-                                *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
-                                if pw == W_SENTINEL {
-                                    local_oflow.push((ifwd as u32, w));
-                                }
+                        }
+
+                        let cur_addr = p as usize;
+                        if cur_addr - last_adv >= CHUNK {
+                            let page_end = cur_addr & !4095;
+                            if page_end > last_adv {
+                                madvise(last_adv as *mut u8, page_end - last_adv, MADV_DONTNEED);
+                                last_adv = page_end;
                             }
                         }
                     }
-                    left = total - vend;
-                    if left > 0 {
-                        buf.copy_within(vend..total, 0);
+                    let final_end = finish_addr & !4095;
+                    if final_end > last_adv {
+                        madvise(last_adv as *mut u8, final_end - last_adv, MADV_DONTNEED);
                     }
-                }
-                local_oflow
-            }));
+                    local_oflow
+                }));
+            }
+            handlers.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        munmap(ptr, gsize);
+        drop(gf);
+
+        let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
+        overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
+
+        let mut head_fwd: Vec<u32> = std::mem::transmute(head_fwd);
+        let mut head_rev: Vec<u32> = std::mem::transmute(head_rev);
+        if n > 0 {
+            head_fwd.copy_within(0..n as usize, 1);
+            head_rev.copy_within(0..n as usize, 1);
         }
-        handlers.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+        head_fwd[0] = 0;
+        head_rev[0] = 0;
 
-    drop(bounds);
-    drop(gf);
-
-    let mut fwd_oflow: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
-    fwd_oflow.sort_unstable_by_key(|&(idx, _)| idx);
-
-    // Fix head_fwd
-    let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
-    if n > 0 {
-        head_fwd.copy_within(0..n as usize, 1);
-    }
-    head_fwd[0] = 0;
-
-    // In-memory reverse fill: build edges_rev from edges_fwd!
-    let n_nodes = n as usize;
-    let chunk_nodes = (n_nodes + nt - 1) / nt;
-    let rev_oflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
-        let mut handlers = Vec::with_capacity(nt);
-        for t in 0..nt {
-            let u_start = t * chunk_nodes;
-            let u_end = (u_start + chunk_nodes).min(n_nodes);
-            let (hf, ef, hr, fof) = (&head_fwd, &edges_fwd, &head_rev, &fwd_oflow);
-            handlers.push(scope.spawn(move || {
-                let mut local_roflow = Vec::new();
-                let er_ptr = er_addr as *mut u32;
-                for u in u_start..u_end {
-                    let e_start = hf[u] as usize;
-                    let e_end = hf[u + 1] as usize;
-                    for e in e_start..e_end {
-                        let packed = ef[e];
-                        let (v, pw) = (packed & V_MASK, packed >> 21);
-                        let irev = hr[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                        unsafe {
-                            *er_ptr.add(irev) = (pw << 21) | (u as u32);
-                        }
-                        if pw == W_SENTINEL {
-                            if let Ok(pos) = fof.binary_search_by_key(&(e as u32), |&(k, _)| k) {
-                                let w = fof[pos].1;
-                                local_roflow.push(((1u32 << 31) | (irev as u32), w));
-                            }
-                        }
-                    }
-                }
-                local_roflow
-            }));
-        }
-        handlers.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut overflow_map = fwd_oflow;
-    overflow_map.extend(rev_oflows.into_iter().flatten());
-    overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
-
-    let mut head_rev: Vec<u32> = unsafe { std::mem::transmute(head_rev) };
-    if n > 0 {
-        head_rev.copy_within(0..n as usize, 1);
-    }
-    head_rev[0] = 0;
-
-    // Queries
+        (head_fwd, head_rev, edges_fwd, edges_rev, overflow_map)
+    };
 
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries");
     let mut queries = Vec::with_capacity(4096);
@@ -585,8 +507,9 @@ fn main() {
     let answers_addr = answers.as_mut_ptr() as usize;
     let next_query = AtomicUsize::new(0);
 
+    let nt = 12;
     std::thread::scope(|scope| {
-        for _ in 0..nt.min(12).min(unique_queries.len()) {
+        for _ in 0..nt.min(unique_queries.len()) {
             let (nq, qref, hf, hr, ef, er, oflow) = (
                 &next_query,
                 &unique_queries,
@@ -744,5 +667,6 @@ fn main() {
             out_buf.push(b'\n');
         }
     }
-    f.write_all(&out_buf).expect("write");
+    f.write_all(&out_buf)?;
+    Ok(())
 }
