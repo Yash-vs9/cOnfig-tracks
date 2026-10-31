@@ -7,4 +7,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 20.64 | 367 | 0 |
 | 1 | C++23 zero-copy mmap, quote parity chunking, direct 1M LUT, parallel sharded dedup | run-2dc91c0fb143 | 0.111 | 57 | 60.74 |
 | 2 | Unrolled branchless quote-scanning for name/note fields, pre-reserved exact shard capacities | run-90413a86a349 | 0.107 | 44 | 61.63 |
-| 3 | AVX2 vectorized quote-parity scan, hardware CRC32 name hashing, tuned capacity and swap dealloc | | | | |
+| 3 | Dense 0..240 country mapping, lock-free 262k-slot 256-bit bitmask hash table, zero vector sort | | | | |
