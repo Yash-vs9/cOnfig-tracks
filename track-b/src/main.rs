@@ -281,7 +281,9 @@ doc_e: &[u32; NUM_C], fw_ptr: *mut u16, dp_ptr: *mut u32, ) { let num_docs = (do
 for ld in 0..num_docs { let start = *dp_ptr.add(ld) as usize; let end = *dp_ptr.add(ld + 1) as usize; let mut i = start;
 while i < end { let mut t = *fw_ptr.add(i) as usize; i += 1; if t == 65535 { t = 65535 + *fw_ptr.add(i) as usize;
 i += 1; } let pos = *cur_ptr.add(t); *cur_ptr.add(t) = pos + 1; *chunk_u16_ptr.add(pos as usize) = ld as u16; } } }
-unsafe fn run_all() { mallopt(-8, 1); mallopt(-1, 0); mallopt(-3, 65536); let mut args = std::env::args().skip(1);
+unsafe fn run_all() {
+let t0 = std::time::Instant::now();
+mallopt(-8, 1); mallopt(-1, 0); mallopt(-3, 65536); let mut args = std::env::args().skip(1);
 let (mut d_dir, mut o_dir) = ("/data".into(), "/out".into()); while let Some(a) = args.next() {
 if a == "--data"  { d_dir = args.next().unwrap(); } else if a == "--out"  { o_dir = args.next().unwrap(); } }
 let q_buf = map_file(&format!("{}/queries.txt", d_dir)); let d_buf = map_file(&format!("{}/docs.txt", d_dir));
@@ -296,7 +298,9 @@ match (ib, tok) { (true, b"AND") => q.ops |= 1 << ((q.k - 1) * 2), (true, b"OR")
 (true, b"NOT") => q.ops |= 3 << ((q.k - 1) * 2), _ => {
 let tid = insert_term(tok, ts as u32, q_buf); q_terms.push(tid); q.k += 1; } } } queries.push(q); qp = le;
 while qp < qe && q_buf[qp] != b'\n'  { qp += 1; } qp += 1; }
-queries.shrink_to_fit(); q_terms.shrink_to_fit(); let mut rep_map = vec![u32::MAX; N_TERMS]; for q in &queries {
+queries.shrink_to_fit(); q_terms.shrink_to_fit();
+eprintln!("[STAGE 0] parse: {:?}", t0.elapsed());
+let mut rep_map = vec![u32::MAX; N_TERMS]; for q in &queries {
 if q.ib == 1 { let q_ts = &q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize]; for w in q_ts.windows(2) {
 if w[0] == w[1] && rep_map[w[0] as usize] == u32::MAX { let (t, rt) = (w[0] as usize, N_TERMS as u32); N_TERMS += 1;
 rep_map[t] = rt; TINFO[rt as usize] = TINFO[t]; } } } } let f_sz = d_buf.len(); let mut pl = f_sz - 1;
@@ -313,7 +317,9 @@ if nh < 2048 { *s_hl.get_unchecked_mut(nh) = t as u32; nh += 1; } else { ov = tr
 sample_counts[t] = sample_counts[t].saturating_add(1); } });
 if ov { s_seen.fill(0); } else { for i in 0..nh { *s_seen.get_unchecked_mut((*s_hl.get_unchecked(i) >> 6) as usize) = 0; } } }
 let threshold = if total_docs >= 25000 { 34 } else { 15 }; for i in 0..nt { if sample_counts[i] >= threshold {
-bs_idx[i] = n_bs as u16; n_bs += 1; } } drop(sample_counts); let g_bs_total = n_bs * w_per_doc;
+bs_idx[i] = n_bs as u16; n_bs += 1; } } drop(sample_counts);
+eprintln!("[STAGE 0] sample: {:?}", t0.elapsed());
+let g_bs_total = n_bs * w_per_doc;
 let raw_bs_ptr = alloc_mmap::<u64>(g_bs_total); let raw_bs_val = raw_bs_ptr as usize;
 let mut doc_ts = vec![0u32; total_docs as usize]; let dpc = (total_docs + NUM_C as u32 - 1) / NUM_C as u32;
 let (mut doc_s, mut doc_e, mut c_byte) = ([0u32; NUM_C], [0u32; NUM_C], [0usize; NUM_C + 1]); c_byte[NUM_C] = f_sz;
@@ -372,6 +378,7 @@ let chunk_u16 = alloc_mmap::<u16>(my_total); c_post_ptrs[c].store(chunk_u16 as u
 c_post_lens[c].store(my_total, Ordering::Relaxed); worker_transpose( c, nt, c_off_p, chunk_u16, &doc_s, &doc_e, fw0,
 dp0, ); } free_mmap(fw0, FW_CAP); free_mmap(dp0, DP_CAP);
 while ready.load(Ordering::Acquire) < NUM_T - 1  { std::hint::spin_loop(); }
+eprintln!("[STAGE 0] scan+transpose: {:?}", t0.elapsed());
 madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4); for i in 0..nt {
 if bs_idx[i] != u16::MAX  { TINFO[i].df = 65535; } else { let mut df = 0u32; for c in 0..NUM_C { let base = c * nt;
 let end = *c_offs.add(base + i); let start = if i > 0 { *c_offs.add(base + i - 1) } else { 0 }; df += end - start; }
@@ -386,8 +393,11 @@ rep_map: &rep_map, doc_ts: doc_ts_slice, d_buf, q_buf, q_terms: &q_terms, nt, };
 loop { let b = next_b.fetch_add(1, Ordering::Relaxed); if b >= nb  { break; }
 let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b); for q in &queries[b * QB..((b + 1) * QB).min(queries.len())] {
 if q.ib == 0  { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } } });
+eprintln!("[STAGE 0] query: {:?}", t0.elapsed());
 let _ = std::fs::create_dir_all(&o_dir); let mut f = File::create(format!("{}/results.txt", o_dir)).unwrap();
 for ob in &out_bufs  { f.write_all(ob).unwrap(); } free_mmap(raw_bs_ptr, g_bs_total);
 for c in 0..NUM_C  { free_mmap(c_post_ptrs[c].load(Ordering::Relaxed) as *mut u16, c_post_lens[c].load(Ordering::Relaxed)); }
-free_mmap(c_offs, sc_count); drop(doc_ts); drop(queries); drop(q_terms); malloc_trim(0); }
+free_mmap(c_offs, sc_count); drop(doc_ts); drop(queries); drop(q_terms); malloc_trim(0);
+eprintln!("[STAGE 0] total: {:?}", t0.elapsed());
+}
 fn main() { unsafe { run_all(); } }
