@@ -12,10 +12,10 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 65536;
+const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 16;
-const H_MAX_LOAD: u32 = 45000;
+const H_SHIFT: u32 = 32 - 17;
+const H_MAX_LOAD: u32 = 85000;
 const BUF_SZ: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
@@ -33,7 +33,7 @@ struct FastDistMap {
 impl FastDistMap {
     fn new() -> Self {
         Self {
-            slots: vec![Slot::default(); H_SZ],
+            slots: unsafe { std::mem::transmute(vec![0u128; H_SZ]) },
             epoch: 1,
             used: 0,
         }
