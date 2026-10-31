@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Instant;
+
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -17,8 +17,8 @@ const V_MASK: u32 = (1 << V_BITS) - 1;
 const INF32: u32 = u32::MAX;
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const H_MAX_LOAD: u32 = 110000;
-const STREAM_BUF_SIZE: usize = 256 * 1024;
+const H_MAX_LOAD: u32 = 85000;
+const STREAM_BUF_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Query { s: u32, t: u32, id: u32 }
@@ -83,21 +83,28 @@ impl FastDistMap {
         _mm_prefetch(self.slots.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
     }
     #[inline(always)]
-    unsafe fn relax_fwd(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
+    unsafe fn relax_fwd(&mut self, v: u32, nd: u32, top_b: u32, heap: &mut MinHeap4, mu: &mut u32) {
         let ep = self.epoch;
         let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
         let base = self.slots.as_mut_ptr();
         loop {
             let slot = base.add(idx);
             if (*slot).epoch != ep {
-                *slot = Slot { v, fwd: nd, rev: INF32, epoch: ep };
-                self.used += 1; heap.push(nd, v); return;
+                if nd.saturating_add(top_b) < *mu {
+                    *slot = Slot { v, fwd: nd, rev: INF32, epoch: ep };
+                    self.used += 1;
+                    heap.push(nd, v);
+                }
+                return;
             }
             if (*slot).v == v {
                 if nd < (*slot).fwd {
-                    (*slot).fwd = nd; heap.push(nd, v);
                     let cr = (*slot).rev;
                     if cr != INF32 { *mu = (*mu).min(nd.saturating_add(cr)); }
+                    if nd.saturating_add(top_b) < *mu {
+                        (*slot).fwd = nd;
+                        heap.push(nd, v);
+                    }
                 }
                 return;
             }
@@ -105,21 +112,28 @@ impl FastDistMap {
         }
     }
     #[inline(always)]
-    unsafe fn relax_rev(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
+    unsafe fn relax_rev(&mut self, v: u32, nd: u32, top_f: u32, heap: &mut MinHeap4, mu: &mut u32) {
         let ep = self.epoch;
         let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
         let base = self.slots.as_mut_ptr();
         loop {
             let slot = base.add(idx);
             if (*slot).epoch != ep {
-                *slot = Slot { v, fwd: INF32, rev: nd, epoch: ep };
-                self.used += 1; heap.push(nd, v); return;
+                if nd.saturating_add(top_f) < *mu {
+                    *slot = Slot { v, fwd: INF32, rev: nd, epoch: ep };
+                    self.used += 1;
+                    heap.push(nd, v);
+                }
+                return;
             }
             if (*slot).v == v {
                 if nd < (*slot).rev {
-                    (*slot).rev = nd; heap.push(nd, v);
                     let cf = (*slot).fwd;
                     if cf != INF32 { *mu = (*mu).min(nd.saturating_add(cf)); }
+                    if nd.saturating_add(top_f) < *mu {
+                        (*slot).rev = nd;
+                        heap.push(nd, v);
+                    }
                 }
                 return;
             }
@@ -225,7 +239,6 @@ fn solve_query_64(s: usize, t: usize, hf: *const u32, hr: *const u32, ef: *const
 }
 
 fn main() {
-    let t_total = Instant::now();
     let (data_dir, out_dir) = {
         let args: Vec<String> = std::env::args().collect();
         let (mut d, mut o) = ("/data".to_string(), "/out".to_string());
@@ -297,6 +310,7 @@ fn main() {
                         while cur < end_cur {
                             let u = parse_fast_u32(&mut cur); cur = cur.add(1);
                             let v = parse_fast_u32(&mut cur);
+                            cur = cur.add(2);
                             while *cur != b'\n' { cur = cur.add(1); }
                             cur = cur.add(1);
                             if u != v {
@@ -398,13 +412,13 @@ fn main() {
         }
     }
     drop(q_bytes);
+    queries.sort_unstable_by_key(|q| (q.s >> 5, q.t >> 5));
 
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
     let q_threads = nt.min(12).min(queries.len());
     let next_query = AtomicUsize::new(0);
 
-    let t_queries = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..q_threads {
             let next_ref = &next_query;
@@ -445,15 +459,18 @@ fn main() {
 
                     unsafe {
                         while !heap_f.is_empty() && !heap_b.is_empty() {
-                            if mu != INF32 && heap_f.min_key().saturating_add(heap_b.min_key()) >= mu { break; }
+                            let top_f = heap_f.min_key();
+                            let top_b = heap_b.min_key();
+                            if top_f.saturating_add(top_b) >= mu { break; }
                             if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
 
                             if heap_f.data.len() <= heap_b.data.len() {
                                 let (d, u) = heap_f.pop();
-                                if d >= mu { break; }
-                                if d > dist_map.get_fwd_dist(u) { continue; }
+                                if d.saturating_add(top_b) >= mu { break; }
+                                if d > 0 && d > dist_map.get_fwd_dist(u) { continue; }
                                 let (e_start, e_end) = (*hf_ptr.add(u as usize) as usize, *hf_ptr.add(u as usize + 1) as usize);
                                 for e in e_start..e_end {
+                                    if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
                                     let packed = *ef_ptr.add(e);
                                     let v = packed & V_MASK;
                                     let mut w = packed >> V_BITS;
@@ -469,14 +486,15 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    dist_map.relax_fwd(v, nd, &mut heap_f, &mut mu);
+                                    dist_map.relax_fwd(v, nd, top_b, &mut heap_f, &mut mu);
                                 }
                             } else {
                                 let (d, u) = heap_b.pop();
-                                if d >= mu { break; }
-                                if d > dist_map.get_rev_dist(u) { continue; }
+                                if d.saturating_add(top_f) >= mu { break; }
+                                if d > 0 && d > dist_map.get_rev_dist(u) { continue; }
                                 let (e_start, e_end) = (*hr_ptr.add(u as usize) as usize, *hr_ptr.add(u as usize + 1) as usize);
                                 for e in e_start..e_end {
+                                    if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
                                     let packed = *er_ptr.add(e);
                                     let v = packed & V_MASK;
                                     let mut w = packed >> V_BITS;
@@ -492,9 +510,10 @@ fn main() {
                                     }
                                     let nd = d.saturating_add(w);
                                     if nd >= mu { continue; }
-                                    dist_map.relax_rev(v, nd, &mut heap_b, &mut mu);
+                                    dist_map.relax_rev(v, nd, top_f, &mut heap_b, &mut mu);
                                 }
                             }
+                            if table_full { break; }
                         }
 
                         let mut ans_val = if mu == INF32 { -1 } else { mu as i64 };
@@ -507,9 +526,6 @@ fn main() {
             });
         }
     });
-
-    println!("Queries (with prefetch + fast push): {:?}", t_queries.elapsed());
-    println!("Total Execution: {:?}", t_total.elapsed());
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut f = File::create(format!("{}/distances.txt", out_dir)).expect("distances.txt");
