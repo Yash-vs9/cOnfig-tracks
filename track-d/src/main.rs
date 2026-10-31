@@ -1,4 +1,6 @@
 //! Speed Demon 2026 - Track D (Traverse)
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -9,9 +11,9 @@ const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_BITS: u32 = 21;
 const V_MASK: u32 = (1 << V_BITS) - 1;
 const INF32: u32 = u32::MAX;
-const H_SZ: usize = 65536;
+const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const H_MAX_LOAD: u32 = 55705; // 85% of 65536
+const H_MAX_LOAD: u32 = 110000;
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
@@ -28,8 +30,7 @@ impl FastDistMap {
     }
     #[inline(always)]
     fn next_query(&mut self) {
-        self.used = 0;
-        self.epoch = self.epoch.wrapping_add(1);
+        self.used = 0; self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 { for s in &mut self.slots { s.epoch = 0; } self.epoch = 1; }
     }
     #[inline(always)]
@@ -41,8 +42,7 @@ impl FastDistMap {
             let slot = base.add(idx);
             if (*slot).epoch != ep || (*slot).v == s {
                 (*slot).epoch = ep; (*slot).v = s; (*slot).fwd = 0; (*slot).rev = INF32;
-                self.used += 1;
-                break;
+                self.used += 1; break;
             }
             idx = (idx + 1) & H_MSK;
         }
@@ -51,8 +51,7 @@ impl FastDistMap {
             let slot = base.add(idx_t);
             if (*slot).epoch != ep || (*slot).v == t {
                 (*slot).epoch = ep; (*slot).v = t; (*slot).fwd = INF32; (*slot).rev = 0;
-                self.used += 1;
-                break;
+                self.used += 1; break;
             }
             idx_t = (idx_t + 1) & H_MSK;
         }
@@ -90,14 +89,11 @@ impl FastDistMap {
             let slot = base.add(idx);
             if (*slot).epoch != ep {
                 (*slot).epoch = ep; (*slot).v = v; (*slot).fwd = nd; (*slot).rev = INF32;
-                self.used += 1;
-                heap.push(nd, v);
-                return;
+                self.used += 1; heap.push(nd, v); return;
             }
             if (*slot).v == v {
                 if nd < (*slot).fwd {
-                    (*slot).fwd = nd;
-                    heap.push(nd, v);
+                    (*slot).fwd = nd; heap.push(nd, v);
                     let cr = (*slot).rev;
                     if cr != INF32 { *mu = (*mu).min(nd.saturating_add(cr)); }
                 }
@@ -115,14 +111,11 @@ impl FastDistMap {
             let slot = base.add(idx);
             if (*slot).epoch != ep {
                 (*slot).epoch = ep; (*slot).v = v; (*slot).fwd = INF32; (*slot).rev = nd;
-                self.used += 1;
-                heap.push(nd, v);
-                return;
+                self.used += 1; heap.push(nd, v); return;
             }
             if (*slot).v == v {
                 if nd < (*slot).rev {
-                    (*slot).rev = nd;
-                    heap.push(nd, v);
+                    (*slot).rev = nd; heap.push(nd, v);
                     let cf = (*slot).fwd;
                     if cf != INF32 { *mu = (*mu).min(nd.saturating_add(cf)); }
                 }
@@ -152,8 +145,7 @@ impl MinHeap4 {
                 let p = (i - 1) >> 2;
                 let parent = *slice.add(p);
                 if packed >= parent { break; }
-                *slice.add(i) = parent;
-                i = p;
+                *slice.add(i) = parent; i = p;
             }
             *slice.add(i) = packed;
         }
@@ -179,8 +171,7 @@ impl MinHeap4 {
                         for k in c + 1..sz { if *slice.add(k) < *slice.add(mc) { mc = k; } }
                     }
                     if *slice.add(mc) >= last { break; }
-                    *slice.add(i) = *slice.add(mc);
-                    i = mc;
+                    *slice.add(i) = *slice.add(mc); i = mc;
                 }
                 *slice.add(i) = last;
             }
@@ -191,8 +182,7 @@ impl MinHeap4 {
 
 #[inline(always)]
 unsafe fn parse_fast_u32(p: &mut *const u8) -> u32 {
-    let mut v = (**p - b'0') as u32;
-    *p = p.add(1);
+    let mut v = (**p - b'0') as u32; *p = p.add(1);
     while **p >= b'0' { v = v * 10 + (**p - b'0') as u32; *p = p.add(1); }
     v
 }
@@ -204,12 +194,12 @@ fn solve_query_64(
     ef_ptr: *const u32, er_ptr: *const u32,
     oflow: &[(u32, u32)],
 ) -> i64 {
-    let mut dist_f = std::collections::HashMap::with_capacity(65536);
-    let mut dist_b = std::collections::HashMap::with_capacity(65536);
-    let mut q_f = std::collections::BinaryHeap::new();
-    let mut q_b = std::collections::BinaryHeap::new();
+    let mut dist_f = HashMap::with_capacity(2048);
+    let mut dist_b = HashMap::with_capacity(2048);
+    let mut q_f = BinaryHeap::new();
+    let mut q_b = BinaryHeap::new();
     dist_f.insert(s as u32, 0u64); dist_b.insert(t as u32, 0u64);
-    q_f.push((std::cmp::Reverse(0u64), s as u32)); q_b.push((std::cmp::Reverse(0u64), t as u32));
+    q_f.push((Reverse(0u64), s as u32)); q_b.push((Reverse(0u64), t as u32));
     let mut mu = u64::MAX;
     unsafe {
         while !q_f.is_empty() && !q_b.is_empty() {
@@ -220,7 +210,7 @@ fn solve_query_64(
             } else {
                 (&mut q_b, &mut dist_b, &dist_f, hr_ptr, er_ptr, 1u32 << 31)
             };
-            let (std::cmp::Reverse(d), u) = q.pop().unwrap();
+            let (Reverse(d), u) = q.pop().unwrap();
             if d > *dist_m.get(&u).unwrap_or(&u64::MAX) { continue; }
             let (start, end) = (*h_ptr.add(u as usize) as usize, *h_ptr.add(u as usize + 1) as usize);
             for e in start..end {
@@ -234,8 +224,7 @@ fn solve_query_64(
                 }
                 let nd = d + w;
                 if nd < *dist_m.get(&v).unwrap_or(&u64::MAX) {
-                    dist_m.insert(v, nd);
-                    q.push((std::cmp::Reverse(nd), v));
+                    dist_m.insert(v, nd); q.push((Reverse(nd), v));
                     if let Some(&opp_d) = dist_o.get(&v) { mu = mu.min(nd + opp_d); }
                 }
             }
@@ -413,8 +402,7 @@ fn main() {
             let s = parse_fast_u32(&mut qp);
             while qp < q_end_p && *qp < b'0' { qp = qp.add(1); }
             let t = parse_fast_u32(&mut qp);
-            queries.push(Query { s, t, id: qid });
-            qid += 1;
+            queries.push(Query { s, t, id: qid }); qid += 1;
         }
     }
     drop(q_bytes);
@@ -456,9 +444,7 @@ fn main() {
 
                     dist_map.next_query();
                     heap_f.clear(); heap_b.clear();
-                    unsafe {
-                        dist_map.init_start(s as u32, t as u32);
-                    }
+                    unsafe { dist_map.init_start(s as u32, t as u32); }
                     heap_f.push(0, s as u32); heap_b.push(0, t as u32);
 
                     let mut mu = INF32;
@@ -528,8 +514,7 @@ fn main() {
         if n == 0 { out_buf.extend_from_slice(b"0\n"); continue; }
         let start = out_buf.len();
         while n > 0 { out_buf.push(b'0' + (n % 10) as u8); n /= 10; }
-        out_buf[start..].reverse();
-        out_buf.push(b'\n');
+        out_buf[start..].reverse(); out_buf.push(b'\n');
     }
     f.write_all(&out_buf).expect("write output");
 }
