@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::os::unix::io::IntoRawFd;
 use std::ptr;
 
@@ -7,6 +8,7 @@ extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn munmap(a: *mut u8, l: usize) -> i32;
     fn close(fd: i32) -> i32;
+    fn mallopt(param: i32, val: i32) -> i32;
 }
 
 const H_SZ: usize = 131072;
@@ -42,10 +44,8 @@ unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h
         let s = *VTAB.get_unchecked(idx);
         if s.h32 == h32 {
             let ti = *TINFO.get_unchecked(s.tid as usize);
-            if ti.w0 == w0 && ti.w1 == w1 && ti.len as usize == len {
-                if len <= 16 || &q_buf[ti.off as usize + 16..ti.off as usize + len] == &tail[..len - 16] {
-                    return s.tid;
-                }
+            if ti.w0 == w0 && ti.w1 == w1 && ti.len as usize == len && (len <= 16 || &q_buf[ti.off as usize + 16..ti.off as usize + len] == &tail[..len - 16]) {
+                return s.tid;
             }
         }
         idx = (idx + 1) & H_MSK;
@@ -112,13 +112,31 @@ unsafe fn scan_doc<F: FnMut(u32, bool)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8
     }
 }
 
+const DIGITS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+#[inline(always)]
 fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
     if n == 0 { buf.push(b'0'); return; }
     let mut tmp = [0u8; 20]; let mut i = 20;
-    while n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+    while n >= 100 {
+        let rem = (n % 100) as usize * 2;
+        n /= 100;
+        i -= 2;
+        tmp[i] = DIGITS[rem];
+        tmp[i + 1] = DIGITS[rem + 1];
+    }
+    if n < 10 {
+        i -= 1; tmp[i] = b'0' + n as u8;
+    } else {
+        let rem = n as usize * 2;
+        i -= 2;
+        tmp[i] = DIGITS[rem];
+        tmp[i + 1] = DIGITS[rem + 1];
+    }
     buf.extend_from_slice(&tmp[i..]);
 }
 
+#[inline(always)]
 fn fmt_res(cnt: u64, sum: u64, top: &[u32; 10], tc: usize, out: &mut Vec<u8>) {
     if cnt == 0 {
         out.extend_from_slice(b"0 0\n");
@@ -134,23 +152,28 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0); // PROT_READ, MAP_SHARED
+    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     close(fd);
     std::slice::from_raw_parts(p, len)
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn exec_bool(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is_bs: &[bool], bs_idx: &[u32], doc_s: &[u32; NUM_C], doc_e: &[u32; NUM_C], w_per_doc: usize, g_bs: &[u64], g_u16: &[u16], out: &mut Vec<u8>) {
+unsafe fn exec_bool(q: &Query, c_off: &[u32], c_base: &[u32; NUM_C], is_bs: &[bool], bs_idx: &[u32], doc_s: &[u32; NUM_C], doc_e: &[u32; NUM_C], w_per_doc: usize, g_bs: &[u64], g_u16: &[u16], nt: usize, out: &mut Vec<u8>) {
     let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
+    let mut clist = [0u16; 1024];
+    let mut curr_uninit = MaybeUninit::<[u64; MAX_W]>::uninit();
+    let mut nb_uninit = MaybeUninit::<[u64; MAX_W]>::uninit();
+    let curr = curr_uninit.assume_init_mut();
+    let nb = nb_uninit.assume_init_mut();
+
     for c in 0..NUM_C {
         let (cs, cd) = (doc_s[c], doc_e[c] - doc_s[c]);
         if cd == 0 { continue; }
         let cw = ((cd + 63) >> 6) as usize;
+        let c_base_off = c * nt;
         let t0 = q.tids[0] as usize;
         let mut clen = 0usize;
-        let mut clist = [0u16; 1024];
         let mut in_bs = is_bs[t0];
-        let (mut curr, mut nb) = ([0u64; MAX_W], [0u64; MAX_W]);
 
         let get_c_bs = |tid: usize, buf: &mut [u64; MAX_W]| {
             if tid == u32::MAX as usize { buf[..cw].fill(0); return; }
@@ -159,53 +182,53 @@ unsafe fn exec_bool(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is
                 buf[..cw].copy_from_slice(&g_bs[off..off + cw]);
             } else {
                 buf[..cw].fill(0);
-                let s = if tid > 0 { c_off[tid - 1][c] } else { c_base[c] } as usize;
-                let e = c_off[tid][c] as usize;
-                for &ld in &g_u16[s..e] { buf[(ld as usize) >> 6] |= 1u64 << (ld & 63); }
+                let s = if tid > 0 { *c_off.get_unchecked(c_base_off + tid - 1) } else { c_base[c] } as usize;
+                let e = *c_off.get_unchecked(c_base_off + tid) as usize;
+                for &ld in &g_u16[s..e] { *buf.get_unchecked_mut((ld as usize) >> 6) |= 1u64 << (ld & 63); }
             }
         };
 
         if in_bs {
-            get_c_bs(t0, &mut curr);
+            get_c_bs(t0, curr);
         } else {
-            let s0 = if t0 > 0 { c_off[t0 - 1][c] } else { c_base[c] } as usize;
-            clen = (c_off[t0][c] as usize) - s0;
-            if clen > 1024 { in_bs = true; get_c_bs(t0, &mut curr); }
+            let s0 = if t0 > 0 { *c_off.get_unchecked(c_base_off + t0 - 1) } else { c_base[c] } as usize;
+            clen = (*c_off.get_unchecked(c_base_off + t0) as usize) - s0;
+            if clen > 1024 { in_bs = true; get_c_bs(t0, curr); }
             else { clist[..clen].copy_from_slice(&g_u16[s0..s0 + clen]); }
         }
 
         for oi in 0..(q.k as usize - 1) {
             let op = (q.ops >> (oi * 2)) & 3;
-            let nt = q.tids[oi + 1] as usize;
-            let ns = if nt > 0 { c_off[nt - 1][c] } else { c_base[c] } as usize;
-            let ne = c_off[nt][c] as usize;
+            let nt_id = q.tids[oi + 1] as usize;
+            let ns = if nt_id > 0 { *c_off.get_unchecked(c_base_off + nt_id - 1) } else { c_base[c] } as usize;
+            let ne = *c_off.get_unchecked(c_base_off + nt_id) as usize;
             if in_bs {
-                if is_bs[nt] {
-                    let b = &g_bs[(bs_idx[nt] as usize) * w_per_doc + ((cs >> 6) as usize)..];
-                    if op == 1 { for w in 0..cw { curr[w] &= b[w]; } }
-                    else if op == 2 { for w in 0..cw { curr[w] |= b[w]; } }
-                    else { for w in 0..cw { curr[w] &= !b[w]; } }
+                if is_bs[nt_id] {
+                    let b = &g_bs[(bs_idx[nt_id] as usize) * w_per_doc + ((cs >> 6) as usize)..];
+                    if op == 1 { for w in 0..cw { *curr.get_unchecked_mut(w) &= *b.get_unchecked(w); } }
+                    else if op == 2 { for w in 0..cw { *curr.get_unchecked_mut(w) |= *b.get_unchecked(w); } }
+                    else { for w in 0..cw { *curr.get_unchecked_mut(w) &= !*b.get_unchecked(w); } }
                 } else if op == 2 {
-                    for &ld in &g_u16[ns..ne] { curr[(ld as usize) >> 6] |= 1u64 << (ld & 63); }
+                    for &ld in &g_u16[ns..ne] { *curr.get_unchecked_mut((ld as usize) >> 6) |= 1u64 << (ld & 63); }
                 } else if op == 3 {
-                    for &ld in &g_u16[ns..ne] { curr[(ld as usize) >> 6] &= !(1u64 << (ld & 63)); }
+                    for &ld in &g_u16[ns..ne] { *curr.get_unchecked_mut((ld as usize) >> 6) &= !(1u64 << (ld & 63)); }
                 } else {
-                    get_c_bs(nt, &mut nb);
-                    for w in 0..cw { curr[w] &= nb[w]; }
+                    get_c_bs(nt_id, nb);
+                    for w in 0..cw { *curr.get_unchecked_mut(w) &= *nb.get_unchecked(w); }
                 }
             } else if op == 1 {
                 if clen == 0 { continue; }
                 let mut w = 0usize;
-                if is_bs[nt] {
-                    let b = &g_bs[(bs_idx[nt] as usize) * w_per_doc..];
+                if is_bs[nt_id] {
+                    let b = &g_bs[(bs_idx[nt_id] as usize) * w_per_doc..];
                     for i in 0..clen {
                         let d = (cs + clist[i] as u32) as usize;
-                        if ((b[d >> 6] >> (d & 63)) & 1) != 0 { clist[w] = clist[i]; w += 1; }
+                        if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) != 0 { *clist.get_unchecked_mut(w) = clist[i]; w += 1; }
                     }
                 } else {
                     let (mut i, mut j) = (0usize, ns);
                     while i < clen && j < ne {
-                        if clist[i] == g_u16[j] { clist[w] = clist[i]; w += 1; i += 1; j += 1; }
+                        if clist[i] == g_u16[j] { *clist.get_unchecked_mut(w) = clist[i]; w += 1; i += 1; j += 1; }
                         else if clist[i] < g_u16[j] { i += 1; } else { j += 1; }
                     }
                 }
@@ -213,26 +236,26 @@ unsafe fn exec_bool(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is
             } else if op == 3 {
                 if clen == 0 { continue; }
                 let mut w = 0usize;
-                if is_bs[nt] {
-                    let b = &g_bs[(bs_idx[nt] as usize) * w_per_doc..];
+                if is_bs[nt_id] {
+                    let b = &g_bs[(bs_idx[nt_id] as usize) * w_per_doc..];
                     for i in 0..clen {
                         let d = (cs + clist[i] as u32) as usize;
-                        if ((b[d >> 6] >> (d & 63)) & 1) == 0 { clist[w] = clist[i]; w += 1; }
+                        if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) == 0 { *clist.get_unchecked_mut(w) = clist[i]; w += 1; }
                     }
                 } else {
                     let (mut i, mut j) = (0usize, ns);
                     while i < clen && j < ne {
                         if clist[i] == g_u16[j] { i += 1; j += 1; }
-                        else if clist[i] < g_u16[j] { clist[w] = clist[i]; w += 1; i += 1; } else { j += 1; }
+                        else if clist[i] < g_u16[j] { *clist.get_unchecked_mut(w) = clist[i]; w += 1; i += 1; } else { j += 1; }
                     }
-                    while i < clen { clist[w] = clist[i]; w += 1; i += 1; }
+                    while i < clen { *clist.get_unchecked_mut(w) = clist[i]; w += 1; i += 1; }
                 }
                 clen = w;
             } else {
-                let nlen = if is_bs[nt] { 100000 } else { ne - ns };
-                if is_bs[nt] || clen + nlen > 1024 {
-                    get_c_bs(nt, &mut curr);
-                    for i in 0..clen { curr[(clist[i] as usize) >> 6] |= 1u64 << (clist[i] & 63); }
+                let nlen = if is_bs[nt_id] { 100000 } else { ne - ns };
+                if is_bs[nt_id] || clen + nlen > 1024 {
+                    get_c_bs(nt_id, curr);
+                    for i in 0..clen { *curr.get_unchecked_mut((clist[i] as usize) >> 6) |= 1u64 << (clist[i] & 63); }
                     in_bs = true;
                 } else {
                     let mut tmp = [0u16; 1024];
@@ -255,9 +278,9 @@ unsafe fn exec_bool(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is
                 if tc < 10 { top[tc] = d; tc += 1; }
             }
         } else {
-            if (cd & 63) != 0 { curr[cw - 1] &= (1u64 << (cd & 63)) - 1; }
+            if (cd & 63) != 0 { *curr.get_unchecked_mut(cw - 1) &= (1u64 << (cd & 63)) - 1; }
             for w in 0..cw {
-                let mut v = curr[w]; if v == 0 { continue; }
+                let mut v = *curr.get_unchecked(w); if v == 0 { continue; }
                 t_cnt += v.count_ones() as u64;
                 let base = cs + ((w as u32) << 6);
                 while v != 0 {
@@ -272,42 +295,44 @@ unsafe fn exec_bool(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn exec_phrase(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], is_bs: &[bool], bs_idx: &[u32], doc_s: &[u32; NUM_C], doc_e: &[u32; NUM_C], w_per_doc: usize, g_bs: &[u64], g_u16: &[u16], term_df: &[u32], rep_map: &[u32], doc_ts: &[u32], d_buf: &[u8], q_buf: &[u8], out: &mut Vec<u8>) {
+unsafe fn exec_phrase(q: &Query, c_off: &[u32], c_base: &[u32; NUM_C], is_bs: &[bool], bs_idx: &[u32], doc_s: &[u32; NUM_C], doc_e: &[u32; NUM_C], w_per_doc: usize, g_bs: &[u64], g_u16: &[u16], term_df: &[u32], rep_map: &[u32], doc_ts: &[u32], d_buf: &[u8], q_buf: &[u8], nt: usize, out: &mut Vec<u8>) {
     let (k, mut nd, mut dist) = (q.k as usize, 0usize, [0usize; 16]);
     for i in 0..k {
         let t = q.tids[i] as usize;
-        if t == u32::MAX as usize || term_df[t] == 0 { fmt_res(0, 0, &[0; 10], 0, out); return; }
+        if t == u32::MAX as usize || *term_df.get_unchecked(t) == 0 { fmt_res(0, 0, &[0; 10], 0, out); return; }
         if !dist[..nd].contains(&t) { dist[nd] = t; nd += 1; }
-        if i + 1 < k && t == q.tids[i + 1] as usize && t < rep_map.len() && rep_map[t] != u32::MAX {
-            let rt = rep_map[t] as usize;
-            if term_df[rt] == 0 { fmt_res(0, 0, &[0; 10], 0, out); return; }
+        if i + 1 < k && t == q.tids[i + 1] as usize && t < rep_map.len() && *rep_map.get_unchecked(t) != u32::MAX {
+            let rt = *rep_map.get_unchecked(t) as usize;
+            if *term_df.get_unchecked(rt) == 0 { fmt_res(0, 0, &[0; 10], 0, out); return; }
             if !dist[..nd].contains(&rt) { dist[nd] = rt; nd += 1; }
         }
     }
-    dist[..nd].sort_unstable_by_key(|&t| term_df[t]);
+    dist[..nd].sort_unstable_by_key(|&t| *term_df.get_unchecked(t));
     let mut pt = [TInfo::default(); 8];
-    for i in 0..k { pt[i] = TINFO[q.tids[i] as usize]; }
+    for i in 0..k { pt[i] = *TINFO.get_unchecked(q.tids[i] as usize); }
 
     let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-    let mut cand = [0u16; 21000];
+    let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+    let cand = cand_uninit.assume_init_mut();
 
     for c in 0..NUM_C {
         let (cs, cd) = (doc_s[c], doc_e[c] - doc_s[c]);
         if cd == 0 { continue; }
+        let c_base_off = c * nt;
         let (rare, mut clen) = (dist[0], 0usize);
         if !is_bs[rare] {
-            let s = if rare > 0 { c_off[rare - 1][c] } else { c_base[c] } as usize;
-            clen = (c_off[rare][c] as usize) - s;
+            let s = if rare > 0 { *c_off.get_unchecked(c_base_off + rare - 1) } else { c_base[c] } as usize;
+            clen = (*c_off.get_unchecked(c_base_off + rare) as usize) - s;
             if clen == 0 { continue; }
             cand[..clen].copy_from_slice(&g_u16[s..s + clen]);
         } else {
             let cw = ((cd + 63) >> 6) as usize;
             let src = &g_bs[(bs_idx[rare] as usize) * w_per_doc + ((cs >> 6) as usize)..];
             for w in 0..cw {
-                let mut v = src[w];
+                let mut v = *src.get_unchecked(w);
                 while v != 0 {
                     let id = (w << 6) + v.trailing_zeros() as usize;
-                    if id < cd as usize { cand[clen] = id as u16; clen += 1; }
+                    if id < cd as usize { *cand.get_unchecked_mut(clen) = id as u16; clen += 1; }
                     v &= v - 1;
                 }
             }
@@ -321,14 +346,14 @@ unsafe fn exec_phrase(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], 
                 let b = &g_bs[(bs_idx[ot] as usize) * w_per_doc..];
                 for i in 0..clen {
                     let d = (cs + cand[i] as u32) as usize;
-                    if ((b[d >> 6] >> (d & 63)) & 1) != 0 { cand[w] = cand[i]; w += 1; }
+                    if ((*b.get_unchecked(d >> 6) >> (d & 63)) & 1) != 0 { *cand.get_unchecked_mut(w) = cand[i]; w += 1; }
                 }
             } else {
-                let ns = if ot > 0 { c_off[ot - 1][c] } else { c_base[c] } as usize;
-                let ne = c_off[ot][c] as usize;
+                let ns = if ot > 0 { *c_off.get_unchecked(c_base_off + ot - 1) } else { c_base[c] } as usize;
+                let ne = *c_off.get_unchecked(c_base_off + ot) as usize;
                 let (mut i, mut j) = (0usize, ns);
                 while i < clen && j < ne {
-                    if cand[i] == g_u16[j] { cand[w] = cand[i]; w += 1; i += 1; j += 1; }
+                    if cand[i] == g_u16[j] { *cand.get_unchecked_mut(w) = cand[i]; w += 1; i += 1; j += 1; }
                     else if cand[i] < g_u16[j] { i += 1; } else { j += 1; }
                 }
             }
@@ -337,7 +362,7 @@ unsafe fn exec_phrase(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], 
 
         for ci in 0..clen {
             let d = cs + cand[ci] as u32;
-            let mut sp = doc_ts[d as usize] as usize;
+            let mut sp = *doc_ts.get_unchecked(d as usize) as usize;
             let mut matched = false;
             loop {
                 while *CMAP.get_unchecked(*d_buf.get_unchecked(sp) as usize) == 0 { sp += 1; }
@@ -368,6 +393,8 @@ unsafe fn exec_phrase(q: &Query, c_off: &[[u32; NUM_C]], c_base: &[u32; NUM_C], 
 
 fn main() {
     unsafe {
+        mallopt(-8, 2); // M_ARENA_MAX = 2
+        mallopt(-4, 0); // M_TRIM_THRESHOLD = 0
         CMAP[b'\n' as usize] = 1;
         for c in b'0'..=b'9' { CMAP[c as usize] = c; }
         for c in b'a'..=b'z' { CMAP[c as usize] = c; CMAP[(c - 32) as usize] = c; }
@@ -499,48 +526,52 @@ fn main() {
         let w_per_doc = ((total_docs + 63) >> 6) as usize;
         let mut tot_u16 = 0u32;
         let mut c_base = [0u32; NUM_C];
-        let mut c_off = vec![[0u32; NUM_C]; nt];
+        let mut c_off = sc;
 
         for c in 0..NUM_C {
             c_base[c] = tot_u16;
+            let c_off_slice = &mut c_off[c * nt..(c + 1) * nt];
             for i in 0..nt {
-                c_off[i][c] = tot_u16;
-                if !is_bs[i] { tot_u16 += sc[c * nt + i]; }
+                if !is_bs[i] { tot_u16 += c_off_slice[i]; }
+                c_off_slice[i] = tot_u16;
             }
         }
-        drop(sc); // Immediate deallocation before g_bs and g_u16
 
         let mut g_bs = vec![0u64; n_bs * w_per_doc];
         let mut g_u16 = vec![0u16; tot_u16 as usize];
-        let mut cur_co = c_off.clone();
 
         let g_bs_ptr = g_bs.as_mut_ptr() as usize;
         let g_u16_ptr = g_u16.as_mut_ptr() as usize;
-        let cur_co_ptr = cur_co.as_mut_ptr() as usize;
 
         std::thread::scope(|s| {
             for c in 0..NUM_C {
-                let (ib, bi, co_init, ds, de, cb, r_ref) = (&is_bs, &bs_idx, &c_off, &doc_s, &doc_e, &c_byte, &rep_map);
+                let (ib, bi, co_ref, ds, de, cb, r_ref) = (&is_bs, &bs_idx, &c_off, &doc_s, &doc_e, &c_byte, &rep_map);
                 s.spawn(move || {
                     let d0 = ds[c];
                     if d0 >= de[c] { return; }
                     let bs_ptr = g_bs_ptr as *mut u64;
                     let u16_ptr = g_u16_ptr as *mut u16;
-                    let cur_c = cur_co_ptr as *mut [u32; NUM_C];
+                    let c_base_off = c * nt;
                     let r_sz = r_ref.len();
                     let (mut p, pe) = (cb[c], cb[c + 1]);
 
-                    let emit = |tid: u32, d: u32, ld: u16| {
+                    // Initialize local write pointers for chunk c
+                    let mut cur_pos = vec![0u32; nt];
+                    for i in 0..nt {
+                        cur_pos[i] = if i > 0 { *co_ref.get_unchecked(c_base_off + i - 1) } else { c_base[c] };
+                    }
+
+                    let mut emit = |tid: u32, d: u32, ld: u16| {
                         let t = tid as usize;
                         if *ib.get_unchecked(t) {
                             let off = (*bi.get_unchecked(t) as usize) * w_per_doc + ((d >> 6) as usize);
                             *bs_ptr.add(off) |= 1u64 << (d & 63);
                         } else {
-                            let cur = (*cur_c.add(t))[c];
-                            let start = co_init[t][c];
+                            let cur = *cur_pos.get_unchecked(t);
+                            let start = if t > 0 { *co_ref.get_unchecked(c_base_off + t - 1) } else { c_base[c] };
                             if cur == start || *u16_ptr.add((cur - 1) as usize) != ld {
                                 *u16_ptr.add(cur as usize) = ld;
-                                (*cur_c.add(t))[c] = cur + 1;
+                                *cur_pos.get_unchecked_mut(t) = cur + 1;
                             }
                         }
                     };
@@ -561,9 +592,6 @@ fn main() {
             }
         });
 
-        // Set c_off to the end positions
-        c_off = cur_co;
-
         let n_q = queries.len();
         let chunk_q = (n_q + NUM_C - 1) / NUM_C;
         let mut out_bufs = vec![Vec::<u8>::with_capacity(chunk_q * 48); NUM_C];
@@ -577,14 +605,22 @@ fn main() {
                 s.spawn(move || {
                     for q in q_slice {
                         if q.kind == 0 {
-                            exec_bool(q, co, cb, ib, bi, ds, de, w_per_doc, bs, u16s, ob);
+                            exec_bool(q, co, cb, ib, bi, ds, de, w_per_doc, bs, u16s, nt, ob);
                         } else {
-                            exec_phrase(q, co, cb, ib, bi, ds, de, w_per_doc, bs, u16s, tdf, rm, dts, d_buf, q_buf, ob);
+                            exec_phrase(q, co, cb, ib, bi, ds, de, w_per_doc, bs, u16s, tdf, rm, dts, d_buf, q_buf, nt, ob);
                         }
                     }
                 });
             }
         });
+
+        drop(g_bs);
+        drop(g_u16);
+        drop(c_off);
+        drop(queries);
+        drop(doc_ts);
+        drop(term_df);
+        drop(rep_map);
 
         munmap(d_buf.as_ptr() as *mut u8, f_sz);
         munmap(q_buf.as_ptr() as *mut u8, q_buf.len());
