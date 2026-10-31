@@ -32,7 +32,7 @@ static inline void fmt_cents(char *&p, int64_t c) {
 
 static inline int64_t parse_u(const char *&p) {
   int64_t x = 0;
-  while (*p != ',') x = x * 10 + (*p++ - '0');
+  while (*p != ',') x = (x << 3) + (x << 1) + (*p++ - '0');
   return ++p, x;
 }
 
@@ -51,10 +51,10 @@ static inline uint64_t hash_bytes(const char *s, uint32_t len) {
 }
 
 static inline const char *find_char_fast(const char *p, const char *end, char c) {
-  if (p + 16 <= end) {
-    __m128i target = _mm_set1_epi8(c);
-    __m128i chunk = _mm_loadu_si128((const __m128i *)p);
-    int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
+  if (p + 32 <= end) {
+    __m256i target = _mm256_set1_epi8(c);
+    __m256i chunk = _mm256_loadu_si256((const __m256i *)p);
+    int mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, target));
     if (mask) return p + __builtin_ctz(mask);
   }
   return (const char *)memchr(p, c, end - p);
@@ -80,8 +80,11 @@ int main(int argc, char **argv) {
   size_t rsz = rst.st_size, sz = mst.st_size;
   const char *rb = rsz ? (const char *)mmap(0, rsz, PROT_READ, MAP_SHARED, rfd, 0) : nullptr;
   if (rsz && rb == MAP_FAILED) rb = (const char *)mmap(0, rsz, PROT_READ, MAP_PRIVATE, rfd, 0);
+  if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_WILLNEED | MADV_SEQUENTIAL);
+
   const char *base = sz ? (const char *)mmap(0, sz, PROT_READ, MAP_SHARED, mfd, 0) : nullptr;
   if (sz && base == MAP_FAILED) base = (const char *)mmap(0, sz, PROT_READ, MAP_PRIVATE, mfd, 0);
+  if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
 
   memset(reg_lut, 0xFF, sizeof(reg_lut));
   if (rsz) {
@@ -125,7 +128,7 @@ int main(int argc, char **argv) {
     int tid = omp_get_thread_num();
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[512];
-    uint64_t tl_cache[2048] = {0};
+    alignas(64) uint64_t tl_cache[2048][2] = {0};
 
     while (p < end) {
       if ((uint8_t)*p == 0xEF) p += 3;
@@ -174,8 +177,9 @@ int main(int argc, char **argv) {
 
       uint32_t tl_idx = (uint32_t)nh & 2047;
       uint64_t tl_sig = (nh & ~0xFFULL) | cid;
-      if (tl_cache[tl_idx] != tl_sig) {
-        tl_cache[tl_idx] = tl_sig;
+      if (tl_cache[tl_idx][0] != tl_sig && tl_cache[tl_idx][1] != tl_sig) {
+        tl_cache[tl_idx][1] = tl_cache[tl_idx][0];
+        tl_cache[tl_idx][0] = tl_sig;
         for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
           uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
           if (!k) {
