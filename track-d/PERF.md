@@ -18,7 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | In-place head prefix sums, zero-copy transmute (-28MB allocations), and streamlined memory layout | run-ccd565870711 | 0.370 | 227.5 | 55.16 |
 | 12 | Streaming pread dual CSR, 8B DistPair with 64-bit fallback & 12-thread cache prefetching | run-0c3b229cac58 | 0.414 | 370.5 | 50.81 |
 | 13 | Zero-copy mmap dual CSR, 8B DistPair (-84MB), 6 P-core cap & compact 64-bit fallback | run-854b13a92e5a | 0.518 | 142.4 | 53.02 |
-| 14 | Gated 64-bit fallback on touched_overflow & eliminated software prefetching | pending | pending | ~142.4 | pending |
+| 14 | Gated 64-bit fallback on touched_overflow & eliminated software prefetching | run-7e3369dda6da | 0.398 | 142.3 | 56.00 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
