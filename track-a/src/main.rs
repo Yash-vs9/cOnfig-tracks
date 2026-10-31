@@ -7,7 +7,10 @@ use std::ptr::copy_nonoverlapping as copy;
 use std::slice::{from_raw_parts as slc, from_raw_parts_mut as slc_mut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thread::Builder};
-extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; }
+extern "C" {
+    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(a: *mut u8, l: usize, b: i32) -> i32;
+}
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
@@ -70,7 +73,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let eid = intern(1, ep, el as u8, h);
+        let idx = ((h >> 16) as usize) & 32767;
+        let kv = (*s).k[idx].load(Relaxed);
+        let eid = if (kv ^ h) < 65536 {
+            (kv & 0xFFFF) as usize
+        } else {
+            intern(1, ep, el as u8, h)
+        };
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let lp = st_p.add(4);
@@ -175,6 +184,7 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
+            madvise(base as _, sz, 2);
             let bar = Barrier::new(12);
             let (outf, bar) = (&outf, &bar);
             std::thread::scope(|sc| {
