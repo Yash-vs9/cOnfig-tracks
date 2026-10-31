@@ -21,11 +21,16 @@ static uint16_t c_to_dense[17577];
 static char dense_to_code[256][4], out_buf[65536];
 static Agg G[256], T[12][256];
 static size_t cs[13], qc[12], iq[12];
-static uint64_t mbox[12][12][32000];
-static uint32_t mbox_cnt[12][12], priv_dn[12][256];
 
+constexpr uint32_t MBOX_CAP = 40000;
+static uint64_t mbox[12][12][MBOX_CAP];
+static uint32_t mbox_cnt[12][12];
+
+constexpr uint32_t TH_CAP = 65536;
+constexpr uint32_t TH_MASK = TH_CAP - 1;
 struct alignas(64) PrivSlot { uint64_t key, bits[4]; };
-static PrivSlot th_table[12][32768];
+static PrivSlot th_table[12][TH_CAP];
+static uint32_t priv_dn[12][256];
 
 static inline void fmt_cents(char *&p, int64_t c) {
   if (c < 0) *p++ = '-', c = -c;
@@ -92,29 +97,26 @@ int main(int argc, char **argv) {
   if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
 
   memset(reg_lut, 0xFF, sizeof(reg_lut));
-  uint8_t nc = 0;
   if (rsz) {
-    static uint32_t regs[250000];
-    static uint16_t codes[250000];
-    uint32_t n_regs = 0;
-    const char *p = (const char *)memchr(rb, '\n', rsz) + 1, *rend = rb + rsz;
-    while (p < rend) {
-      uint32_t reg = 0;
-      while (*p != ',') reg = reg * 10 + (*p++ - '0');
-      ++p;
-      uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
-      c_to_dense[code] = 1, regs[n_regs] = reg, codes[n_regs++] = code;
-      p += 3 + 1 + (*p == '\r');
+    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
+      while (*p++ != ',') {}
+      c_to_dense[(p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1] = 1;
+      while (p < rb + rsz && *p++ != '\n') {}
     }
-    for (uint16_t c = 1; c <= 17576; ++c)
-      if (c_to_dense[c]) {
-        uint16_t v = c - 1;
-        dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
-        c_to_dense[c] = nc++;
-      }
-    for (uint32_t i = 0; i < n_regs; ++i) {
-      uint32_t r = regs[i];
-      if (r < 1000000) reg_lut[r] = (uint8_t)c_to_dense[codes[i]];
+  }
+  uint8_t nc = 0;
+  for (uint16_t c = 1; c <= 17576; ++c)
+    if (c_to_dense[c]) {
+      uint16_t v = c - 1;
+      dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
+      c_to_dense[c] = nc++;
+    }
+  if (rsz) {
+    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
+      uint32_t reg = (uint32_t)parse_u(p);
+      uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
+      if (reg < 1000000) reg_lut[reg] = (uint8_t)c_to_dense[code];
+      while (p < rb + rsz && *p++ != '\n') {}
     }
   }
   uint8_t unm_cid = nc;
@@ -228,11 +230,15 @@ int main(int argc, char **argv) {
       uint8_t r_cid = rid < 1000000 ? reg_lut[rid] : 0xFF, cid = r_cid == 0xFF ? unm_cid : r_cid;
       bool neg = (*p == '-') && ++p;
       while (*p != '.') cents = cents * 10 + (*p++ - '0');
-      cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3 + 1 + (*p == '\r');
+      cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
+      p += 1 + (*p == '\r');
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
+
       uint32_t target_th = (uint32_t)(((nh >> 32) * 12ULL) >> 32);
-      mbox[tid][target_th][local_cnt[target_th]++] = (nh & ~0xFFULL) | cid;
+      if (__builtin_expect(local_cnt[target_th] < MBOX_CAP, 1)) {
+        mbox[tid][target_th][local_cnt[target_th]++] = (nh & ~0xFFULL) | cid;
+      }
     }
     for (int t = 0; t < 12; ++t) mbox_cnt[tid][t] = local_cnt[t];
   }
@@ -241,7 +247,6 @@ int main(int argc, char **argv) {
   {
     int tid = omp_get_thread_num();
     PrivSlot *table = th_table[tid];
-    constexpr uint32_t MASK = 32767;
 
     for (int src = 0; src < 12; ++src) {
       uint64_t *entries = mbox[src][tid];
@@ -251,7 +256,7 @@ int main(int argc, char **argv) {
         uint8_t cid = (uint8_t)(e & 0xFF);
         uint64_t nh = e & ~0xFFULL;
 
-        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & MASK;; slot = (slot + 1) & MASK) {
+        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & TH_MASK;; slot = (slot + 1) & TH_MASK) {
           PrivSlot &s = table[slot];
           if (!s.key) {
             s.key = nh, s.bits[cid >> 6] |= (1ULL << (cid & 63)), priv_dn[tid][cid]++;
@@ -267,11 +272,12 @@ int main(int argc, char **argv) {
     }
   }
 
-  for (int cid = 0; cid <= unm_cid; ++cid)
+  for (int cid = 0; cid <= unm_cid; ++cid) {
     for (int tid = 0; tid < 12; ++tid) {
       G[cid].dn += priv_dn[tid][cid];
       if (T[tid][cid].cnt) G[cid].add(T[tid][cid]);
     }
+  }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) { ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' '; };
