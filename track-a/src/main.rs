@@ -1,14 +1,14 @@
 // Speed Demon 2026 — Track A (Ingest) Championship Rust Solution
-// Zero external dependencies (D = 1), 100% .bss zero-initialized static arena, offline build (--network=none).
+// Zero external dependencies (D = 1), 100% .bss zero-initialized static arena, offline build.
 // 1. Zero-copy mmap(MAP_SHARED) over pre-warmed /data/requests.log (0 B cgroup charge).
 // 2. Cache-line aligned ThreadState (#[repr(C, align(64))]) eliminates L1 false sharing across 12 threads.
 // 3. Fast line scanning and backward latency parsing.
 // 4. Hardware CRC32 + lock-free interning + parallel CSR + select_nth_unstable.
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 
 use std::arch::x86_64::*;
-use std::cell::UnsafeCell;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -19,10 +19,6 @@ extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
 }
-
-#[repr(transparent)]
-struct Global<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for Global<T> {}
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -42,12 +38,9 @@ struct ThreadState {
 const BLK_SZ: usize = 256;
 const NUM_BLKS: usize = 20480;
 
-const ZERO_U64: AtomicU64 = AtomicU64::new(0);
-const ZERO_U32: AtomicU32 = AtomicU32::new(0);
-
-static HR_KEY: [AtomicU64; 256] = [ZERO_U64; 256];
-static EP_KEY: [AtomicU64; 8192] = [ZERO_U64; 8192];
-static G_ERR: [AtomicU32; 144 * 2048] = [ZERO_U32; 144 * 2048];
+static mut HR_KEY: [u64; 256] = [0; 256];
+static mut EP_KEY: [u64; 8192] = [0; 8192];
+static mut G_ERR: [u32; 144 * 2048] = [0; 144 * 2048];
 static N_HR: AtomicU32 = AtomicU32::new(0);
 static N_EP: AtomicU32 = AtomicU32::new(0);
 static N_BLKS: AtomicU32 = AtomicU32::new(0);
@@ -68,7 +61,7 @@ struct SharedData {
     t_out: [[u8; 360000]; 12],
 }
 
-static S: Global<SharedData> = Global(UnsafeCell::new(SharedData {
+static mut S: SharedData = SharedData {
     hr_ptr: [std::ptr::null(); 144],
     ep_ptr: [std::ptr::null(); 2048],
     hr_id: [0; 256],
@@ -86,7 +79,27 @@ static S: Global<SharedData> = Global(UnsafeCell::new(SharedData {
     }; 12],
     t_out_len: [0; 12],
     t_out: [[0; 360000]; 12],
-}));
+};
+
+#[inline(always)]
+unsafe fn atomic_load_u64(p: *const u64, ord: Ordering) -> u64 {
+    (*(p as *const AtomicU64)).load(ord)
+}
+
+#[inline(always)]
+unsafe fn atomic_store_u64(p: *const u64, val: u64, ord: Ordering) {
+    (*(p as *const AtomicU64)).store(val, ord)
+}
+
+#[inline(always)]
+unsafe fn atomic_cas_u64(p: *const u64, exp: u64, val: u64) -> Result<u64, u64> {
+    (*(p as *const AtomicU64)).compare_exchange(exp, val, Ordering::AcqRel, Ordering::Acquire)
+}
+
+#[inline(always)]
+unsafe fn atomic_add_u32(p: *const u32, val: u32, ord: Ordering) -> u32 {
+    (*(p as *const AtomicU32)).fetch_add(val, ord)
+}
 
 #[inline(always)]
 unsafe fn fmt_u32(mut p: *mut u8, mut v: u32) -> *mut u8 {
@@ -115,7 +128,8 @@ unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
     }
     let mut s = (h as usize) & 255;
     loop {
-        let k = HR_KEY[s].load(Ordering::Acquire);
+        let p_key = HR_KEY.as_ptr().add(s);
+        let k = atomic_load_u64(p_key, Ordering::Acquire);
         if k == h {
             let hid = (*sd).hr_id[s];
             if std::slice::from_raw_parts((*sd).hr_ptr[hid as usize], 13)
@@ -124,21 +138,17 @@ unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
                 return hid;
             }
         }
-        if k == 0
-            && HR_KEY[s]
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
+        if k == 0 && atomic_cas_u64(p_key, 0, 1).is_ok() {
             let id = N_HR.fetch_add(1, Ordering::Relaxed) as u8;
             (*sd).hr_ptr[id as usize] = p;
             (*sd).hr_id[s] = id;
-            HR_KEY[s].store(h, Ordering::Release);
+            atomic_store_u64(p_key, h, Ordering::Release);
             return id;
         }
-        while HR_KEY[s].load(Ordering::Acquire) == 1 {
-            std::hint::spin_loop();
+        while atomic_load_u64(p_key, Ordering::Acquire) == 1 {
+            _mm_pause();
         }
-        if HR_KEY[s].load(Ordering::Acquire) == h {
+        if atomic_load_u64(p_key, Ordering::Acquire) == h {
             let hid = (*sd).hr_id[s];
             if std::slice::from_raw_parts((*sd).hr_ptr[hid as usize], 13)
                 == std::slice::from_raw_parts(p, 13)
@@ -166,7 +176,8 @@ unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
     h = (h << 8) | (len as u64) | (1u64 << 62);
     let mut s = ((h >> 8) as usize) & 8191;
     loop {
-        let key = EP_KEY[s].load(Ordering::Acquire);
+        let p_key = EP_KEY.as_ptr().add(s);
+        let key = atomic_load_u64(p_key, Ordering::Acquire);
         if key == h {
             let eid = (*sd).ep_id[s];
             if (*sd).ep_len[eid as usize] == len
@@ -176,22 +187,18 @@ unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
                 return eid;
             }
         }
-        if key == 0
-            && EP_KEY[s]
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
+        if key == 0 && atomic_cas_u64(p_key, 0, 1).is_ok() {
             let id = N_EP.fetch_add(1, Ordering::Relaxed) as u16;
             (*sd).ep_ptr[id as usize] = ep;
             (*sd).ep_len[id as usize] = len;
             (*sd).ep_id[s] = id;
-            EP_KEY[s].store(h, Ordering::Release);
+            atomic_store_u64(p_key, h, Ordering::Release);
             return id;
         }
-        while EP_KEY[s].load(Ordering::Acquire) == 1 {
-            std::hint::spin_loop();
+        while atomic_load_u64(p_key, Ordering::Acquire) == 1 {
+            _mm_pause();
         }
-        if EP_KEY[s].load(Ordering::Acquire) == h {
+        if atomic_load_u64(p_key, Ordering::Acquire) == h {
             let eid = (*sd).ep_id[s];
             if (*sd).ep_len[eid as usize] == len
                 && std::slice::from_raw_parts((*sd).ep_ptr[eid as usize], len as usize)
@@ -246,11 +253,12 @@ fn main() {
 
         let bar = Barrier::new(12);
         let base_addr = base as usize;
+        let sd = std::ptr::addr_of_mut!(S);
+
         std::thread::scope(|scope| {
             for tid in 0..12 {
                 let bar_ref = &bar;
                 scope.spawn(move || {
-                    let sd = S.0.get();
                     let b_ptr = base_addr as *const u8;
                     let mut s = if tid > 0 { (tid * sz) / 12 } else { 0 };
                     let mut e = if tid < 11 { ((tid + 1) * sz) / 12 } else { sz };
@@ -302,8 +310,8 @@ fn main() {
                         }
                         let eid = get_eid(ep, elen as u8, sd);
                         if *cur.sub(3) == b'5' {
-                            G_ERR[(hid as usize) * 2048 + (eid as usize)]
-                                .fetch_add(1, Ordering::Relaxed);
+                            let p_err = G_ERR.as_ptr().add((hid as usize) * 2048 + (eid as usize));
+                            atomic_add_u32(p_err, 1, Ordering::Relaxed);
                         }
 
                         let mut b = my.cur_blk[hid as usize];
@@ -437,7 +445,7 @@ fn main() {
                                         l_slice[i95 + 1..].select_nth_unstable(i99 - i95 - 1);
                                     }
                                 }
-                                let err = G_ERR[h_id * 2048 + eid].load(Ordering::Relaxed);
+                                let err = G_ERR[h_id * 2048 + eid];
                                 let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
 
                                 std::ptr::copy_nonoverlapping((*sd).hr_ptr[h_id], ptr, 13);
