@@ -15,6 +15,7 @@ m[b'\n' as usize] = 1; let mut i = 0u8; loop { if i >= b'0' && i <= b'9'  { m[i 
 if i >= b'a' && i <= b'z' { m[i as usize] = i; m[(i - 32) as usize] = i; } if i == 255  { break; } i += 1; } m };
 const MASKS: [u64; 9] = [ 0, 0x00000000000000FF, 0x000000000000FFFF, 0x0000000000FFFFFF, 0x00000000FFFFFFFF,
 0x000000FFFFFFFFFF, 0x0000FFFFFFFFFFFF, 0x00FFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, ];
+#[derive(Clone, Copy, Default)] struct FastEntry { w0: u64, tid: u32, len: u32 }
 #[repr(align(4096))]
 struct AlignedVTab([Slot; H_SZ]); static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
 static mut TINFO: [TInfo; 81920] = [TInfo { w0: 0, w1: 0, off: 0, len: 0, df: 0 }; 81920];
@@ -61,15 +62,34 @@ let n = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
 _mm256_movemask_epi8(_mm256_or_si256(l, n)) as u32 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], rep_map: &[u32], mut fn_: F) {
+unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], rep_map: &[u32], fc: &mut [FastEntry; 2048], mut fn_: F) {
 let (base, n) = (d_buf.as_ptr(), d_buf.len()); let nlv = _mm256_set1_epi8(b'\n' as i8);
 let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX); let mut tail = [0u8; 16];
-let mut process_token = |w0: u64, w1: u64, len: usize, tail: &[u8]| { let h = mix64(w0, w1, len);
-let pb = ((h ^ (h >> 32)) as usize) & PF_MASK; if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 {
-p_tid = u32::MAX; pos += 1; return; } let tid = lookup_swar(w0, w1, tail, len, q_buf, h); if tid != u32::MAX {
-let t = tid as usize; fn_(t); if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
-let rt = *rep_map.get_unchecked(t); if rt != u32::MAX  { fn_(rt as usize); } } p_tid = tid; p_pos = pos;
-} else { p_tid = u32::MAX; } pos += 1; }; while *p + 32 <= n {
+let mut process_token = |w0: u64, w1: u64, len: usize, tail: &[u8]| {
+let tid = if len <= 8 {
+let fi = ((w0 ^ (w0 >> 17)) as usize) & 2047;
+let fe = *fc.get_unchecked(fi);
+if fe.w0 == w0 && fe.len == len as u32 { fe.tid }
+else {
+let h = mix64(w0, w1, len);
+let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
+let t = if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 { u32::MAX }
+else { lookup_swar(w0, w1, tail, len, q_buf, h) };
+*fc.get_unchecked_mut(fi) = FastEntry { w0, tid: t, len: len as u32 };
+t }
+} else {
+let h = mix64(w0, w1, len);
+let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
+if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 { u32::MAX }
+else { lookup_swar(w0, w1, tail, len, q_buf, h) }
+};
+if tid != u32::MAX {
+let t = tid as usize; fn_(t);
+if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
+let rt = *rep_map.get_unchecked(t); if rt != u32::MAX { fn_(rt as usize); } }
+p_tid = tid; p_pos = pos;
+} else { p_tid = u32::MAX; }
+pos += 1; }; while *p + 32 <= n {
 let c = _mm256_loadu_si256(base.add(*p) as *const __m256i); let mut mask_tok = tokmask(c);
 let mask_nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c, nlv)) as u32;
 let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 32 };
@@ -247,11 +267,11 @@ if matched  { record_doc(d, &mut t_cnt, &mut t_sum, &mut top, &mut tc); } } } fm
 unsafe fn worker_scan_fw( c: usize, _nt: usize, w_per_doc: usize, co_ptr: *mut u16, doc_ts_ptr: *mut u32,
 g_bs_ptr: *mut u64, bs_idx: *const u16, d_buf: &[u8], q_buf: &[u8], rep_map: &[u32], doc_s: &[u32; NUM_C],
 c_byte: &[usize; NUM_C + 1], fw_ptr: *mut u16, dp_ptr: *mut u32, ) { let mut seen = [0u64; 1280];
-let mut hl = [0u32; 2048]; let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
+let mut hl = [0u32; 2048]; let mut fc = [FastEntry { w0: 0, tid: u32::MAX, len: 0 }; 2048]; let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
 madvise(d_buf.as_ptr().add(p) as *mut u8, pe - p, 3); let mut fw_idx = 0usize; while p < pe {
 while *d_buf.get_unchecked(p) != b'\t'  { p += 1; } p += 1; *doc_ts_ptr.add(d as usize) = p as u32;
 *dp_ptr.add(ld as usize) = fw_idx as u32; let (mut nh, mut ov) = (0usize, false);
-scan_doc(d_buf, &mut p, q_buf, rep_map, |t| { let (w, b) = (t >> 6, 1u64 << (t & 63)); let sw = *seen.get_unchecked(w);
+scan_doc(d_buf, &mut p, q_buf, rep_map, &mut fc, |t| { let (w, b) = (t >> 6, 1u64 << (t & 63)); let sw = *seen.get_unchecked(w);
 if sw & b == 0 { *seen.get_unchecked_mut(w) = sw | b; if nh < 2048 { *hl.get_unchecked_mut(nh) = t as u32; nh += 1;
 } else { ov = true; } let bi = *bs_idx.add(t); if bi != u16::MAX {
 *g_bs_ptr.add((bi as usize) * w_per_doc + ((d as usize) >> 6)) |= 1u64 << (d & 63); } else { *co_ptr.add(t) += 1;
@@ -287,9 +307,9 @@ while pl > 0 && d_buf[pl - 1] != b'\n'  { pl -= 1; } let mut total_docs = 0u32;
 while pl < f_sz && d_buf[pl] >= b'0' && d_buf[pl] <= b'9' { total_docs = total_docs * 10 + (d_buf[pl] - b'0') as u32;
 pl += 1; } total_docs += 1; let nt = N_TERMS; let w_per_doc = ((total_docs + 63) >> 6) as usize;
 let mut bs_idx = vec![u16::MAX; nt]; let mut n_bs = 0usize; let sample_docs = total_docs.min(600);
-let mut sample_counts = vec![0u16; nt]; let mut sp = 0usize; let mut s_seen = [0u64; 1280]; let mut s_hl = [0u32; 2048];
+let mut sample_counts = vec![0u16; nt]; let mut sp = 0usize; let mut s_seen = [0u64; 1280]; let mut s_hl = [0u32; 2048]; let mut s_fc = [FastEntry { w0: 0, tid: u32::MAX, len: 0 }; 2048];
 for _ in 0..sample_docs { while sp < f_sz && d_buf[sp] != b'\t'  { sp += 1; } if sp >= f_sz  { break; } sp += 1;
-let (mut nh, mut ov) = (0usize, false); scan_doc(d_buf, &mut sp, q_buf, &rep_map, |t| {
+let (mut nh, mut ov) = (0usize, false); scan_doc(d_buf, &mut sp, q_buf, &rep_map, &mut s_fc, |t| {
 let (w, b) = (t >> 6, 1u64 << (t & 63)); let sw = *s_seen.get_unchecked(w); if sw & b == 0 {
 *s_seen.get_unchecked_mut(w) = sw | b;
 if nh < 2048 { *s_hl.get_unchecked_mut(nh) = t as u32; nh += 1; } else { ov = true; }
