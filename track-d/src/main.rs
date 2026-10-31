@@ -12,10 +12,10 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 131072;
+const H_SZ: usize = 65536;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 17;
-const H_MAX_LOAD: u32 = 85000;
+const H_SHIFT: u32 = 32 - 16;
+const H_MAX_LOAD: u32 = 58000;
 const BUF_SZ: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
@@ -210,6 +210,35 @@ unsafe fn parse_u32(p: &mut *const u8) -> u32 {
     v
 }
 
+fn stream_file<F: FnMut(&[u8])>(gf: &File, mut off: usize, finish: usize, mut on_chunk: F) {
+    let mut buf = vec![0u8; BUF_SZ + 64];
+    let mut left = 0usize;
+    while off < finish {
+        let to_read = (finish - off).min(BUF_SZ);
+        let got = gf
+            .read_at(&mut buf[left..left + to_read], off as u64)
+            .unwrap_or(0);
+        if got == 0 {
+            break;
+        }
+        off += got;
+        let total = left + got;
+        let mut vend = total;
+        if off < finish {
+            while vend > 0 && buf[vend - 1] != b'\n' {
+                vend -= 1;
+            }
+        } else if vend == total {
+            buf[total] = b'\n';
+        }
+        on_chunk(&buf[..vend]);
+        left = total - vend;
+        if left > 0 {
+            buf.copy_within(vend..total, 0);
+        }
+    }
+}
+
 #[cold]
 fn solve_query_64(
     s: usize,
@@ -220,7 +249,7 @@ fn solve_query_64(
     er: *const u32,
     oflow: &[(u32, u32)],
 ) -> i64 {
-    let (mut dist_f, mut dist_b) = (HashMap::with_capacity(2048), HashMap::with_capacity(2048));
+    let (mut dist_f, mut dist_b) = (HashMap::with_capacity(32768), HashMap::with_capacity(32768));
     let (mut q_f, mut q_b) = (BinaryHeap::new(), BinaryHeap::new());
     dist_f.insert(s as u32, 0u64);
     dist_b.insert(t as u32, 0u64);
@@ -345,47 +374,22 @@ fn main() {
             let (start, finish, hf, hr, gf_ref) =
                 (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
             scope.spawn(move || {
-                let mut buf = vec![0u8; BUF_SZ + 64];
-                let (mut off, mut left) = (start, 0usize);
-                while off < finish {
-                    let to_read = (finish - off).min(BUF_SZ);
-                    let got = gf_ref
-                        .read_at(&mut buf[left..left + to_read], off as u64)
-                        .unwrap_or(0);
-                    if got == 0 {
-                        break;
-                    }
-                    off += got;
-                    let total = left + got;
-                    let mut vend = total;
-                    if off < finish {
-                        while vend > 0 && buf[vend - 1] != b'\n' {
-                            vend -= 1;
+                stream_file(gf_ref, start, finish, |chunk| unsafe {
+                    let (mut cur, end_p) = (chunk.as_ptr(), chunk.as_ptr().add(chunk.len()));
+                    while cur < end_p {
+                        let u = parse_u32(&mut cur);
+                        cur = cur.add(1);
+                        let v = parse_u32(&mut cur);
+                        while *cur != b'\n' {
+                            cur = cur.add(1);
                         }
-                    } else if vend == total {
-                        buf[total] = b'\n';
-                    }
-                    unsafe {
-                        let (mut cur, end_p) = (buf.as_ptr(), buf.as_ptr().add(vend));
-                        while cur < end_p {
-                            let u = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let v = parse_u32(&mut cur);
-                            while *cur != b'\n' {
-                                cur = cur.add(1);
-                            }
-                            cur = cur.add(1);
-                            if u != v {
-                                hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
-                                hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
-                            }
+                        cur = cur.add(1);
+                        if u != v {
+                            hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
+                            hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    left = total - vend;
-                    if left > 0 {
-                        buf.copy_within(vend..total, 0);
-                    }
-                }
+                });
             });
         }
     });
@@ -416,61 +420,34 @@ fn main() {
                 (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
             handlers.push(scope.spawn(move || {
                 let mut local_oflow = Vec::new();
-                let mut buf = vec![0u8; BUF_SZ + 64];
-                let (mut off, mut left) = (start, 0usize);
                 let (ef_ptr, er_ptr) = (ef_addr as *mut u32, er_addr as *mut u32);
-                while off < finish {
-                    let to_read = (finish - off).min(BUF_SZ);
-                    let got = gf_ref
-                        .read_at(&mut buf[left..left + to_read], off as u64)
-                        .unwrap_or(0);
-                    if got == 0 {
-                        break;
-                    }
-                    off += got;
-                    let total = left + got;
-                    let mut vend = total;
-                    if off < finish {
-                        while vend > 0 && buf[vend - 1] != b'\n' {
-                            vend -= 1;
+                stream_file(gf_ref, start, finish, |chunk| unsafe {
+                    let (mut cur, end_p) = (chunk.as_ptr(), chunk.as_ptr().add(chunk.len()));
+                    while cur < end_p {
+                        let u = parse_u32(&mut cur);
+                        cur = cur.add(1);
+                        let v = parse_u32(&mut cur);
+                        cur = cur.add(1);
+                        let w = parse_u32(&mut cur);
+                        if *cur == b'\r' {
+                            cur = cur.add(1);
                         }
-                    } else if vend == total {
-                        buf[total] = b'\n';
-                    }
-                    unsafe {
-                        let (mut cur, end_p) = (buf.as_ptr(), buf.as_ptr().add(vend));
-                        while cur < end_p {
-                            let u = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let v = parse_u32(&mut cur);
-                            cur = cur.add(1);
-                            let w = parse_u32(&mut cur);
-                            if *cur == b'\r' {
-                                cur = cur.add(1);
-                            }
-                            cur = cur.add(1);
-                            if u != v {
-                                let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
-                                let ifwd =
-                                    hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed)
-                                        as usize;
-                                *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
-                                let irev =
-                                    hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed)
-                                        as usize;
-                                *er_ptr.add(irev) = (pw << 21) | (u & V_MASK);
-                                if pw == W_SENTINEL {
-                                    local_oflow.push((ifwd as u32, w));
-                                    local_oflow.push(((1u32 << 31) | (irev as u32), w));
-                                }
+                        cur = cur.add(1);
+                        if u != v {
+                            let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
+                            let ifwd = hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed)
+                                as usize;
+                            *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
+                            let irev = hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed)
+                                as usize;
+                            *er_ptr.add(irev) = (pw << 21) | (u & V_MASK);
+                            if pw == W_SENTINEL {
+                                local_oflow.push((ifwd as u32, w));
+                                local_oflow.push(((1u32 << 31) | (irev as u32), w));
                             }
                         }
                     }
-                    left = total - vend;
-                    if left > 0 {
-                        buf.copy_within(vend..total, 0);
-                    }
-                }
+                });
                 local_oflow
             }));
         }
@@ -533,7 +510,7 @@ fn main() {
     let answers_addr = answers.as_mut_ptr() as usize;
     let next_query = AtomicUsize::new(0);
 
-    let n_workers = 6.min(unique_queries.len());
+    let n_workers = nt.min(unique_queries.len());
     std::thread::scope(|scope| {
         for _ in 0..n_workers {
             let (nq, qref, hf, hr, ef, er, oflow) = (
