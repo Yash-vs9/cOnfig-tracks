@@ -27,21 +27,21 @@ fn mix64(w0: u64, w1: u64, len: usize) -> u64 { let h = if len <= 8 {
 (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64))).wrapping_mul(0xbf58476d1ce4e5b9) };
 h ^ (h >> 31) }
 #[inline(always)]
-unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h: u64) -> u32 {
+unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h: u64) -> (u32, usize) {
 let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
 let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24); loop { let s = VTAB.0.get_unchecked(idx);
-if s.h_tag == 0  { return u32::MAX; } if s.h_tag == h_tag && s.w0 == w0 { if len <= 8  { return s.tid; }
-let ti = TINFO.get_unchecked(s.tid as usize); if len <= 16 { if ti.w1 == w1 { return s.tid; }
-} else if ti.w1 == w1 && std::slice::from_raw_parts(q_buf.as_ptr().add(ti.off as usize + 16), len - 16) == &tail[..len - 16]  { return s.tid; } }
+if s.h_tag == 0  { return (u32::MAX, idx); } if s.h_tag == h_tag && s.w0 == w0 { if len <= 8  { return (s.tid, idx); }
+let ti = TINFO.get_unchecked(s.tid as usize); if len <= 16 { if ti.w1 == w1 { return (s.tid, idx); }
+} else if ti.w1 == w1 && std::slice::from_raw_parts(q_buf.as_ptr().add(ti.off as usize + 16), len - 16) == &tail[..len - 16]  { return (s.tid, idx); } }
 idx = (idx + 1) & H_MSK; } }
 unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 { let (mut w0, mut w1, len) = (0u64, 0u64, s.len());
 ptr::copy_nonoverlapping(s.as_ptr(), &mut w0 as *mut _ as *mut u8, len.min(8));
 if len > 8  { ptr::copy_nonoverlapping(s.as_ptr().add(8), &mut w1 as *mut _ as *mut u8, (len - 8).min(8)); }
 let h = mix64(w0, w1, len); let tail = if len > 16 { &s[16..] } else { &[] };
-let tid = lookup_swar(w0, w1, tail, len, q_buf, h); if tid != u32::MAX  { return tid; }
-let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
-let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24); while VTAB.0[idx].h_tag != 0  { idx = (idx + 1) & H_MSK; }
-let nt = N_TERMS as u32; N_TERMS += 1; VTAB.0[idx] = Slot { w0, h_tag, tid: nt };
+let (tid, empty_idx) = lookup_swar(w0, w1, tail, len, q_buf, h); if tid != u32::MAX  { return tid; }
+let h32 = ((h ^ (h >> 32)) as u32) | 1;
+let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24);
+let nt = N_TERMS as u32; N_TERMS += 1; VTAB.0[empty_idx] = Slot { w0, h_tag, tid: nt };
 TINFO[nt as usize] = TInfo { w0, w1, off, len: len as u16, df: 0 }; let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
 PF[pb >> 6] |= 1u64 << (pb & 63); nt }
 #[inline(always)]
@@ -72,12 +72,12 @@ if set[0].w0 == w0 && set[0].len == len as u16 { (set[0].tid, set[0].bi) }
 else if set[1].w0 == w0 && set[1].len == len as u16 { let hit = set[1]; set[1] = set[0]; set[0] = hit; (hit.tid, hit.bi) }
 else { let h = mix64(w0, w1, len); let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
 let t = if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 { u32::MAX }
-else { lookup_swar(w0, w1, tail, len, q_buf, h) };
+else { lookup_swar(w0, w1, tail, len, q_buf, h).0 };
 let b = if t != u32::MAX && !bs_idx.is_null() { *bs_idx.add(t as usize) } else { u16::MAX };
 set[1] = set[0]; set[0] = FastEntry { w0, tid: t, bi: b, len: len as u16 }; (t, b) }
 } else { let h = mix64(w0, w1, len); let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
 let t = if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 { u32::MAX }
-else { lookup_swar(w0, w1, tail, len, q_buf, h) };
+else { lookup_swar(w0, w1, tail, len, q_buf, h).0 };
 let b = if t != u32::MAX && !bs_idx.is_null() { *bs_idx.add(t as usize) } else { u16::MAX }; (t, b) };
 if tid != u32::MAX { let t = tid as usize; fn_(t, bi);
 if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
@@ -290,11 +290,12 @@ let (mut qp, qe) = (0usize, q_buf.len()); while qp < qe { while qp < qe && q_buf
 if qp >= qe  { break; } let ib = q_buf[qp..].starts_with(b"BOOL "); qp += if ib { 5 } else { 8 }; let mut le = qp;
 while le < qe && q_buf[le] != if ib { b'\n' } else { b'"' } { le += 1; } let t_idx = q_terms.len() as u32;
 let mut q = Query { ib: (!ib) as u8, k: 0, ops: 0, t_idx };
-for tok in q_buf[qp..le].split(|&b| b == b' ').filter(|s| !s.is_empty()) {
-let tk = (tok.as_ptr() as usize) - (q_buf.as_ptr() as usize); match (ib, tok) {
-(true, b"AND") => q.ops |= 1 << ((q.k - 1) * 2), (true, b"OR") => q.ops |= 2 << ((q.k - 1) * 2),
-(true, b"NOT") => q.ops |= 3 << ((q.k - 1) * 2), _ => { let tid = insert_term(tok, tk as u32, q_buf); q_terms.push(tid);
-q.k += 1; } } } queries.push(q); qp = le; while qp < qe && q_buf[qp] != b'\n'  { qp += 1; } qp += 1; }
+let mut tp = qp; while tp < le { while tp < le && q_buf[tp] == b' '  { tp += 1; } if tp >= le  { break; }
+let ts = tp; while tp < le && q_buf[tp] != b' '  { tp += 1; } let tok = &q_buf[ts..tp];
+match (ib, tok) { (true, b"AND") => q.ops |= 1 << ((q.k - 1) * 2), (true, b"OR") => q.ops |= 2 << ((q.k - 1) * 2),
+(true, b"NOT") => q.ops |= 3 << ((q.k - 1) * 2), _ => {
+let tid = insert_term(tok, ts as u32, q_buf); q_terms.push(tid); q.k += 1; } } } queries.push(q); qp = le;
+while qp < qe && q_buf[qp] != b'\n'  { qp += 1; } qp += 1; }
 queries.shrink_to_fit(); q_terms.shrink_to_fit(); let mut rep_map = vec![u32::MAX; N_TERMS]; for q in &queries {
 if q.ib == 1 { let q_ts = &q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize]; for w in q_ts.windows(2) {
 if w[0] == w[1] && rep_map[w[0] as usize] == u32::MAX { let (t, rt) = (w[0] as usize, N_TERMS as u32); N_TERMS += 1;
