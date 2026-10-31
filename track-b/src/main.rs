@@ -19,11 +19,13 @@ extern "C" {
 
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const BLOOM_SZ: usize = 16384;
+// 4096 * 8 = 32 KB -> Fits completely in L1 Data Cache!
+const BLOOM_SZ: usize = 4096;
 const BLOOM_MSK: usize = BLOOM_SZ - 1;
 const NUM_C: usize = 12;
 const BS_TH: u32 = 15625;
-const MAX_W: usize = 352; // Multiple of 4 for AVX2 256-bit loads
+const MAX_W: usize = 352;
+const Q_BATCH: usize = 64;
 
 #[derive(Clone, Copy, Default)]
 struct Slot(u32, u32);
@@ -74,7 +76,8 @@ fn mix64(w0: u64, w1: u64, len: usize) -> u64 {
     h ^ (h >> 31)
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
 unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h: u64) -> u32 {
     let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
     loop {
@@ -105,6 +108,7 @@ unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h
     }
 }
 
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
     let (mut w0, mut w1, len) = (0u64, 0u64, s.len());
     ptr::copy_nonoverlapping(s.as_ptr(), &mut w0 as *mut _ as *mut u8, len.min(8));
@@ -129,13 +133,13 @@ unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
     N_TERMS += 1;
     VTAB.0[idx] = Slot(h32, nt);
     TINFO[nt as usize] = TInfo(w0, off, len as u16, 0);
-    BLOOM.0[((h >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h & 63);
-    let h2 = h.rotate_left(27);
-    BLOOM.0[((h2 >> 32) as usize) & BLOOM_MSK] |= 1u64 << (h2 & 63);
+    let b_idx = ((h >> 32) as usize) & BLOOM_MSK;
+    BLOOM.0[b_idx] |= (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
     nt
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
     let mut w0 = 0u64;
     let mut len = 0usize;
@@ -186,6 +190,131 @@ unsafe fn scan_doc<F: FnMut(usize)>(
     mut fn_: F,
 ) {
     let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
+    let d_ptr = d_buf.as_ptr();
+    let d_len = d_buf.len();
+
+    let v_20 = _mm256_set1_epi8(0x20);
+    let v_a = _mm256_set1_epi8((b'a' - 1) as i8);
+    let v_z = _mm256_set1_epi8((b'z' + 1) as i8);
+    let v_0 = _mm256_set1_epi8((b'0' - 1) as i8);
+    let v_9 = _mm256_set1_epi8((b'9' + 1) as i8);
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+
+    let mut lbuf = [0u8; 48];
+
+    'chunk_loop: while *p + 32 <= d_len {
+        let raw = _mm256_loadu_si256(d_ptr.add(*p) as *const __m256i);
+        let nl_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(raw, v_nl)) as u32;
+        let lo = _mm256_or_si256(raw, v_20);
+        let is_alpha = _mm256_and_si256(
+            _mm256_cmpgt_epi8(lo, v_a),
+            _mm256_cmpgt_epi8(v_z, lo),
+        );
+        let is_num = _mm256_and_si256(
+            _mm256_cmpgt_epi8(raw, v_0),
+            _mm256_cmpgt_epi8(v_9, raw),
+        );
+        let tok_vec = _mm256_or_si256(is_alpha, is_num);
+        let mut mask = _mm256_movemask_epi8(tok_vec) as u32;
+
+        let has_nl = nl_mask != 0;
+        let limit = if has_nl { nl_mask.trailing_zeros() } else { 32 };
+        if has_nl {
+            mask &= ((1u64 << limit) - 1) as u32;
+        }
+
+        _mm256_storeu_si256(lbuf.as_mut_ptr() as *mut __m256i, lo);
+
+        while mask != 0 {
+            let s_bit = mask.trailing_zeros();
+            let shifted = mask >> s_bit;
+            let t_len = shifted.trailing_ones();
+
+            if s_bit + t_len == 32 && !has_nl {
+                *p += s_bit as usize;
+                let mut tail = [0u8; 16];
+                let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
+                let h = mix64(w0, w1, len);
+                let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
+                let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
+                let tid = if (b & m_bits) == m_bits {
+                    lookup_swar(w0, w1, &tail, len, q_buf, h)
+                } else {
+                    u32::MAX
+                };
+                if tid != u32::MAX {
+                    let t = tid as usize;
+                    fn_(t);
+                    if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
+                        let rt = *rep_map.get_unchecked(t);
+                        if rt != u32::MAX {
+                            fn_(rt as usize);
+                        }
+                    }
+                    p_tid = tid;
+                    p_pos = pos;
+                } else {
+                    p_tid = u32::MAX;
+                }
+                pos += 1;
+                continue 'chunk_loop;
+            }
+
+            let len = t_len as usize;
+            let lp = lbuf.as_ptr().add(s_bit as usize);
+            let (w0, w1, tail) = if len <= 8 {
+                let raw_w0 = (lp as *const u64).read_unaligned();
+                (_bzhi_u64(raw_w0, (len * 8) as u32), 0u64, [0u8; 16])
+            } else if len <= 16 {
+                let raw_w0 = (lp as *const u64).read_unaligned();
+                let raw_w1 = (lp.add(8) as *const u64).read_unaligned();
+                (raw_w0, _bzhi_u64(raw_w1, ((len - 8) * 8) as u32), [0u8; 16])
+            } else {
+                let raw_w0 = (lp as *const u64).read_unaligned();
+                let raw_w1 = (lp.add(8) as *const u64).read_unaligned();
+                let mut t_arr = [0u8; 16];
+                ptr::copy_nonoverlapping(lp.add(16), t_arr.as_mut_ptr(), len - 16);
+                (raw_w0, raw_w1, t_arr)
+            };
+
+            let h = mix64(w0, w1, len);
+            let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
+            let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
+            let tid = if (b & m_bits) == m_bits {
+                lookup_swar(w0, w1, &tail, len, q_buf, h)
+            } else {
+                u32::MAX
+            };
+            if tid != u32::MAX {
+                let t = tid as usize;
+                fn_(t);
+                if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
+                    let rt = *rep_map.get_unchecked(t);
+                    if rt != u32::MAX {
+                        fn_(rt as usize);
+                    }
+                }
+                p_tid = tid;
+                p_pos = pos;
+            } else {
+                p_tid = u32::MAX;
+            }
+            pos += 1;
+
+            let clear_shift = s_bit + t_len;
+            if clear_shift >= 32 {
+                break;
+            }
+            mask &= !((1u32 << clear_shift) - 1);
+        }
+
+        if has_nl {
+            *p += (limit as usize) + 1;
+            return;
+        }
+        *p += 32;
+    }
+
     loop {
         while *CMAP.get_unchecked(*d_buf.get_unchecked(*p) as usize) == 0 {
             *p += 1;
@@ -197,10 +326,9 @@ unsafe fn scan_doc<F: FnMut(usize)>(
         let mut tail = [0u8; 16];
         let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
         let h = mix64(w0, w1, len);
-        let h2 = h.rotate_left(27);
-        let b1 = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
-        let b2 = *BLOOM.0.get_unchecked(((h2 >> 32) as usize) & BLOOM_MSK);
-        let tid = if ((b1 >> (h & 63)) & (b2 >> (h2 & 63)) & 1) != 0 {
+        let b = *BLOOM.0.get_unchecked(((h >> 32) as usize) & BLOOM_MSK);
+        let m_bits = (1u64 << (h & 63)) | (1u64 << ((h >> 17) & 63));
+        let tid = if (b & m_bits) == m_bits {
             lookup_swar(w0, w1, &tail, len, q_buf, h)
         } else {
             u32::MAX
@@ -257,10 +385,8 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    // MAP_SHARED (1) | MAP_POPULATE (0x8000) eliminates soft page fault traps during scan
-    let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     close(fd);
-    madvise(p, len, 2); // MADV_SEQUENTIAL = 2
     std::slice::from_raw_parts(p, len)
 }
 
@@ -516,7 +642,6 @@ impl<'a> Engine<'a> {
             }
         };
 
-        // Precompute AVX2 broadcast vectors for first character of pt[0] (lower and upper)
         let first_ch = (pt[0].0 & 0xFF) as u8;
         let first_up = if first_ch >= b'a' && first_ch <= b'z' {
             first_ch - 32
@@ -602,7 +727,6 @@ impl<'a> Engine<'a> {
                 let mut sp = *self.doc_ts.get_unchecked(d as usize) as usize;
                 let mut matched = false;
 
-                // Fast AVX2 scan for first character of pt[0] or newline
                 'doc_scan: loop {
                     if sp + 32 <= d_len {
                         let chunk = _mm256_loadu_si256(d_ptr.add(sp) as *const __m256i);
@@ -630,7 +754,6 @@ impl<'a> Engine<'a> {
                             let bit = valid_ch.trailing_zeros() as usize;
                             valid_ch &= valid_ch - 1;
                             let cand_p = sp + bit;
-                            // Must be start of a token (preceded by non-token char or tab)
                             if *CMAP.get_unchecked(*d_ptr.add(cand_p - 1) as usize) <= 1 {
                                 let mut tp = cand_p;
                                 let mut tail = [0u8; 16];
@@ -664,7 +787,6 @@ impl<'a> Engine<'a> {
                         }
                         sp += 32;
                     } else {
-                        // Tail fallback near EOF
                         while *CMAP.get_unchecked(*self.d_buf.get_unchecked(sp) as usize) == 0 {
                             sp += 1;
                         }
@@ -933,12 +1055,12 @@ unsafe fn run_all() {
     let bs_idx_ptr = bs_idx.as_mut_ptr() as usize;
     let c_base_ptr = c_base.as_mut_ptr() as usize;
 
-    const NUM_Q: usize = 12;
-    let chunk_q = (queries.len() + NUM_Q - 1) / NUM_Q;
-    let mut out_bufs = vec![Vec::<u8>::with_capacity(chunk_q * 30); NUM_Q];
+    // Work-stealing batches of Q_BATCH queries to eliminate tail latency imbalance
+    let num_batches = (queries.len() + Q_BATCH - 1) / Q_BATCH;
+    let mut out_bufs = vec![Vec::<u8>::with_capacity(Q_BATCH * 32); num_batches];
     let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
+    let next_batch = AtomicUsize::new(0);
 
-    // Single persistent thread scope with lock-free atomic barrier
     let phase = AtomicUsize::new(0);
     let ready = AtomicUsize::new(0);
 
@@ -956,11 +1078,11 @@ unsafe fn run_all() {
             let g_u16_p = &g_u16_ptr;
             let g_bs_l = &g_bs_len;
             let g_u16_l = &g_u16_len;
+            let nb_ref = &next_batch;
 
             std::thread::Builder::new()
                 .stack_size(262144)
                 .spawn_scoped(s, move || {
-                    // Phase 1: Count document frequencies
                     pass1_worker(
                         tid,
                         nt,
@@ -977,7 +1099,6 @@ unsafe fn run_all() {
                         std::hint::spin_loop();
                     }
 
-                    // Phase 2: Populate inverted index & bitsets
                     let bi_slice = std::slice::from_raw_parts(bs_idx_ptr as *const u16, nt);
                     pass2_worker(
                         tid,
@@ -999,7 +1120,6 @@ unsafe fn run_all() {
                         std::hint::spin_loop();
                     }
 
-                    // Phase 3: Execute queries
                     let c_off_slice = std::slice::from_raw_parts(sc_ptr as *const u32, NUM_C * nt);
                     let g_bs_slice = std::slice::from_raw_parts(
                         g_bs_p.load(Ordering::Relaxed) as *const u64,
@@ -1030,14 +1150,20 @@ unsafe fn run_all() {
                         nt,
                     };
 
-                    let q_start = (tid * chunk_q).min(queries_ref.len());
-                    let q_end = ((tid + 1) * chunk_q).min(queries_ref.len());
-                    let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(tid);
-                    for q in &queries_ref[q_start..q_end] {
-                        if q.ib == 0 {
-                            eng.exec_bool(q, ob);
-                        } else {
-                            eng.exec_phrase(q, ob);
+                    loop {
+                        let b_idx = nb_ref.fetch_add(1, Ordering::Relaxed);
+                        if b_idx >= num_batches {
+                            break;
+                        }
+                        let q_start = b_idx * Q_BATCH;
+                        let q_end = (q_start + Q_BATCH).min(queries_ref.len());
+                        let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b_idx);
+                        for q in &queries_ref[q_start..q_end] {
+                            if q.ib == 0 {
+                                eng.exec_bool(q, ob);
+                            } else {
+                                eng.exec_phrase(q, ob);
+                            }
                         }
                     }
                 })
@@ -1060,7 +1186,6 @@ unsafe fn run_all() {
             std::hint::spin_loop();
         }
 
-        // Serial prefix-sum between Phase 1 and Phase 2
         let mut n_bs = 0usize;
         for i in 0..nt {
             let mut df = 0u32;
@@ -1130,7 +1255,7 @@ unsafe fn run_all() {
 
         phase.store(2, Ordering::Release);
 
-        // Main thread (tid = 0): Phase 3
+        // Main thread (tid = 0): Phase 3 work-stealing
         let eng = Engine {
             c_off: &sc,
             c_base: &c_base,
@@ -1147,13 +1272,20 @@ unsafe fn run_all() {
             q_terms: &q_terms,
             nt,
         };
-        let q_end = chunk_q.min(queries.len());
-        let ob = &mut *(out_bufs_ptr as *mut Vec<u8>);
-        for q in &queries[0..q_end] {
-            if q.ib == 0 {
-                eng.exec_bool(q, ob);
-            } else {
-                eng.exec_phrase(q, ob);
+        loop {
+            let b_idx = next_batch.fetch_add(1, Ordering::Relaxed);
+            if b_idx >= num_batches {
+                break;
+            }
+            let q_start = b_idx * Q_BATCH;
+            let q_end = (q_start + Q_BATCH).min(queries.len());
+            let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b_idx);
+            for q in &queries[q_start..q_end] {
+                if q.ib == 0 {
+                    eng.exec_bool(q, ob);
+                } else {
+                    eng.exec_phrase(q, ob);
+                }
             }
         }
     });
