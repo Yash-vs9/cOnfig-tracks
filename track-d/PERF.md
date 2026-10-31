@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Run-length `prev_u` batching, pre-Dijkstra bitset release, restrict pointers & 64-bit safe Dijkstra | local-step4 | 4.61 | 216.1 | 36.1 |
 | 5 | 64-byte cache-aligned 8-ary packed heap, batch-atomic Pass 2 reservation, insertion-sort & 8-thread core cap | local-step5 | 4.40 | 159.7 | 37.9 |
 | 6 | Dataset scale bucketing (tiny/sample/full), 1-bit sink filter topology detection & single-target fast-path | local-step6 | 4.70 | 159.7 | 37.2 |
+| 7 | Full migration to zero-dependency Rust with scoped threading, L1 prefetching & 158MB peak RSS | local-step7 | 4.87 | 158.1 | 36.9 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -37,3 +38,8 @@ Every step from the reference to your final version, each with the live-board ru
   1. *Dataset Scale Bucketing:* Classified datasets into Tiny ($M < 50\text{k}$), Sample ($50\text{k} \le M < 2\text{M}$), and Full ($M \ge 2\text{M}$) tiers. Scaled thread pool and memory reservations adaptively—dropping `d-tiny` host runtime from $0.29\text{ s} \to 0.004\text{ s}$ ($72.5\times$ speedup) by bypassing multi-threading spinup overhead on small workloads.
   2. *Single-Target Query Fast-Path:* Detected single-target source groups ($99\%$ of queries in `d-full`) and routed them to a dedicated Dijkstra search loop that completely bypasses `is_target` bitset lookups, eliminating L1/L2 cache pollution.
   3. *Adaptive Sink Filter Topology Gating:* Integrated the 1-bit sink filter (`has_out_bitset`), dynamically gating the inner-loop sink filter check based on whether graph sinks represent a significant fraction of vertices ($\ge 1\%$), maintaining high throughput across diverse graph structures.
+- **Step 7:** Full migration of Track D codebase from C++ to idiomatic, zero-dependency Rust:
+  1. *Zero External Dependencies:* Implemented standard library Rust using raw POSIX `mmap`/`munmap`/`madvise` via `extern "C"`, achieving `dependency_count = 0` with completely offline compilation (`cargo build --release --offline`).
+  2. *Scoped Worker Threads:* Replaced OS thread pool with `std::thread::scope`, enabling lifetime-safe borrowed stack access and zero thread allocation overhead.
+  3. *Zero-Cost Pointer Arithmetic & Prefetching:* Utilized pointer offsets (`slice.as_ptr().add()`) with hardware `_mm_prefetch`, retaining the 8-ary packed 64-bit cache-line heap (`FastHeap8`) and dataset scale bucketing.
+  4. *Memory Efficiency:* Peak RSS dropped to **158.1 MB** (a new record low for Track D), executing `d-tiny` in **0.006 s**, `d-sample` in **0.305 s**, and `d-full` in **4.87 s** with 100% byte-for-byte SHA-256 accuracy.
