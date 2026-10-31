@@ -778,7 +778,7 @@ impl<'a> Engine<'a> {
     }
 }
 
-const FW_CAP: usize = 2_000_000;
+const FW_CAP: usize = 2_050_000;
 const DP_CAP: usize = 25_000;
 
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -793,7 +793,7 @@ unsafe fn worker_scan_fw(
     doc_s: &[u32; NUM_C],
     c_byte: &[usize; NUM_C + 1],
     seen_buf: *mut u16,
-    fw_ptr: *mut u32,
+    fw_ptr: *mut u16,
     dp_ptr: *mut u32,
 ) {
     let seen = std::slice::from_raw_parts_mut(seen_buf.add(c * 81920), 81920);
@@ -814,8 +814,14 @@ unsafe fn worker_scan_fw(
             if *seen.get_unchecked(t) != ld {
                 *seen.get_unchecked_mut(t) = ld;
                 *co_ptr.add(t) += 1;
-                *fw.add(fw_idx) = t as u32;
-                fw_idx += 1;
+                if t < 65535 {
+                    *fw.add(fw_idx) = t as u16;
+                    fw_idx += 1;
+                } else {
+                    *fw.add(fw_idx) = 65535;
+                    *fw.add(fw_idx + 1) = (t - 65535) as u16;
+                    fw_idx += 2;
+                }
             }
         });
         d += 1;
@@ -836,7 +842,7 @@ unsafe fn worker_transpose(
     bs_idx: *const u16,
     doc_s: &[u32; NUM_C],
     doc_e: &[u32; NUM_C],
-    fw_ptr: *mut u32,
+    fw_ptr: *mut u16,
     dp_ptr: *mut u32,
 ) {
     let num_docs = (doc_e[c] - doc_s[c]) as u16;
@@ -858,8 +864,14 @@ unsafe fn worker_transpose(
         let d = (doc_s[c] + ld as u32) as usize;
         let start = *dp.add(ld as usize) as usize;
         let end = *dp.add(ld as usize + 1) as usize;
-        for i in start..end {
-            let t = *fw.add(i) as usize;
+        let mut i = start;
+        while i < end {
+            let mut t = *fw.add(i) as usize;
+            i += 1;
+            if t == 65535 {
+                t = 65535 + *fw.add(i) as usize;
+                i += 1;
+            }
             let bi = *bs_idx.add(t);
             if bi != u16::MAX {
                 *g_bs_ptr.add((bi as usize) * w_per_doc + (d >> 6)) |= 1u64 << (d & 63);
@@ -1025,7 +1037,7 @@ unsafe fn run_all() {
 
     let seen_buf_ptr = alloc_mmap::<u16>(NUM_C * 81920);
     let seen_buf_val = seen_buf_ptr as usize;
-    let fw_bufs_ptr = alloc_mmap::<u32>(NUM_C * FW_CAP);
+    let fw_bufs_ptr = alloc_mmap::<u16>(NUM_C * FW_CAP);
     let fw_bufs_val = fw_bufs_ptr as usize;
     let dp_bufs_ptr = alloc_mmap::<u32>(NUM_C * DP_CAP);
     let dp_bufs_val = dp_bufs_ptr as usize;
@@ -1062,7 +1074,7 @@ unsafe fn run_all() {
                         ds_ref,
                         cb_ref,
                         seen_buf_val as *mut u16,
-                        fw_bufs_val as *mut u32,
+                        fw_bufs_val as *mut u16,
                         dp_bufs_val as *mut u32,
                     );
                     ready_ref.fetch_add(1, Ordering::Release);
@@ -1083,7 +1095,7 @@ unsafe fn run_all() {
                         bi_slice.as_ptr(),
                         ds_ref,
                         de_ref,
-                        fw_bufs_val as *mut u32,
+                        fw_bufs_val as *mut u16,
                         dp_bufs_val as *mut u32,
                     );
                     ready_ref.fetch_add(1, Ordering::Release);
@@ -1146,7 +1158,7 @@ unsafe fn run_all() {
             &doc_s,
             &c_byte,
             seen_buf_val as *mut u16,
-            fw_bufs_val as *mut u32,
+            fw_bufs_val as *mut u16,
             dp_bufs_val as *mut u32,
         );
         while ready.load(Ordering::Acquire) < NUM_C - 1 {
@@ -1207,15 +1219,14 @@ unsafe fn run_all() {
             bs_idx.as_ptr(),
             &doc_s,
             &doc_e,
-            fw_bufs_val as *mut u32,
+            fw_bufs_val as *mut u16,
             dp_bufs_val as *mut u32,
         );
         while ready.load(Ordering::Acquire) < NUM_C - 1 {
             std::hint::spin_loop();
         }
 
-        free_mmap(fw_bufs_ptr, NUM_C * FW_CAP);
-        free_mmap(dp_bufs_ptr, NUM_C * DP_CAP);
+
 
         phase.store(2, Ordering::Release);
 
