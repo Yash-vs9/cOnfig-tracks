@@ -8,13 +8,14 @@ use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thre
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn munmap(a: *mut u8, l: usize) -> i32;
+    fn madvise(a: *mut u8, l: usize, advice: i32) -> i32;
     fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize;
 }
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
-    iov: [[usize; 2]; 12], ep_c: [[u64; 2048]; 12],
+    iov: [[usize; 2]; 12], ep_c: [[u64; 4096]; 12],
     k: [AtomicU64; 33024], c: [AtomicU32; 163844], p: [usize; 2304],
     str_pool: [u8; 131072], str_off: AtomicU32,
     q: [u32; 13312 * 256], g: [u32; 65536], l: [[u32; 75000]; 12], n: [i32; 13312],
@@ -23,6 +24,7 @@ struct SharedData {
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 static DIGITS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+static M_OFF: [u8; 16] = [33, 0, 0, 0, 0, 36, 0, 0, 34, 33, 32, 0, 35, 0, 0, 32];
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
     let (mut b, mut i) = ([b' '; 12], 11usize);
@@ -82,8 +84,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
-        let mut ep = p.add(32 + (*p.add(32) != b'/') as usize);
-        while *ep != b'/' { ep = ep.add(1); }
+        let mw = (p.add(28) as *const u16).read_unaligned();
+        let ep = p.add(M_OFF[(((mw >> 11) ^ (mw.wrapping_mul(33))) & 15) as usize] as usize);
         let m = if ep.add(64) <= ec { sp_m(ep) | (sp_m(ep.add(32)) << 32) } else { 0 };
         let el = if m != 0 { m.trailing_zeros() as usize } else { find(ep, b' ') };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
@@ -92,7 +94,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let ci = ((h >> 16) as usize) & 2047;
+        let ci = ((h >> 16) as usize) & 4095;
         let mut kv = ep_c[ci];
         if (kv ^ h) >= 65536 {
             kv = intern(1, ep, el as u8, h);
@@ -100,16 +102,12 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         }
         let (eid, st_p) = ((kv & 0xFFFF) as usize, ep.add(el + 1));
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
-        let lp = st_p.add(4);
-        let sub = if lp.add(8) <= ec { u8_at(lp).wrapping_sub(0x3030_3030_3030_3030) } else { 0 };
-        let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
-        if sub & 0x8080_8080_8080_8080 != 0 {
-            let tz = (sub & 0x8080_8080_8080_8080).trailing_zeros();
-            let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
-            let w2 = (w.wrapping_mul(6553601) >> 16 & 0xFFFF_0000_FFFF).wrapping_mul(42949672960001);
-            (c, lat) = (lp.add((tz >> 3) as usize), (w2 >> 32) as u32);
-        } else {
-            while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
+        let mut c = st_p.add(4);
+        let mut lat = (*c - b'0') as u32;
+        c = c.add(1);
+        while *c >= b'0' {
+            lat = (lat << 3) + (lat << 1) + (*c - b'0') as u32;
+            c = c.add(1);
         }
         p = c.add(1 + (*c == b'\r') as usize);
         if cur_f == 256 {
@@ -215,6 +213,7 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
+            madvise(base as _, sz, 2);
             let bar = Barrier::new(12);
             let (out_fd, bar) = (outf.as_raw_fd(), &bar);
             std::thread::scope(|sc| {
