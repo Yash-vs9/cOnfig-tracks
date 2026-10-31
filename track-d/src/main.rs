@@ -9,6 +9,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 const MADV_DONTNEED: i32 = 4;
@@ -55,45 +56,36 @@ impl FastDistMap {
         }
     }
     #[inline(always)]
-    unsafe fn init_start(&mut self, s: u32, t: u32) {
+    unsafe fn init_start(&mut self, s: u32, t: u32) -> (u32, u32) {
         let ep = self.epoch;
         let base = self.slots.as_mut_ptr();
-        for &(v, fwd, rev) in &[(s, 0, INF), (t, INF, 0)] {
-            let mut idx = (v.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
-            loop {
-                let slot = base.add(idx);
-                if (*slot).3 != ep || (*slot).0 == v {
-                    *slot = Slot(v, fwd, rev, ep);
-                    self.used += 1;
-                    break;
-                }
-                idx = (idx + 1) & H_MSK;
-            }
-        }
-    }
-    #[inline(always)]
-    unsafe fn get_dist<const IS_FWD: bool>(&self, v: u32) -> u32 {
-        let ep = self.epoch;
-        let mut idx = (v.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
-        let base = self.slots.as_ptr();
+
+        let s_idx;
+        let mut idx = (s.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
         loop {
             let slot = base.add(idx);
-            if (*slot).3 != ep {
-                return INF;
-            }
-            if (*slot).0 == v {
-                return if IS_FWD { (*slot).1 } else { (*slot).2 };
+            if (*slot).3 != ep || (*slot).0 == s {
+                *slot = Slot(s, 0, INF, ep);
+                self.used += 1;
+                s_idx = idx as u32;
+                break;
             }
             idx = (idx + 1) & H_MSK;
         }
-    }
-    #[inline(always)]
-    unsafe fn prefetch(&self, v: u32) {
-        let idx = (v.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
-        std::arch::x86_64::_mm_prefetch(
-            self.slots.as_ptr().add(idx) as *const i8,
-            std::arch::x86_64::_MM_HINT_T0,
-        );
+
+        let t_idx;
+        let mut idx = (t.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
+        loop {
+            let slot = base.add(idx);
+            if (*slot).3 != ep || (*slot).0 == t {
+                *slot = Slot(t, INF, 0, ep);
+                self.used += 1;
+                t_idx = idx as u32;
+                break;
+            }
+            idx = (idx + 1) & H_MSK;
+        }
+        (s_idx, t_idx)
     }
     #[inline(always)]
     unsafe fn relax<const IS_FWD: bool>(
@@ -117,7 +109,7 @@ impl FastDistMap {
                         Slot(v, INF, nd, ep)
                     };
                     self.used += 1;
-                    heap.push(nd, v);
+                    heap.push(nd, idx as u32);
                 }
                 return;
             }
@@ -137,7 +129,7 @@ impl FastDistMap {
                     }
                     if nd.saturating_add(top_opp) < *mu {
                         *my_d = nd;
-                        heap.push(nd, v);
+                        heap.push(nd, idx as u32);
                     }
                 }
                 return;
@@ -173,8 +165,8 @@ impl MinHeap {
         }
     }
     #[inline(always)]
-    fn push(&mut self, d: u32, v: u32) {
-        let packed = ((d as u64) << 32) | (v as u64);
+    fn push(&mut self, d: u32, slot_idx: u32) {
+        let packed = ((d as u64) << 32) | (slot_idx as u64);
         let mut i = self.data.len();
         self.data.push(packed);
         unsafe {
@@ -294,6 +286,7 @@ fn solve_query_64(
 }
 
 fn main() -> std::io::Result<()> {
+    unsafe { mallopt(-8, 2); }
     let args: Vec<String> = std::env::args().collect();
     let (d_def, o_def) = ("/data".to_string(), "/out".to_string());
     let data_dir = args.iter().position(|a| a == "--data").map(|i| &args[i + 1]).or_else(|| args.get(1)).unwrap_or(&d_def);
@@ -555,16 +548,18 @@ fn main() -> std::io::Result<()> {
                     dist_map.next_query();
                     heap_f.clear();
                     heap_b.clear();
-                    unsafe {
-                        dist_map.init_start(s as u32, t as u32);
-                    }
-                    heap_f.push(0, s as u32);
-                    heap_b.push(0, t as u32);
+                    let (s_slot, t_slot) = unsafe {
+                        dist_map.init_start(s as u32, t as u32)
+                    };
+                    heap_f.push(0, s_slot);
+                    heap_b.push(0, t_slot);
 
                     let mut mu = INF;
                     let (mut touched_oflow, mut table_full) = (false, false);
 
                     unsafe {
+                        let slots_base = dist_map.slots.as_ptr();
+                        let ep = dist_map.epoch;
                         while !heap_f.is_empty() && !heap_b.is_empty() {
                             let (top_f, top_b) = (heap_f.min_key(), heap_b.min_key());
                             if top_f.saturating_add(top_b) >= mu {
@@ -576,19 +571,21 @@ fn main() -> std::io::Result<()> {
                             }
 
                             let is_fwd = heap_f.data.len() <= heap_b.data.len();
-                            let (d, u) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
+                            let (d, slot_idx) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
                             let top_opp = if is_fwd { top_b } else { top_f };
                             if d.saturating_add(top_opp) >= mu {
                                 break;
                             }
-                            let my_d = if is_fwd {
-                                dist_map.get_dist::<true>(u)
-                            } else {
-                                dist_map.get_dist::<false>(u)
-                            };
-                            if d > 0 && d > my_d {
+
+                            let slot_p = slots_base.add(slot_idx as usize);
+                            if (*slot_p).3 != ep {
                                 continue;
                             }
+                            let my_d = if is_fwd { (*slot_p).1 } else { (*slot_p).2 };
+                            if d > my_d {
+                                continue;
+                            }
+                            let u = (*slot_p).0;
 
                             let (h_ptr, e_ptr, mask) = if is_fwd {
                                 (hf_ptr, ef_ptr, 0u32)
@@ -601,15 +598,8 @@ fn main() -> std::io::Result<()> {
                             );
 
                             for e in e_start..e_end {
-                                if dist_map.used >= H_MAX_LOAD {
-                                    table_full = true;
-                                    break;
-                                }
                                 let packed = *e_ptr.add(e);
                                 let (v, mut w) = (packed & V_MASK, packed >> 21);
-                                if e + 1 < e_end {
-                                    dist_map.prefetch(*e_ptr.add(e + 1) & V_MASK);
-                                }
                                 if has_oflow && w == W_SENTINEL {
                                     touched_oflow = true;
                                     if let Ok(pos) = oflow
@@ -628,7 +618,8 @@ fn main() -> std::io::Result<()> {
                                     dist_map.relax::<false>(v, nd, top_opp, &mut heap_b, &mut mu);
                                 }
                             }
-                            if table_full {
+                            if dist_map.used >= H_MAX_LOAD {
+                                table_full = true;
                                 break;
                             }
                         }
