@@ -1,5 +1,6 @@
 #include <bits/stdc++.h>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <nmmintrin.h>
 #include <omp.h>
 #include <sys/mman.h>
@@ -49,6 +50,28 @@ static inline uint64_t hash_bytes(const char *s, uint32_t len) {
   return ((h1 << 32) ^ h2 ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL)) | 1ULL;
 }
 
+static inline const char *find_char_fast(const char *p, const char *end, char c) {
+  if (p + 16 <= end) {
+    __m128i target = _mm_set1_epi8(c);
+    __m128i chunk = _mm_loadu_si128((const __m128i *)p);
+    int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
+    if (mask) return p + __builtin_ctz(mask);
+  }
+  return (const char *)memchr(p, c, end - p);
+}
+
+static inline size_t count_quotes_avx2(const char *p, const char *end) {
+  __m256i target = _mm256_set1_epi8('"');
+  size_t cnt = 0, n = (end - p) - ((end - p) % 32);
+  for (size_t i = 0; i < n; i += 32) {
+    __m256i chunk = _mm256_loadu_si256((const __m256i *)(p + i));
+    __m256i cmp = _mm256_cmpeq_epi8(chunk, target);
+    cnt += __builtin_popcount(_mm256_movemask_epi8(cmp));
+  }
+  for (size_t i = n; i < (size_t)(end - p); ++i) cnt += (p[i] == '"');
+  return cnt;
+}
+
 int main(int argc, char **argv) {
   int rfd = open(argc > 1 ? argv[1] : "/data/regions.csv", O_RDONLY);
   int mfd = open(argc > 2 ? argv[2] : "/data/records.csv", O_RDONLY);
@@ -88,7 +111,7 @@ int main(int argc, char **argv) {
   size_t bo = (const char *)memchr(base, '\n', sz) + 1 - base, q_par = 0;
   for (int t = 0; t <= 12; ++t) cs[t] = bo + (sz - bo) * t / 12;
 #pragma omp parallel for num_threads(12)
-  for (int t = 0; t < 12; ++t) qc[t] = std::count(base + cs[t], base + cs[t + 1], '"');
+  for (int t = 0; t < 12; ++t) qc[t] = count_quotes_avx2(base + cs[t], base + cs[t + 1]);
   for (int t = 0; t < 12; ++t) iq[t] = q_par, q_par ^= (qc[t] & 1);
 #pragma omp parallel for num_threads(12)
   for (int t = 1; t < 12; ++t) {
@@ -102,6 +125,8 @@ int main(int argc, char **argv) {
     int tid = omp_get_thread_num();
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[512];
+    uint64_t tl_cache[2048] = {0};
+
     while (p < end) {
       if ((uint8_t)*p == 0xEF) p += 3;
       int64_t id = parse_u(p), nb = 0, ntb = 0, cents = 0;
@@ -109,7 +134,7 @@ int main(int argc, char **argv) {
 
       if (*p == '"') {
         ++p;
-        const char *q = (const char *)memchr(p, '"', end - p);
+        const char *q = find_char_fast(p, end, '"');
         if (q[1] != '"') {
           nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 2;
         } else {
@@ -121,20 +146,20 @@ int main(int argc, char **argv) {
           nh = hash_bytes(tmp, (uint32_t)std::min<int64_t>(nb, 512)), p += 2;
         }
       } else {
-        const char *q = (const char *)memchr(p, ',', end - p);
+        const char *q = find_char_fast(p, end, ',');
         nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 1;
       }
 
       if (*p == '"') {
         const char *s = ++p;
         for (;; p += 2, --ntb) {
-          p = (const char *)memchr(p, '"', end - p);
+          p = find_char_fast(p, end, '"');
           if (p[1] != '"') break;
         }
         ntb += p - s, p += 2;
       } else {
         const char *s = p;
-        p = (const char *)memchr(p, ',', end - p);
+        p = find_char_fast(p, end, ',');
         ntb += p - s, ++p;
       }
 
@@ -146,16 +171,22 @@ int main(int argc, char **argv) {
       while (p < end && (uint8_t)*p <= ' ') ++p;
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
-      for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
-        uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
-        if (!k) {
-          k = __sync_val_compare_and_swap(&name_keys[slot], 0ULL, nh);
-          if (!k) k = nh;
-        }
-        if (k == nh) {
-          uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-          if (!(*w & mask) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
-          break;
+
+      uint32_t tl_idx = (uint32_t)nh & 2047;
+      uint64_t tl_sig = (nh & ~0xFFULL) | cid;
+      if (tl_cache[tl_idx] != tl_sig) {
+        tl_cache[tl_idx] = tl_sig;
+        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
+          uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
+          if (!k) {
+            k = __sync_val_compare_and_swap(&name_keys[slot], 0ULL, nh);
+            if (!k) k = nh;
+          }
+          if (k == nh) {
+            uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+            if (!(*w & mask) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
+            break;
+          }
         }
       }
     }
