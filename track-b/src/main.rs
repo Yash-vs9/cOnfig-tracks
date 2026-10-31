@@ -331,7 +331,6 @@ fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
     while n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
     buf.extend_from_slice(&tmp[i..]);
 }
-
 fn main() {
     unsafe {
         CMAP[b'\n' as usize] = 1;
@@ -400,4 +399,74 @@ fn main() {
         while pl > 0 && tail_buf[pl - 1] != b'\n' { pl -= 1; }
         let mut total_docs = 0u32;
         while pl < t_read && tail_buf[pl] >= b'0' && tail_buf[pl] <= b'9' {
-            total_docs = total_docs * 10 + (tail_buf[pl] - b'0') as u3
+            total_docs = total_docs * 10 + (tail_buf[pl] - b'0') as u32; pl += 1;
+        }
+        total_docs += 1;
+
+        let dpc = (total_docs + NUM_C as u32 - 1) / NUM_C as u32;
+        let (mut doc_s, mut doc_e, mut c_byte, mut max_cd) = ([0u32; NUM_C], [0u32; NUM_C], [0usize; NUM_C + 1], 0usize);
+        c_byte[NUM_C] = f_sz;
+        for c in 0..NUM_C {
+            doc_s[c] = total_docs.min(if c > 0 { (c as u32 * dpc + 63) & !63 } else { 0 });
+            if c > 0 { doc_e[c - 1] = doc_s[c]; max_cd = max_cd.max((doc_e[c - 1] - doc_s[c - 1]) as usize); }
+        }
+        doc_e[NUM_C - 1] = total_docs;
+        max_cd = max_cd.max((doc_e[NUM_C - 1] - doc_s[NUM_C - 1]) as usize);
+
+        for c in 1..NUM_C {
+            let (mut lo, mut hi, mut ans) = (0isize, f_sz as isize - 1, f_sz);
+            let mut probe = [0u8; 512];
+            while lo <= hi {
+                let m = (lo + hi) >> 1;
+                let r = pread(fd_d, probe.as_mut_ptr(), 512, m as i64);
+                if r <= 0 { hi = m - 1; continue; }
+                let mut off_nl = 0usize;
+                if m > 0 { while off_nl < r as usize && probe[off_nl] != b'\n' { off_nl += 1; } off_nl += 1; }
+                if off_nl >= r as usize { hi = m - 1; continue; }
+                let (mut id, mut k) = (0u32, off_nl);
+                while k < r as usize && probe[k] >= b'0' && probe[k] <= b'9' { id = id * 10 + (probe[k] - b'0') as u32; k += 1; }
+                if id >= doc_s[c] { ans = m as usize + off_nl; hi = m - 1; } else { lo = m + off_nl as isize + 1; }
+            }
+            c_byte[c] = ans;
+        }
+
+        let n_q = queries.len();
+        let mut all_res = vec![CRes::default(); NUM_C * n_q];
+        let res_ptr = all_res.as_mut_ptr() as usize;
+        let next_c = AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                let (nc, qr, rr, ds, de, cb) = (&next_c, &queries, &rep_map, &doc_s, &doc_e, &c_byte);
+                s.spawn(move || {
+                    let mut arena = Arena::new(N_TERMS, max_cd);
+                    loop {
+                        let c = nc.fetch_add(1, Ordering::Relaxed);
+                        if c >= NUM_C { break; }
+                        let slice = std::slice::from_raw_parts_mut((res_ptr as *mut CRes).add(c * n_q), n_q);
+                        process_chunk(c, fd_d, q_buf, qr, rr, ds, de, cb, &mut arena, slice);
+                    }
+                });
+            }
+        });
+        close(fd_d);
+        drop(q_vec);
+
+        let mut wbuf = Vec::with_capacity(1 << 20);
+        for qi in 0..n_q {
+            let (mut cnt, mut sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
+            for c in 0..NUM_C {
+                let r = &all_res[c * n_q + qi];
+                cnt += r.cnt as u64; sum += r.sum;
+                for i in 0..(r.tc as usize) { if tc < 10 { top[tc] = r.top[i]; tc += 1; } }
+            }
+            if cnt == 0 { wbuf.extend_from_slice(b"0 0\n"); }
+            else {
+                push_u64(&mut wbuf, cnt); wbuf.push(b' '); push_u64(&mut wbuf, sum);
+                for i in 0..tc { wbuf.push(b' '); push_u64(&mut wbuf, top[i] as u64); }
+                wbuf.push(b'\n');
+            }
+        }
+        File::create(format!("{}/results.txt", o_dir)).unwrap().write_all(&wbuf).unwrap();
+    }
+}
