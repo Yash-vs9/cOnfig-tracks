@@ -14,7 +14,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Full migration to zero-dependency Rust with scoped threading, L1 prefetching & 158MB peak RSS | local-step7 | 4.87 | 158.1 | 36.9 |
 | 8 | Bidirectional Dijkstra with queue-length balancing, dual CSR, unified inner loop & 38% LOC reduction | run-0ed58b2875c3 | 0.394 | 266.4 | 53.86 |
 | 9 | 32-bit bit-packed dual CSR, hoisted branchless relaxation, lazy distance check & 4-core cap | run-fd11db9205da | 0.559 | 169.1 | 51.88 |
-| 10 | 6 P-core query dispatch, Pass 1 weight skipping, 32-bit packed dual CSR & 4.0s Dijkstra | local-step10 | 0.260 | 224.0 | 59.50 |
+| 10 | 6 P-core query dispatch, Pass 1 weight skipping, 32-bit packed dual CSR & 4.0s Dijkstra | run-482c56a0f7f8 | 0.362 | 227.3 | 55.34 |
+| 11 | In-place head prefix sums, zero-copy transmute (-28MB allocations), and streamlined memory layout | local-step11 | 0.240 | 205.0 | 60.50 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.

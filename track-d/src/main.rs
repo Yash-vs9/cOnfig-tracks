@@ -233,26 +233,18 @@ fn main() {
     });
 
     let mut accum_fwd = 0u32;
-    let head_fwd_pos: Vec<AtomicU32> = head_fwd
-        .into_iter()
-        .map(|a| {
-            let d = a.load(Ordering::Relaxed);
-            let pos = accum_fwd;
-            accum_fwd += d;
-            AtomicU32::new(pos)
-        })
-        .collect();
+    for a in &head_fwd {
+        let d = a.load(Ordering::Relaxed);
+        a.store(accum_fwd, Ordering::Relaxed);
+        accum_fwd += d;
+    }
 
     let mut accum_rev = 0u32;
-    let head_rev_pos: Vec<AtomicU32> = head_rev
-        .into_iter()
-        .map(|a| {
-            let d = a.load(Ordering::Relaxed);
-            let pos = accum_rev;
-            accum_rev += d;
-            AtomicU32::new(pos)
-        })
-        .collect();
+    for a in &head_rev {
+        let d = a.load(Ordering::Relaxed);
+        a.store(accum_rev, Ordering::Relaxed);
+        accum_rev += d;
+    }
 
     let mut edges_fwd = vec![0u32; accum_fwd as usize];
     let mut edges_rev = vec![0u32; accum_rev as usize];
@@ -265,8 +257,8 @@ fn main() {
         for t in 0..nt {
             let start = chunk_bounds[t];
             let finish = chunk_bounds[t + 1];
-            let hf_pos = &head_fwd_pos;
-            let hr_pos = &head_rev_pos;
+            let hf = &head_fwd;
+            let hr = &head_rev;
 
             handlers.push(scope.spawn(move || {
                 let mut local_overflow = Vec::new();
@@ -289,15 +281,11 @@ fn main() {
 
                         if u != v {
                             let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
-                            let idx_f = hf_pos
-                                .get_unchecked(u as usize)
-                                .fetch_add(1, Ordering::Relaxed)
+                            let idx_f = hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed)
                                 as usize;
                             *ef_ptr.add(idx_f) = (pw << V_BITS) | (v & V_MASK);
 
-                            let idx_r = hr_pos
-                                .get_unchecked(v as usize)
-                                .fetch_add(1, Ordering::Relaxed)
+                            let idx_r = hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed)
                                 as usize;
                             *er_ptr.add(idx_r) = (pw << V_BITS) | (u & V_MASK);
 
@@ -322,8 +310,8 @@ fn main() {
     let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
     overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
 
-    let mut head_fwd: Vec<u32> = head_fwd_pos.into_iter().map(|a| a.into_inner()).collect();
-    let mut head_rev: Vec<u32> = head_rev_pos.into_iter().map(|a| a.into_inner()).collect();
+    let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
+    let mut head_rev: Vec<u32> = unsafe { std::mem::transmute(head_rev) };
     if n > 0 {
         head_fwd.copy_within(0..n as usize, 1);
         head_rev.copy_within(0..n as usize, 1);
