@@ -352,13 +352,21 @@ impl<'a> Engine<'a> {
                     if self.is_bs(nt_id) {
                         let b = &self.g_bs[(self.bs_idx[nt_id] as usize) * self.w_per_doc
                             + ((cs >> 6) as usize)..];
-                        for w in 0..cw {
-                            let bw = *b.get_unchecked(w);
-                            let cw_ref = curr.get_unchecked_mut(w);
-                            match op {
-                                1 => *cw_ref &= bw,
-                                2 => *cw_ref |= bw,
-                                _ => *cw_ref &= !bw,
+                        match op {
+                            1 => {
+                                for w in 0..cw {
+                                    *curr.get_unchecked_mut(w) &= *b.get_unchecked(w);
+                                }
+                            }
+                            2 => {
+                                for w in 0..cw {
+                                    *curr.get_unchecked_mut(w) |= *b.get_unchecked(w);
+                                }
+                            }
+                            _ => {
+                                for w in 0..cw {
+                                    *curr.get_unchecked_mut(w) &= !*b.get_unchecked(w);
+                                }
                             }
                         }
                     } else if op == 2 {
@@ -816,7 +824,7 @@ fn main() {
 
         std::thread::scope(|s| {
             for c in 0..NUM_C {
-                let (bi, ds, cb, r_ref) = (&bs_idx, &doc_s, &c_byte, &rep_map);
+                let (bi, ds, de, dt, r_ref) = (&bs_idx, &doc_s, &doc_e, &doc_ts, &rep_map);
                 std::thread::Builder::new()
                     .stack_size(262144)
                     .spawn_scoped(s, move || {
@@ -824,21 +832,19 @@ fn main() {
                         let u16_ptr = g_u16_ptr as *mut u16;
                         let co_ptr = (c_off_ptr as *mut u32).add(c * nt);
                         let mut seen = [u16::MAX; 80000];
-                        let (mut p, pe, mut d, mut ld) = (cb[c], cb[c + 1], ds[c], 0u16);
+                        let (mut d, de_c, mut ld) = (ds[c], de[c], 0u16);
 
-                        while p < pe {
-                            while *d_buf.get_unchecked(p) != b'\t' {
-                                p += 1;
-                            }
-                            p += 1;
+                        while d < de_c {
+                            let mut p = *dt.get_unchecked(d as usize) as usize;
+                            let d_word = (d >> 6) as usize;
+                            let d_bit = 1u64 << (d & 63);
                             scan_doc(d_buf, &mut p, q_buf, r_ref, |t| {
                                 if *seen.get_unchecked(t) != ld {
                                     *seen.get_unchecked_mut(t) = ld;
                                     let bi_idx = *bi.get_unchecked(t);
                                     if bi_idx != u16::MAX {
-                                        *bs_ptr.add(
-                                            (bi_idx as usize) * w_per_doc + ((d >> 6) as usize),
-                                        ) |= 1u64 << (d & 63);
+                                        *bs_ptr.add((bi_idx as usize) * w_per_doc + d_word) |=
+                                            d_bit;
                                     } else {
                                         let cur = *co_ptr.add(t);
                                         *u16_ptr.add(cur as usize) = ld;
