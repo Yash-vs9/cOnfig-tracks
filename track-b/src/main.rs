@@ -21,10 +21,10 @@ extern "C" {
 
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_T: usize = 12;
-const CHUNK_DOCS: usize = 3000;
-const FW_CAP: usize = 350_000;
-const DP_CAP: usize = 3016;
+const NUM_T: usize = 6;
+const CHUNK_DOCS: usize = 10500;
+const FW_CAP: usize = 1_050_000;
+const DP_CAP: usize = 10516;
 const MAX_TERMS: usize = 81920;
 
 #[derive(Clone, Copy, Default)]
@@ -485,6 +485,25 @@ unsafe fn record_bits(acc: &mut QueryAcc, top_arena: &mut Vec<u32>, doc_s: u32, 
 }
 
 #[inline(always)]
+unsafe fn gallop_search(post: &[u16], mut lo: usize, hi: usize, target: u16) -> usize {
+    let mut step = 1;
+    while lo + step < hi && *post.get_unchecked(lo + step) < target {
+        lo += step;
+        step <<= 1;
+    }
+    let mut right = (lo + step).min(hi);
+    while lo < right {
+        let mid = (lo + right) / 2;
+        if *post.get_unchecked(mid) < target {
+            lo = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    lo
+}
+
+#[inline(always)]
 unsafe fn intersect_and(
     t: usize,
     chunk_postings: *const u16,
@@ -520,15 +539,7 @@ unsafe fn intersect_and(
             let mut j = 0usize;
             for idx in 0..clen {
                 let v1 = *cand.get_unchecked(idx);
-                let (mut lo, mut hi) = (j, cnt);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if *o_post.get_unchecked(mid) < v1 {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
+                let lo = gallop_search(o_post, j, cnt, v1);
                 if lo < cnt && *o_post.get_unchecked(lo) == v1 {
                     *cand.get_unchecked_mut(w) = v1;
                     w += 1;
@@ -979,7 +990,6 @@ unsafe fn exec_phrase_chunk(
 }
 
 unsafe fn run_all() {
-    let t0 = std::time::Instant::now();
     mallopt(-8, 1);
     mallopt(-1, 0);
     mallopt(-3, 65536);
@@ -1045,7 +1055,6 @@ unsafe fn run_all() {
     }
     queries.shrink_to_fit();
     q_terms.shrink_to_fit();
-    eprintln!("[STAGE 1] parse: {:?}", t0.elapsed());
 
     let mut rep_map = vec![u32::MAX; N_TERMS];
     for q in &queries {
@@ -1118,8 +1127,10 @@ unsafe fn run_all() {
             let cb_ref = &c_byte;
             let queries_ref = &queries;
             let q_terms_ref = &q_terms;
-            s.spawn(move || {
-                let aff_mask = 1u64 << (tid % 12);
+            let _ = std::thread::Builder::new()
+                .stack_size(131072)
+                .spawn_scoped(s, move || {
+                let aff_mask = 1u64 << ((tid * 2) % 12);
                 sched_setaffinity(0, 8, &aff_mask);
                 let accs = &mut *(accs_ptr as *mut Vec<QueryAcc>).add(tid);
                 let top_arena = &mut *(arenas_ptr as *mut Vec<u32>).add(tid);
@@ -1131,15 +1142,15 @@ unsafe fn run_all() {
                 let mut cur_pos = vec![0u32; MAX_TERMS];
                 let mut touched_terms = Vec::with_capacity(16384);
                 let mut chunk_bs_idx = vec![u16::MAX; MAX_TERMS];
-                let mut chunk_bs = vec![0u64; 128 * 64];
+                let mut chunk_bs = vec![0u64; 128 * 165];
                 let mut bs_terms = Vec::with_capacity(128);
                 let mut doc_ts = vec![0u32; CHUNK_DOCS];
                 let mut seen = [0u64; 1280];
                 let mut hl = [0u32; 2048];
                 let mut fc = [[FastEntry { w0: 0, tid: u32::MAX, len: 0 }; 2]; 1024];
-                let mut cand_uninit = MaybeUninit::<[u16; CHUNK_DOCS]>::uninit();
-                let cand = cand_uninit.assume_init_mut();
-                let mut curr_uninit = MaybeUninit::<[u64; 64]>::uninit();
+                let cand_ptr = alloc_mmap::<u16>(CHUNK_DOCS);
+                let cand = std::slice::from_raw_parts_mut(cand_ptr, CHUNK_DOCS);
+                let mut curr_uninit = MaybeUninit::<[u64; 165]>::uninit();
                 let curr = curr_uninit.assume_init_mut();
 
                 loop {
@@ -1270,14 +1281,13 @@ unsafe fn run_all() {
                     bs_terms.clear();
                 }
 
+                free_mmap(cand_ptr, CHUNK_DOCS);
                 free_mmap(fw, FW_CAP);
                 free_mmap(dp, DP_CAP);
                 free_mmap(chunk_postings, FW_CAP);
             });
         }
     });
-
-    eprintln!("[STAGE 1] chunk loop finished: {:?}", t0.elapsed());
 
     let _ = std::fs::create_dir_all(&o_dir);
     let mut f = File::create(format!("{}/results.txt", o_dir)).unwrap();
@@ -1314,7 +1324,6 @@ unsafe fn run_all() {
     if !out_buf.is_empty() {
         f.write_all(&out_buf).unwrap();
     }
-    eprintln!("[STAGE 1] merge & write: {:?}", t0.elapsed());
     malloc_trim(0);
 }
 
