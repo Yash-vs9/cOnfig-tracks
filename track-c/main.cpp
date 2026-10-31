@@ -22,15 +22,8 @@ static char dense_to_code[256][4], out_buf[65536];
 static Agg G[256], T[12][256];
 static size_t cs[13], qc[12], iq[12];
 
-constexpr uint32_t MBOX_CAP = 45000;
-static uint64_t mbox[12][12][MBOX_CAP];
-static uint32_t mbox_cnt[12][12];
-
-constexpr uint32_t TH_CAP = 65536;
-constexpr uint32_t TH_MASK = TH_CAP - 1;
-struct alignas(64) PrivSlot { uint64_t key, bits[4]; };
-static PrivSlot th_table[12][TH_CAP];
-static uint32_t priv_dn[12][256];
+constexpr uint32_t HT_MASK = (1 << 18) - 1;
+static uint64_t name_keys[1 << 18], name_bits[1 << 18][4];
 
 static inline void fmt_cents(char *&p, int64_t c) {
   if (c < 0) *p++ = '-', c = -c;
@@ -162,7 +155,6 @@ int main(int argc, char **argv) {
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[520];
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
-    uint32_t local_cnt[12] = {0};
 
     auto find_q = [&](const char *s) -> const char * {
       while (s + 32 <= end) {
@@ -246,49 +238,36 @@ int main(int argc, char **argv) {
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
 
-      uint32_t target_th = (uint32_t)(((nh >> 32) * 12ULL) >> 32);
-      if (__builtin_expect(local_cnt[target_th] < MBOX_CAP, 1)) {
-        mbox[tid][target_th][local_cnt[target_th]++] = (nh & ~0xFFULL) | cid;
-      }
-    }
-    for (int t = 0; t < 12; ++t) mbox_cnt[tid][t] = local_cnt[t];
-  }
-
-#pragma omp parallel num_threads(12)
-  {
-    int tid = omp_get_thread_num();
-    PrivSlot *table = th_table[tid];
-
-    for (int src = 0; src < 12; ++src) {
-      uint64_t *entries = mbox[src][tid];
-      uint32_t cnt = mbox_cnt[src][tid];
-      for (uint32_t i = 0; i < cnt; ++i) {
-        uint64_t e = entries[i];
-        uint8_t cid = (uint8_t)(e & 0xFF);
-        uint64_t nh = e & ~0xFFULL;
-
-        for (uint32_t p_step = 0, slot = (uint32_t)(nh ^ (nh >> 32)) & TH_MASK; p_step < TH_CAP; ++p_step, slot = (slot + 1) & TH_MASK) {
-          PrivSlot &s = table[slot];
-          if (!s.key) {
-            s.key = nh, s.bits[cid >> 6] |= (1ULL << (cid & 63)), priv_dn[tid][cid]++;
-            break;
-          }
-          if (s.key == nh) {
-            uint64_t mask = 1ULL << (cid & 63);
-            if (!(s.bits[cid >> 6] & mask)) s.bits[cid >> 6] |= mask, priv_dn[tid][cid]++;
-            break;
-          }
+      for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
+        uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
+        if (!k) {
+          k = __sync_val_compare_and_swap(&name_keys[slot], 0ULL, nh);
+          if (!k) k = nh;
+        }
+        if (k == nh) {
+          uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+          if (!(*w & mask)) __atomic_fetch_or(w, mask, __ATOMIC_RELAXED);
+          break;
         }
       }
     }
   }
 
+#pragma omp parallel for num_threads(12)
   for (int cid = 0; cid <= unm_cid; ++cid) {
+    uint32_t word_idx = cid >> 6;
+    uint64_t mask = 1ULL << (cid & 63);
+    uint32_t dn = 0;
+    for (uint32_t slot = 0; slot <= HT_MASK; ++slot) {
+      if (name_bits[slot][word_idx] & mask) dn++;
+    }
+    G[cid].dn = dn;
+  }
+
+  for (int cid = 0; cid <= unm_cid; ++cid)
     for (int tid = 0; tid < 12; ++tid) {
-      G[cid].dn += priv_dn[tid][cid];
       if (T[tid][cid].cnt) G[cid].add(T[tid][cid]);
     }
-  }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) { ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' '; };
