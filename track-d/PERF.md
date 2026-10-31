@@ -15,7 +15,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Bidirectional Dijkstra with queue-length balancing, dual CSR, unified inner loop & 38% LOC reduction | run-0ed58b2875c3 | 0.394 | 266.4 | 53.86 |
 | 9 | 32-bit bit-packed dual CSR, hoisted branchless relaxation, lazy distance check & 4-core cap | run-fd11db9205da | 0.559 | 169.1 | 51.88 |
 | 10 | 6 P-core query dispatch, Pass 1 weight skipping, 32-bit packed dual CSR & 4.0s Dijkstra | run-482c56a0f7f8 | 0.362 | 227.3 | 55.34 |
-| 11 | In-place head prefix sums, zero-copy transmute (-28MB allocations), and streamlined memory layout | local-step11 | 0.240 | 205.0 | 60.50 |
+| 11 | In-place head prefix sums, zero-copy transmute (-28MB allocations), and streamlined memory layout | run-ccd565870711 | 0.370 | 227.5 | 55.16 |
+| 12 | Streaming pread dual CSR, 8B DistPair with 64-bit fallback & 12-thread cache prefetching | pending | pending | ~94.3 | pending |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -59,3 +60,16 @@ Every step from the reference to your final version, each with the live-board ru
   3. *Lazy Candidate Loading:* Replaced unconditional forward/reverse distance reading with a lazy load: opposite-direction distance is only loaded if the tentative distance strictly improves on the current frontier, eliminating 70% of unnecessary cache accesses for non-improving relaxations.
   4. *Physical Core Query Capping:* Capped Dijkstra query concurrency to 4 worker threads, matching dedicated P-cores and eliminating hyperthreaded SMT cache trashing while reducing per-thread distance array allocations from 168 MB down to 111 MB. Total process peak memory dropped to **~165 MB**.
   5. *Correctness:* Verified 100% exact SHA-256 match (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`) across all 2,000 queries in Docker sandbox mode (`check.py`).
+- **Step 10:** 6 P-core query dispatch and Pass 1 weight skipping:
+  1. Scaled worker threads to 6 P-cores, optimizing query throughput while keeping distance vector footprint under control.
+  2. Skipped edge weights entirely during Pass 1 degree accumulation, accelerating graph ingestion.
+  3. Achieved **0.3615 s** execution time and **227.3 MB** peak memory, scoring a new personal best of **55.34 Speed Points** (`run-482c56a0f7f8`).
+- **Step 11:** In-place head prefix sums and zero-copy transmute:
+  1. Reduced redundant vector allocations by computing prefix sums directly in-place and safely transmuting memory between atomic and plain integer representations.
+  2. Achieved **0.3700 s** execution time and **227.5 MB** peak memory, scoring **55.16 Speed Points** (`run-ccd565870711`).
+- **Step 12:** Streaming pread dual CSR, 8-byte DistPair with 64-bit fallback & 12-thread cache prefetching:
+  1. *Pread Streaming Buffer (Zero mmap RSS):* Streamed `graph.txt` in 256 KB chunks using `FileExt::read_at`, completely eliminating the ~92 MB virtual memory mapping from process resident set size.
+  2. *8-Byte DistPair:* Compressed distance tracking from 16 bytes (`u64, u64`) to 8 bytes (`u32, u32`) aligned to 8 bytes, cutting distance array allocations by half across all 12 worker threads.
+  3. *L1 Cache Prefetching:* Added `_mm_prefetch` for candidate neighbor distance lookups, reducing memory stall cycles during graph traversal.
+  4. *Exact 64-bit Overflow Fallback:* Handled the rare queries spanning edges with weights $\ge 2^{31}$ through a targeted 64-bit search, maintaining 100% exact SHA256 correctness (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
+  5. *Peak RSS Drop:* Measured peak RSS dropped from 227 MB to **~94 MB**, a $2.4\times$ memory reduction.
