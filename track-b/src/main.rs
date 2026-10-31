@@ -61,6 +61,18 @@ const CMAP: [u8; 256] = {
     m
 };
 
+const LEN_MASKS: [u64; 9] = [
+    0,
+    0x00000000000000FF,
+    0x000000000000FFFF,
+    0x0000000000FFFFFF,
+    0x00000000FFFFFFFF,
+    0x000000FFFFFFFFFF,
+    0x0000FFFFFFFFFFFF,
+    0x00FFFFFFFFFFFFFF,
+    0xFFFFFFFFFFFFFFFF,
+];
+
 #[repr(align(4096))]
 struct AlignedVTab([Slot; H_SZ]);
 
@@ -195,6 +207,9 @@ unsafe fn scan_doc<F: FnMut(usize)>(
 ) {
     let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
     let mut tail = [0u8; 16];
+    let d_ptr = d_buf.as_ptr();
+    let d_len = d_buf.len();
+
     loop {
         if *d_buf.get_unchecked(*p) == b' ' {
             *p += 1;
@@ -206,9 +221,46 @@ unsafe fn scan_doc<F: FnMut(usize)>(
             *p += 1;
             break;
         }
-        let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
-        let h = mix64(w0, w1, len);
-        let tid = lookup_swar(w0, w1, &tail, len, q_buf, h);
+
+        let tid = if *p + 9 <= d_len {
+            let raw8 = *(d_ptr.add(*p) as *const u64);
+            let xor20 = raw8 ^ 0x2020202020202020;
+            let has_space = (xor20.wrapping_sub(0x0101010101010101)) & !xor20 & 0x8080808080808080;
+
+            if has_space != 0 {
+                let bit = has_space.trailing_zeros() as usize;
+                let len = bit >> 3;
+                let w0 = raw8 & *LEN_MASKS.get_unchecked(len);
+                let sub_a = w0.wrapping_sub(0x6161616161616161);
+                let mask_under_a = sub_a & 0x8080808080808080;
+                if (mask_under_a & *LEN_MASKS.get_unchecked(len)) == 0 {
+                    let sub_z = (w0.wrapping_add(0x0505050505050505)) & 0x8080808080808080;
+                    if (sub_z & *LEN_MASKS.get_unchecked(len)) == 0 {
+                        *p += len + 1;
+                        let h = (w0 ^ (len as u64)).wrapping_mul(0xbf58476d1ce4e5b9);
+                        let h = h ^ (h >> 31);
+                        lookup_swar(w0, 0, &[], len, q_buf, h)
+                    } else {
+                        let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
+                        let h = mix64(w0, w1, len);
+                        lookup_swar(w0, w1, &tail, len, q_buf, h)
+                    }
+                } else {
+                    let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
+                    let h = mix64(w0, w1, len);
+                    lookup_swar(w0, w1, &tail, len, q_buf, h)
+                }
+            } else {
+                let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
+                let h = mix64(w0, w1, len);
+                lookup_swar(w0, w1, &tail, len, q_buf, h)
+            }
+        } else {
+            let (w0, w1, len) = read_tok(d_buf, p, &mut tail);
+            let h = mix64(w0, w1, len);
+            lookup_swar(w0, w1, &tail, len, q_buf, h)
+        };
+
         if tid != u32::MAX {
             let t = tid as usize;
             fn_(t);
