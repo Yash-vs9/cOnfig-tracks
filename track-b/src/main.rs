@@ -11,8 +11,9 @@ extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
+const NUM_SCAN_T: usize = 6;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 750_000;
+const FW_CAP: usize = 680_000;
 const DP_CAP: usize = 11_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
@@ -156,37 +157,8 @@ while *p + 32 <= n {
 let c = _mm256_loadu_si256(base.add(*p) as *const __m256i);
 let mut mask_tok = tokmask(c);
 let mask_nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c, nlv)) as u32;
-if mask_nl != 0 {
-let nl_pos = mask_nl.trailing_zeros();
-mask_tok &= (1u32 << nl_pos).wrapping_sub(1);
-let mut offset = 0usize;
-while mask_tok != 0 {
-let zeros = mask_tok.trailing_zeros() as usize;
-let tok_start = offset + zeros;
-let rem = mask_tok >> zeros;
-let len = (!rem).trailing_zeros() as usize;
-let (w0, w1);
-if len <= 8 {
-let raw = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
-w0 = raw & *MASKS.get_unchecked(len);
-w1 = 0;
-process_token(w0, w1, len, &[]);
-} else if len <= 16 {
-w0 = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
-let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) | 0x2020202020202020;
-w1 = raw1 & *MASKS.get_unchecked(len - 8);
-process_token(w0, w1, len, &[]);
-} else {
-let mut tp = *p + tok_start;
-let r = read_tok(d_buf, &mut tp, &mut tail);
-w0 = r.0;
-w1 = r.1;
-process_token(w0, w1, len, &tail); }
-let consumed = zeros + len;
-if consumed >= 32  { break; }
-mask_tok = rem >> len;
-offset = tok_start + len; }
-*p += nl_pos as usize + 1; return; }
+let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 32 };
+if mask_nl != 0 { mask_tok &= (1u32 << nl_pos).wrapping_sub(1); }
 let mut offset = 0usize;
 let mut cross = false;
 while mask_tok != 0 {
@@ -194,7 +166,7 @@ let zeros = mask_tok.trailing_zeros() as usize;
 let tok_start = offset + zeros;
 let rem = mask_tok >> zeros;
 let len = (!rem).trailing_zeros() as usize;
-if tok_start + len == 32 {
+if mask_nl == 0 && tok_start + len == 32 {
 *p += tok_start;
 cross = true; break; }
 let (w0, w1);
@@ -218,11 +190,10 @@ let consumed = zeros + len;
 if consumed >= 32  { break; }
 mask_tok = rem >> len;
 offset = tok_start + len; }
+if mask_nl != 0 { *p += nl_pos + 1; return; }
 if cross {
 let l = (!tokmask(_mm256_loadu_si256(base.add(*p) as *const __m256i))).trailing_zeros() as usize;
-if l < 16 && *p + 32 <= n {
-// Already at start of token, fall through to next iteration
-} else {
+if l >= 16 || *p + 32 > n {
 let r = read_tok(d_buf, p, &mut tail);
 process_token(r.0, r.1, r.2, &tail); }
 } else { *p += 32; } }
@@ -821,7 +792,7 @@ hi = (lo + hi) / 2;
 let sc_count = NUM_C * nt;
 let c_offs = alloc_mmap::<u32>(sc_count);
 let c_offs_val = c_offs as usize;
-let thread_counts = alloc_mmap::<u16>(NUM_T * nt);
+let thread_counts = alloc_mmap::<u16>(NUM_SCAN_T * nt);
 let thread_counts_val = thread_counts as usize;
 let doc_ts_ptr = doc_ts.as_mut_ptr() as usize;
 const ATOMIC_ZERO: AtomicUsize = AtomicUsize::new(0);
@@ -833,10 +804,9 @@ let nb = (queries.len() + QB - 1) / QB;
 let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
 let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
 let next_b = AtomicUsize::new(0);
-// Per-worker forward buffers (only NUM_T buffers allocated)
-let mut fw_ptrs = [0usize; NUM_T];
-let mut dp_ptrs = [0usize; NUM_T];
-for t in 0..NUM_T {
+let mut fw_ptrs = [0usize; NUM_SCAN_T];
+let mut dp_ptrs = [0usize; NUM_SCAN_T];
+for t in 0..NUM_SCAN_T {
 fw_ptrs[t] = alloc_mmap::<u16>(FW_CAP) as usize;
 dp_ptrs[t] = alloc_mmap::<u32>(DP_CAP) as usize; }
 let next_chunk = AtomicUsize::new(0);
@@ -856,13 +826,14 @@ let q_terms_ref = &q_terms;
 let next_ref = &next_b;
 let c_post_ptrs_ref = &c_post_ptrs;
 let c_post_lens_ref = &c_post_lens;
-let fw_ptr_c = fw_ptrs[tid];
-let dp_ptr_c = dp_ptrs[tid];
+let fw_ptr_c = if tid < NUM_SCAN_T { fw_ptrs[tid] } else { 0 };
+let dp_ptr_c = if tid < NUM_SCAN_T { dp_ptrs[tid] } else { 0 };
 std::thread::Builder::new()
 .stack_size(196608)
 .spawn_scoped(s, move || {
 let aff_mask = 1u64 << (tid % 12);
 sched_setaffinity(0, 8, &aff_mask);
+if tid < NUM_SCAN_T {
 let fw = fw_ptr_c as *mut u16;
 let dp = dp_ptr_c as *mut u32;
 let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
@@ -906,7 +877,7 @@ fw,
 dp,
 ); }
 free_mmap(fw, FW_CAP);
-free_mmap(dp, DP_CAP);
+free_mmap(dp, DP_CAP); }
 ready_ref.fetch_add(1, Ordering::Release);
 while phase_ref.load(Ordering::Acquire) < 1  { std::hint::spin_loop(); }
 let mut cp_ptrs = [ptr::null(); NUM_C];
@@ -993,7 +964,7 @@ let end = *c_offs.add(base + i);
 let start = if i > 0 { *c_offs.add(base + i - 1) } else { 0 };
 df += end - start; }
 TINFO[i].df = (df as u16).min(65535); } }
-free_mmap(thread_counts, NUM_T * nt);
+free_mmap(thread_counts, NUM_SCAN_T * nt);
 phase.store(1, Ordering::Release);
 let mut cp_ptrs = [ptr::null(); NUM_C];
 for c in 0..NUM_C  { cp_ptrs[c] = c_post_ptrs[c].load(Ordering::Relaxed) as *const u16; }
