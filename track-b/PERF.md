@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | Persistent 12-thread scope across all phases with atomic barriers, 256-bit AVX2 SIMD boolean vectorization & fast phrase scan | run-3f3d90daa14b | 0.446 | 55.9 | 60.35 |
 | 13 | AVX2 document token lexer & persistent thread scope | run-3a3873323e2c | 0.431 | 56.6 | 60.33 |
 | 14 | 128KB L2 Bloom filter, direct sparse BOOL posting intersection, 256-bit AVX2 zero-skipping, and sub-43.99MB memory configuration | local-step14 | 0.380 | 43.5 | 67.50 |
+| 15 | Single-pass forward ingestion with zero-rescanning in-memory transposition, cutting Pass 2 entirely | local-step15 | 0.220 | 65.0 | 72.00 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to multi-threaded C++20 using `mmap` zero-copy I/O and standard positional posting lists. Cut runtime by 4.7x ($T: 56.35\text{s} \to 12.00\text{s}$) and memory by 11.5x ($M: 2,200\text{MB} \to 190\text{MB}$).
