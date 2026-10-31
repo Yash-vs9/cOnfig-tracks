@@ -1,5 +1,5 @@
 //! Speed Demon 2026 - Track D (Traverse)
-//! Ultra-Fast Bidirectional Dijkstra Engine with Zero Dependencies.
+//! Ultra-Fast Bit-Packed Dual-CSR Bidirectional Dijkstra Engine.
 
 use std::fs::File;
 use std::io::Write;
@@ -14,55 +14,10 @@ extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-struct FastMmap {
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl FastMmap {
-    fn new(path: &str) -> Option<Self> {
-        let f = File::open(path).ok()?;
-        let meta = f.metadata().ok()?;
-        let size = meta.len() as usize;
-        if size == 0 {
-            return None;
-        }
-        let fd = f.into_raw_fd();
-        let ptr = unsafe { mmap(ptr::null_mut(), size, 1, 2, fd, 0) };
-        unsafe {
-            close(fd);
-        }
-        if ptr == usize::MAX as *mut u8 || ptr.is_null() {
-            None
-        } else {
-            unsafe {
-                madvise(ptr, size, 2);
-            }
-            Some(Self { ptr, size })
-        }
-    }
-    #[inline(always)]
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
-    }
-}
-
-impl Drop for FastMmap {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.ptr != usize::MAX as *mut u8 {
-            unsafe {
-                munmap(self.ptr, self.size);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct Edge {
-    to: u32,
-    w: u32,
-}
+const W_BITS: u32 = 11;
+const W_SENTINEL: u32 = (1 << W_BITS) - 1; // 2047
+const V_BITS: u32 = 21;
+const V_MASK: u32 = (1 << V_BITS) - 1;
 
 #[derive(Clone, Copy)]
 struct Query {
@@ -78,8 +33,8 @@ struct DistPair {
     rev: u64,
 }
 
-const V_BITS: u32 = 22;
-const V_MASK: u64 = (1u64 << V_BITS) - 1;
+const HEAP_V_BITS: u32 = 22;
+const HEAP_V_MASK: u64 = (1u64 << HEAP_V_BITS) - 1;
 
 struct MinHeap4 {
     data: Vec<u64>,
@@ -105,7 +60,7 @@ impl MinHeap4 {
         if self.data.is_empty() {
             u64::MAX
         } else {
-            self.data[0] >> V_BITS
+            self.data[0] >> HEAP_V_BITS
         }
     }
     #[inline(always)]
@@ -154,7 +109,7 @@ impl MinHeap4 {
                 }
                 *slice.add(i) = last;
             }
-            (top >> V_BITS, (top & V_MASK) as u32)
+            (top >> HEAP_V_BITS, (top & HEAP_V_MASK) as u32)
         }
     }
 }
@@ -199,13 +154,20 @@ fn main() {
         (d, o)
     };
 
-    let gmap = FastMmap::new(&format!("{}/graph.txt", data_dir)).expect("graph.txt");
-    let g_bytes = gmap.as_slice();
+    let gf = File::open(format!("{}/graph.txt", data_dir)).expect("graph.txt");
+    let gsize = gf.metadata().expect("meta").len() as usize;
+    let gfd = gf.into_raw_fd();
+    let g_ptr = unsafe { mmap(ptr::null_mut(), gsize, 1, 2, gfd, 0) };
+    unsafe {
+        close(gfd);
+        madvise(g_ptr, gsize, 2);
+    }
+    let g_bytes = unsafe { std::slice::from_raw_parts(g_ptr, gsize) };
+
     let mut g_end = g_bytes.len();
     while g_end > 0 && g_bytes[g_end - 1] < b'0' {
         g_end -= 1;
     }
-
     let mut p = g_bytes.as_ptr();
     let end_p = unsafe { p.add(g_end) };
 
@@ -262,7 +224,6 @@ fn main() {
                             cur = cur.add(1);
                         }
                         cur = cur.add(1);
-
                         if u != v {
                             hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
                             hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
@@ -295,24 +256,26 @@ fn main() {
         })
         .collect();
 
-    let mut edges_fwd = vec![Edge::default(); accum_fwd as usize];
-    let mut edges_rev = vec![Edge::default(); accum_rev as usize];
+    let mut edges_fwd = vec![0u32; accum_fwd as usize];
+    let mut edges_rev = vec![0u32; accum_rev as usize];
     let edges_fwd_addr = edges_fwd.as_mut_ptr() as usize;
     let edges_rev_addr = edges_rev.as_mut_ptr() as usize;
 
-    // Pass 2: Populate both CSRs
-    std::thread::scope(|scope| {
+    // Pass 2: Populate both CSRs with 32-bit packed edges
+    let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
+        let mut handlers = Vec::with_capacity(nt);
         for t in 0..nt {
             let start = chunk_bounds[t];
             let finish = chunk_bounds[t + 1];
             let hf_pos = &head_fwd_pos;
             let hr_pos = &head_rev_pos;
 
-            scope.spawn(move || {
+            handlers.push(scope.spawn(move || {
+                let mut local_overflow = Vec::new();
                 let mut cur = start as *const u8;
                 let end_cur = finish as *const u8;
-                let ef_ptr = edges_fwd_addr as *mut Edge;
-                let er_ptr = edges_rev_addr as *mut Edge;
+                let ef_ptr = edges_fwd_addr as *mut u32;
+                let er_ptr = edges_rev_addr as *mut u32;
 
                 unsafe {
                     while cur < end_cur {
@@ -327,26 +290,39 @@ fn main() {
                         cur = cur.add(1);
 
                         if u != v {
+                            let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
                             let idx_f = hf_pos
                                 .get_unchecked(u as usize)
                                 .fetch_add(1, Ordering::Relaxed)
                                 as usize;
-                            *ef_ptr.add(idx_f) = Edge { to: v, w };
+                            *ef_ptr.add(idx_f) = (pw << V_BITS) | (v & V_MASK);
 
                             let idx_r = hr_pos
                                 .get_unchecked(v as usize)
                                 .fetch_add(1, Ordering::Relaxed)
                                 as usize;
-                            *er_ptr.add(idx_r) = Edge { to: u, w };
+                            *er_ptr.add(idx_r) = (pw << V_BITS) | (u & V_MASK);
+
+                            if pw == W_SENTINEL {
+                                local_overflow.push((idx_f as u32, w));
+                                local_overflow.push(((1u32 << 31) | (idx_r as u32), w));
+                            }
                         }
                     }
                 }
-            });
+                local_overflow
+            }));
         }
+        handlers.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    drop(gmap);
+    unsafe {
+        munmap(g_ptr, gsize);
+    }
     drop(chunk_bounds);
+
+    let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
+    overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
 
     let mut head_fwd: Vec<u32> = head_fwd_pos.into_iter().map(|a| a.into_inner()).collect();
     let mut head_rev: Vec<u32> = head_rev_pos.into_iter().map(|a| a.into_inner()).collect();
@@ -358,12 +334,17 @@ fn main() {
     head_rev[0] = 0;
 
     // Parse queries
-    let qmap = FastMmap::new(&format!("{}/queries.txt", data_dir)).expect("queries.txt");
-    let q_bytes = qmap.as_slice();
-    let q_end = q_bytes.len();
+    let qf = File::open(format!("{}/queries.txt", data_dir)).expect("queries.txt");
+    let qsize = qf.metadata().expect("qmeta").len() as usize;
+    let qfd = qf.into_raw_fd();
+    let q_ptr = unsafe { mmap(ptr::null_mut(), qsize, 1, 2, qfd, 0) };
+    unsafe {
+        close(qfd);
+    }
+    let q_bytes = unsafe { std::slice::from_raw_parts(q_ptr, qsize) };
     let mut queries = Vec::with_capacity(4096);
     let mut qp = q_bytes.as_ptr();
-    let q_end_p = unsafe { qp.add(q_end) };
+    let q_end_p = unsafe { qp.add(q_bytes.len()) };
     let mut qid = 0u32;
     unsafe {
         while qp < q_end_p {
@@ -381,19 +362,20 @@ fn main() {
             queries.push(Query { s, t, id: qid });
             qid += 1;
         }
+        munmap(q_ptr, qsize);
     }
-    drop(qmap);
 
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
 
-    let q_threads = nt.min(6).min(queries.len());
+    let q_threads = nt.min(4).min(queries.len());
     let next_query = AtomicUsize::new(0);
 
     let ef_addr = edges_fwd.as_ptr() as usize;
     let er_addr = edges_rev.as_ptr() as usize;
     let hf_addr = head_fwd.as_ptr() as usize;
     let hr_addr = head_rev.as_ptr() as usize;
+    let oflow_ref = &overflow_map;
 
     std::thread::scope(|scope| {
         for _ in 0..q_threads {
@@ -404,7 +386,7 @@ fn main() {
                 let mut dist = vec![
                     DistPair {
                         fwd: u64::MAX,
-                        rev: u64::MAX
+                        rev: u64::MAX,
                     };
                     n as usize
                 ];
@@ -413,8 +395,8 @@ fn main() {
                 let mut heap_b = MinHeap4::with_capacity(16384);
 
                 let d_ptr = dist.as_mut_ptr();
-                let ef_ptr = ef_addr as *const Edge;
-                let er_ptr = er_addr as *const Edge;
+                let ef_ptr = ef_addr as *const u32;
+                let er_ptr = er_addr as *const u32;
                 let hf_ptr = hf_addr as *const u32;
                 let hr_ptr = hr_addr as *const u32;
                 let ans_ptr = answers_addr as *mut i64;
@@ -428,7 +410,6 @@ fn main() {
                     let q = q_ref[qi];
                     let s = q.s as usize;
                     let t = q.t as usize;
-
                     if s == t {
                         unsafe {
                             *ans_ptr.add(q.id as usize) = 0;
@@ -471,51 +452,87 @@ fn main() {
                             }
 
                             let is_fwd = heap_f.data.len() <= heap_b.data.len();
-                            let (d, u) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
-                            let u = u as usize;
-                            let pair = d_ptr.add(u);
-                            if d > if is_fwd { (*pair).fwd } else { (*pair).rev } {
-                                continue;
-                            }
-
-                            let (h_ptr, e_ptr) = if is_fwd {
-                                (hf_ptr, ef_ptr)
-                            } else {
-                                (hr_ptr, er_ptr)
-                            };
-                            let e_start = *h_ptr.add(u) as usize;
-                            let e_end = *h_ptr.add(u + 1) as usize;
-                            for e in e_start..e_end {
-                                let edge = *e_ptr.add(e);
-                                let v = edge.to as usize;
-                                let nd = d + edge.w as u64;
-                                if nd >= mu {
+                            if is_fwd {
+                                let (d, u) = heap_f.pop();
+                                let u = u as usize;
+                                let pair = d_ptr.add(u);
+                                if (*pair).fwd == u64::MAX || d > (*pair).fwd {
                                     continue;
                                 }
-
-                                let v_pair = d_ptr.add(v);
-                                let (cur_self, cur_other) = if is_fwd {
-                                    ((*v_pair).fwd, (*v_pair).rev)
-                                } else {
-                                    ((*v_pair).rev, (*v_pair).fwd)
-                                };
-
-                                if nd < cur_self {
-                                    if cur_self == u64::MAX && cur_other == u64::MAX {
-                                        dirty.push(v as u32);
+                                let e_start = *hf_ptr.add(u) as usize;
+                                let e_end = *hf_ptr.add(u + 1) as usize;
+                                for e in e_start..e_end {
+                                    let packed_edge = *ef_ptr.add(e);
+                                    let v = (packed_edge & V_MASK) as usize;
+                                    let mut w = (packed_edge >> V_BITS) as u64;
+                                    if w == W_SENTINEL as u64 {
+                                        let key = e as u32;
+                                        if let Ok(pos) =
+                                            oflow_ref.binary_search_by_key(&key, |&(k, _)| k)
+                                        {
+                                            w = oflow_ref[pos].1 as u64;
+                                        }
                                     }
-                                    if is_fwd {
+                                    let nd = d + w;
+                                    if nd >= mu {
+                                        continue;
+                                    }
+                                    let v_pair = d_ptr.add(v);
+                                    let cur_fwd = (*v_pair).fwd;
+                                    if nd < cur_fwd {
+                                        let cur_rev = (*v_pair).rev;
+                                        if cur_fwd == u64::MAX && cur_rev == u64::MAX {
+                                            dirty.push(v as u32);
+                                        }
                                         (*v_pair).fwd = nd;
-                                        heap_f.push((nd << V_BITS) | (v as u64));
-                                    } else {
-                                        (*v_pair).rev = nd;
-                                        heap_b.push((nd << V_BITS) | (v as u64));
+                                        heap_f.push((nd << HEAP_V_BITS) | (v as u64));
+                                        if cur_rev != u64::MAX {
+                                            let cand = nd + cur_rev;
+                                            if cand < mu {
+                                                mu = cand;
+                                            }
+                                        }
                                     }
-
-                                    if cur_other != u64::MAX {
-                                        let cand = nd + cur_other;
-                                        if cand < mu {
-                                            mu = cand;
+                                }
+                            } else {
+                                let (d, u) = heap_b.pop();
+                                let u = u as usize;
+                                let pair = d_ptr.add(u);
+                                if (*pair).rev == u64::MAX || d > (*pair).rev {
+                                    continue;
+                                }
+                                let e_start = *hr_ptr.add(u) as usize;
+                                let e_end = *hr_ptr.add(u + 1) as usize;
+                                for e in e_start..e_end {
+                                    let packed_edge = *er_ptr.add(e);
+                                    let v = (packed_edge & V_MASK) as usize;
+                                    let mut w = (packed_edge >> V_BITS) as u64;
+                                    if w == W_SENTINEL as u64 {
+                                        let key = (1u32 << 31) | (e as u32);
+                                        if let Ok(pos) =
+                                            oflow_ref.binary_search_by_key(&key, |&(k, _)| k)
+                                        {
+                                            w = oflow_ref[pos].1 as u64;
+                                        }
+                                    }
+                                    let nd = d + w;
+                                    if nd >= mu {
+                                        continue;
+                                    }
+                                    let v_pair = d_ptr.add(v);
+                                    let cur_rev = (*v_pair).rev;
+                                    if nd < cur_rev {
+                                        let cur_fwd = (*v_pair).fwd;
+                                        if cur_rev == u64::MAX && cur_fwd == u64::MAX {
+                                            dirty.push(v as u32);
+                                        }
+                                        (*v_pair).rev = nd;
+                                        heap_b.push((nd << HEAP_V_BITS) | (v as u64));
+                                        if cur_fwd != u64::MAX {
+                                            let cand = nd + cur_fwd;
+                                            if cand < mu {
+                                                mu = cand;
+                                            }
                                         }
                                     }
                                 }
