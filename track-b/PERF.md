@@ -16,7 +16,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | 128KB thread stacks, in-place c_off cursor (delete all_scratch), scoped L2 seen arrays, unrolled token reader | run-1e7feec2852c | 0.563 | 52.3 | 59.12 |
 | 10 | 6 P-core physical indexing (cut c_off 50%), 16B packed TInfo, 100% stack seen arrays, 12-thread parallel queries | run-aef8179f86fb | 0.636 | 48.6 | 58.03 |
 | 11 | Full 12-thread indexing & queries, madvise unmapping of VTAB+BLOOM, 8B Query + q_terms, u16 bs_idx, 64KB query stacks, malloc_trim under 50x cap | run-81d218f06437 | 0.497 | 53.2 | 60.11 |
-| 12 | Persistent 12-thread scope across all phases with atomic barriers, 256-bit AVX2 SIMD boolean vectorization & fast phrase scan | local-step12 | 0.450 | 52.8 | 62.50 |
+| 12 | Persistent 12-thread scope across all phases with atomic barriers, 256-bit AVX2 SIMD boolean vectorization & fast phrase scan | run-3f3d90daa14b | 0.446 | 55.9 | 60.35 |
+| 13 | AVX2 document token lexer & persistent thread scope | run-3a3873323e2c | 0.431 | 56.6 | 60.33 |
+| 14 | 128KB L2 Bloom filter, direct sparse BOOL posting intersection, 256-bit AVX2 zero-skipping, and sub-43.99MB memory configuration | local-step14 | 0.380 | 43.5 | 67.50 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to multi-threaded C++20 using `mmap` zero-copy I/O and standard positional posting lists. Cut runtime by 4.7x ($T: 56.35\text{s} \to 12.00\text{s}$) and memory by 11.5x ($M: 2,200\text{MB} \to 190\text{MB}$).
