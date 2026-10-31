@@ -405,19 +405,25 @@ unsafe fn free_mmap<T>(p: *mut T, count: usize) {
 }
 
 #[inline(always)]
+unsafe fn get_arena_slot(acc: &mut QueryAcc, top_arena: &mut Vec<u32>) -> usize {
+    let cur = (acc.head_len & 0xFF) as usize;
+    if cur == 0 {
+        let sl = (top_arena.len() / 10) as u32;
+        top_arena.extend_from_slice(&[0u32; 10]);
+        acc.head_len = sl << 8;
+        sl as usize
+    } else {
+        (acc.head_len >> 8) as usize
+    }
+}
+
+#[inline(always)]
 unsafe fn record_match(acc: &mut QueryAcc, top_arena: &mut Vec<u32>, global_id: u32) {
     acc.cnt += 1;
     acc.sum += global_id as u64;
     let cur_len = (acc.head_len & 0xFF) as usize;
     if cur_len < 10 {
-        let slot = if cur_len == 0 {
-            let sl = (top_arena.len() / 10) as u32;
-            top_arena.extend_from_slice(&[0u32; 10]);
-            acc.head_len = sl << 8;
-            sl as usize
-        } else {
-            (acc.head_len >> 8) as usize
-        };
+        let slot = get_arena_slot(acc, top_arena);
         *top_arena.get_unchecked_mut(slot * 10 + cur_len) = global_id;
         acc.head_len += 1;
     }
@@ -438,14 +444,7 @@ unsafe fn record_batch(acc: &mut QueryAcc, top_arena: &mut Vec<u32>, doc_s: u32,
     let cur_len = (acc.head_len & 0xFF) as usize;
     let need = (10 - cur_len).min(clen);
     if need > 0 {
-        let slot = if cur_len == 0 {
-            let sl = (top_arena.len() / 10) as u32;
-            top_arena.extend_from_slice(&[0u32; 10]);
-            acc.head_len = sl << 8;
-            sl as usize
-        } else {
-            (acc.head_len >> 8) as usize
-        };
+        let slot = get_arena_slot(acc, top_arena);
         let head = slot * 10 + cur_len;
         for i in 0..need {
             *top_arena.get_unchecked_mut(head + i) = doc_s + *clist.get_unchecked(i) as u32;
@@ -476,14 +475,7 @@ unsafe fn record_bits(acc: &mut QueryAcc, top_arena: &mut Vec<u32>, doc_s: u32, 
             acc.sum += bit as u64;
             let cur_len = (acc.head_len & 0xFF) as usize;
             if cur_len < 10 {
-                let slot = if cur_len == 0 {
-                    let sl = (top_arena.len() / 10) as u32;
-                    top_arena.extend_from_slice(&[0u32; 10]);
-                    acc.head_len = sl << 8;
-                    sl as usize
-                } else {
-                    (acc.head_len >> 8) as usize
-                };
+                let slot = get_arena_slot(acc, top_arena);
                 *top_arena.get_unchecked_mut(slot * 10 + cur_len) = base_id + bit;
                 acc.head_len += 1;
             }
@@ -523,6 +515,30 @@ unsafe fn intersect_and(
         }
         let end = *cur_pos.get_unchecked(t) as usize;
         let o_post = std::slice::from_raw_parts(chunk_postings.add(end - cnt), cnt);
+        if cnt >= 16 * clen && clen > 0 {
+            let mut w = 0usize;
+            let mut j = 0usize;
+            for idx in 0..clen {
+                let v1 = *cand.get_unchecked(idx);
+                let (mut lo, mut hi) = (j, cnt);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if *o_post.get_unchecked(mid) < v1 {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo < cnt && *o_post.get_unchecked(lo) == v1 {
+                    *cand.get_unchecked_mut(w) = v1;
+                    w += 1;
+                    j = lo + 1;
+                } else {
+                    j = lo;
+                }
+            }
+            return w;
+        }
         let mut w = 0usize;
         let (mut i, mut j) = (0usize, 0usize);
         while i < clen && j < cnt {
@@ -871,36 +887,23 @@ unsafe fn exec_phrase_chunk(
                 if (raw & mask) != pw0[j] {
                     return false;
                 }
-            } else if l <= 16 {
-                if tp + 16 > d_len {
-                    return false;
-                }
-                let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
-                if raw0 != pw0[j] {
-                    return false;
-                }
-                let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
-                let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
-                if (raw1 & mask1) != pw1[j] {
-                    return false;
-                }
             } else {
                 if tp + 16 > d_len {
                     return false;
                 }
                 let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
-                if raw0 != pw0[j] {
-                    return false;
-                }
                 let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
-                if raw1 != pw1[j] {
+                let mask1 = if l <= 16 { if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 } } else { u64::MAX };
+                if raw0 != pw0[j] || (raw1 & mask1) != pw1[j] {
                     return false;
                 }
-                let q_tail = &q_buf[poff[j] + 16..poff[j] + l];
-                let d_tail = std::slice::from_raw_parts(d_ptr.add(tp + 16), l - 16);
-                for t_idx in 0..l - 16 {
-                    if (d_tail[t_idx] | 0x20) != q_tail[t_idx] {
-                        return false;
+                if l > 16 {
+                    let q_tail = &q_buf[poff[j] + 16..poff[j] + l];
+                    let d_tail = std::slice::from_raw_parts(d_ptr.add(tp + 16), l - 16);
+                    for t_idx in 0..l - 16 {
+                        if (d_tail[t_idx] | 0x20) != q_tail[t_idx] {
+                            return false;
+                        }
                     }
                 }
             }
