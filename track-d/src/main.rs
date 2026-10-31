@@ -1,9 +1,14 @@
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
 const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
@@ -42,45 +47,79 @@ impl FastDistMap {
                 let slot = base.add(idx);
                 if (*slot).epoch != ep || (*slot).v == v {
                     *slot = Slot { v, fwd, rev, epoch: ep };
-                    self.used += 1;
-                    break;
+                    self.used += 1; break;
                 }
                 idx = (idx + 1) & H_MSK;
             }
         }
     }
     #[inline(always)]
-    unsafe fn get_dist(&self, v: u32, is_fwd: bool) -> u32 {
+    unsafe fn get_fwd_dist(&self, v: u32) -> u32 {
         let ep = self.epoch;
         let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
         let base = self.slots.as_ptr();
         loop {
             let slot = base.add(idx);
             if (*slot).epoch != ep { return INF32; }
-            if (*slot).v == v { return if is_fwd { (*slot).fwd } else { (*slot).rev }; }
+            if (*slot).v == v { return (*slot).fwd; }
             idx = (idx + 1) & H_MSK;
         }
     }
     #[inline(always)]
-    unsafe fn relax(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32, is_fwd: bool) {
+    unsafe fn get_rev_dist(&self, v: u32) -> u32 {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep { return INF32; }
+            if (*slot).v == v { return (*slot).rev; }
+            idx = (idx + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn prefetch_slot(&self, v: u32) {
+        let idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        _mm_prefetch(self.slots.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+    }
+    #[inline(always)]
+    unsafe fn relax_fwd(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
         let ep = self.epoch;
         let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
         let base = self.slots.as_mut_ptr();
         loop {
             let slot = base.add(idx);
             if (*slot).epoch != ep {
-                let (fwd, rev) = if is_fwd { (nd, INF32) } else { (INF32, nd) };
-                *slot = Slot { v, fwd, rev, epoch: ep };
-                self.used += 1;
-                heap.push(nd, v);
-                return;
+                *slot = Slot { v, fwd: nd, rev: INF32, epoch: ep };
+                self.used += 1; heap.push(nd, v); return;
             }
             if (*slot).v == v {
-                let (cur_d, opp_d) = if is_fwd { (&mut (*slot).fwd, (*slot).rev) } else { (&mut (*slot).rev, (*slot).fwd) };
-                if nd < *cur_d {
-                    *cur_d = nd;
-                    heap.push(nd, v);
-                    if opp_d != INF32 { *mu = (*mu).min(nd.saturating_add(opp_d)); }
+                if nd < (*slot).fwd {
+                    (*slot).fwd = nd; heap.push(nd, v);
+                    let cr = (*slot).rev;
+                    if cr != INF32 { *mu = (*mu).min(nd.saturating_add(cr)); }
+                }
+                return;
+            }
+            idx = (idx + 1) & H_MSK;
+        }
+    }
+    #[inline(always)]
+    unsafe fn relax_rev(&mut self, v: u32, nd: u32, heap: &mut MinHeap4, mu: &mut u32) {
+        let ep = self.epoch;
+        let mut idx = (v.wrapping_mul(0x9E3779B9) as usize) & H_MSK;
+        let base = self.slots.as_mut_ptr();
+        loop {
+            let slot = base.add(idx);
+            if (*slot).epoch != ep {
+                *slot = Slot { v, fwd: INF32, rev: nd, epoch: ep };
+                self.used += 1; heap.push(nd, v); return;
+            }
+            if (*slot).v == v {
+                if nd < (*slot).rev {
+                    (*slot).rev = nd; heap.push(nd, v);
+                    let cf = (*slot).fwd;
+                    if cf != INF32 { *mu = (*mu).min(nd.saturating_add(cf)); }
                 }
                 return;
             }
@@ -101,15 +140,15 @@ impl MinHeap4 {
     fn push(&mut self, d: u32, v: u32) {
         let packed = ((d as u64) << 32) | (v as u64);
         let mut i = self.data.len();
-        self.data.push(packed);
         unsafe {
+            if i >= self.data.capacity() { self.data.reserve(32768); }
+            self.data.set_len(i + 1);
             let slice = self.data.as_mut_ptr();
             while i > 0 {
                 let p = (i - 1) >> 2;
                 let parent = *slice.add(p);
                 if packed >= parent { break; }
-                *slice.add(i) = parent;
-                i = p;
+                *slice.add(i) = parent; i = p;
             }
             *slice.add(i) = packed;
         }
@@ -130,8 +169,7 @@ impl MinHeap4 {
                     let ec = (c + 4).min(sz);
                     for k in c + 1..ec { if *slice.add(k) < *slice.add(mc) { mc = k; } }
                     if *slice.add(mc) >= last { break; }
-                    *slice.add(i) = *slice.add(mc);
-                    i = mc;
+                    *slice.add(i) = *slice.add(mc); i = mc;
                 }
                 *slice.add(i) = last;
             }
@@ -187,6 +225,7 @@ fn solve_query_64(s: usize, t: usize, hf: *const u32, hr: *const u32, ef: *const
 }
 
 fn main() {
+    let t_total = Instant::now();
     let (data_dir, out_dir) = {
         let args: Vec<String> = std::env::args().collect();
         let (mut d, mut o) = ("/data".to_string(), "/out".to_string());
@@ -220,7 +259,7 @@ fn main() {
     let mut g_end = tail_start + t_read;
     while g_end > tail_start && tail_buf[g_end - tail_start - 1] < b'0' { g_end -= 1; }
 
-    let nt = 6;
+    let nt = 12;
     let edge_bytes = g_end - edge_start_offset;
     let mut chunk_bounds = vec![g_end; nt + 1];
     chunk_bounds[0] = edge_start_offset;
@@ -233,13 +272,13 @@ fn main() {
         chunk_bounds[t] = off.min(g_end);
     }
 
-    let mut thread_fwd_degs = vec![vec![0u8; (n + 1) as usize]; nt];
-    let mut thread_rev_degs = vec![vec![0u8; (n + 1) as usize]; nt];
+    let head_fwd: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; (n + 1) as usize]) };
+    let head_rev: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; (n + 1) as usize]) };
 
     std::thread::scope(|scope| {
-        for (t, (fwd_deg, rev_deg)) in thread_fwd_degs.iter_mut().zip(thread_rev_degs.iter_mut()).enumerate() {
+        for t in 0..nt {
             let (start, finish) = (chunk_bounds[t], chunk_bounds[t + 1]);
-            let gf_ref = &gf;
+            let (hf, hr, gf_ref) = (&head_fwd, &head_rev, &gf);
             scope.spawn(move || {
                 let mut buf = vec![0u8; STREAM_BUF_SIZE + 64];
                 let (mut file_off, mut leftover) = (start, 0usize);
@@ -261,8 +300,8 @@ fn main() {
                             while *cur != b'\n' { cur = cur.add(1); }
                             cur = cur.add(1);
                             if u != v {
-                                *fwd_deg.get_unchecked_mut(u as usize) += 1;
-                                *rev_deg.get_unchecked_mut(v as usize) += 1;
+                                hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed);
+                                hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -273,37 +312,20 @@ fn main() {
         }
     });
 
-    let mut head_fwd = vec![0u32; (n + 2) as usize];
-    let mut head_rev = vec![0u32; (n + 2) as usize];
-    let mut acc_f = 0u32;
-    let mut acc_r = 0u32;
-    for u in 0..=(n as usize) {
-        head_fwd[u] = acc_f; head_rev[u] = acc_r;
-        for t in 0..nt {
-            let df = thread_fwd_degs[t][u] as u32;
-            thread_fwd_degs[t][u] = (acc_f - head_fwd[u]) as u8;
-            acc_f += df;
+    let mut accum_fwd = 0u32;
+    for a in &head_fwd { let d = a.load(Ordering::Relaxed); a.store(accum_fwd, Ordering::Relaxed); accum_fwd += d; }
+    let mut accum_rev = 0u32;
+    for a in &head_rev { let d = a.load(Ordering::Relaxed); a.store(accum_rev, Ordering::Relaxed); accum_rev += d; }
 
-            let dr = thread_rev_degs[t][u] as u32;
-            thread_rev_degs[t][u] = (acc_r - head_rev[u]) as u8;
-            acc_r += dr;
-        }
-    }
-    head_fwd[(n + 1) as usize] = acc_f;
-    head_rev[(n + 1) as usize] = acc_r;
-
-    let mut edges_fwd = vec![0u32; acc_f as usize];
-    let mut edges_rev = vec![0u32; acc_r as usize];
+    let mut edges_fwd = vec![0u32; accum_fwd as usize];
+    let mut edges_rev = vec![0u32; accum_rev as usize];
     let (ef_addr, er_addr) = (edges_fwd.as_mut_ptr() as usize, edges_rev.as_mut_ptr() as usize);
-
-    let hf_slice = &head_fwd;
-    let hr_slice = &head_rev;
 
     let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
         let mut handlers = Vec::with_capacity(nt);
-        for (t, (mut fwd_off, mut rev_off)) in thread_fwd_degs.into_iter().zip(thread_rev_degs.into_iter()).enumerate() {
+        for t in 0..nt {
             let (start, finish) = (chunk_bounds[t], chunk_bounds[t + 1]);
-            let gf_ref = &gf;
+            let (hf, hr, gf_ref) = (&head_fwd, &head_rev, &gf);
             handlers.push(scope.spawn(move || {
                 let mut local_overflow = Vec::new();
                 let mut buf = vec![0u8; STREAM_BUF_SIZE + 64];
@@ -329,16 +351,10 @@ fn main() {
                             cur = cur.add(1);
                             if u != v {
                                 let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
-                                let off_u = *fwd_off.get_unchecked(u as usize);
-                                *fwd_off.get_unchecked_mut(u as usize) += 1;
-                                let idx_f = (*hf_slice.get_unchecked(u as usize) + off_u as u32) as usize;
+                                let idx_f = hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed) as usize;
                                 *ef_ptr.add(idx_f) = (pw << V_BITS) | (v & V_MASK);
-
-                                let off_v = *rev_off.get_unchecked(v as usize);
-                                *rev_off.get_unchecked_mut(v as usize) += 1;
-                                let idx_r = (*hr_slice.get_unchecked(v as usize) + off_v as u32) as usize;
+                                let idx_r = hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed) as usize;
                                 *er_ptr.add(idx_r) = (pw << V_BITS) | (u & V_MASK);
-
                                 if pw == W_SENTINEL {
                                     local_overflow.push((idx_f as u32, w));
                                     local_overflow.push(((1u32 << 31) | (idx_r as u32), w));
@@ -361,6 +377,11 @@ fn main() {
     let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
     overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
 
+    let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
+    let mut head_rev: Vec<u32> = unsafe { std::mem::transmute(head_rev) };
+    if n > 0 { head_fwd.copy_within(0..n as usize, 1); head_rev.copy_within(0..n as usize, 1); }
+    head_fwd[0] = 0; head_rev[0] = 0;
+
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries.txt");
     let mut queries = Vec::with_capacity(4096);
     let mut qp = q_bytes.as_ptr();
@@ -380,9 +401,10 @@ fn main() {
 
     let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
-    let q_threads = 6.min(queries.len());
+    let q_threads = nt.min(12).min(queries.len());
     let next_query = AtomicUsize::new(0);
 
+    let t_queries = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..q_threads {
             let next_ref = &next_query;
@@ -426,31 +448,52 @@ fn main() {
                             if mu != INF32 && heap_f.min_key().saturating_add(heap_b.min_key()) >= mu { break; }
                             if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
 
-                            let is_fwd = heap_f.data.len() <= heap_b.data.len();
-                            let (heap_cur, h_ptr, e_ptr) = if is_fwd {
-                                (&mut heap_f, hf_ptr, ef_ptr)
-                            } else {
-                                (&mut heap_b, hr_ptr, er_ptr)
-                            };
-
-                            let (d, u) = heap_cur.pop();
-                            if d >= mu { break; }
-                            if d > dist_map.get_dist(u, is_fwd) { continue; }
-                            let (e_start, e_end) = (*h_ptr.add(u as usize) as usize, *h_ptr.add(u as usize + 1) as usize);
-                            for e in e_start..e_end {
-                                let packed = *e_ptr.add(e);
-                                let v = packed & V_MASK;
-                                let mut w = packed >> V_BITS;
-                                if has_overflow && w == W_SENTINEL {
-                                    touched_overflow = true;
-                                    let key = if is_fwd { e as u32 } else { (1u32 << 31) | (e as u32) };
-                                    if let Ok(pos) = oflow_ref.binary_search_by_key(&key, |&(k, _)| k) {
-                                        w = oflow_ref.get_unchecked(pos).1;
+                            if heap_f.data.len() <= heap_b.data.len() {
+                                let (d, u) = heap_f.pop();
+                                if d >= mu { break; }
+                                if d > dist_map.get_fwd_dist(u) { continue; }
+                                let (e_start, e_end) = (*hf_ptr.add(u as usize) as usize, *hf_ptr.add(u as usize + 1) as usize);
+                                for e in e_start..e_end {
+                                    let packed = *ef_ptr.add(e);
+                                    let v = packed & V_MASK;
+                                    let mut w = packed >> V_BITS;
+                                    if e + 1 < e_end {
+                                        let next_v = *ef_ptr.add(e + 1) & V_MASK;
+                                        dist_map.prefetch_slot(next_v);
                                     }
+                                    if has_overflow && w == W_SENTINEL {
+                                        touched_overflow = true;
+                                        if let Ok(pos) = oflow_ref.binary_search_by_key(&(e as u32), |&(k, _)| k) {
+                                            w = oflow_ref.get_unchecked(pos).1;
+                                        }
+                                    }
+                                    let nd = d.saturating_add(w);
+                                    if nd >= mu { continue; }
+                                    dist_map.relax_fwd(v, nd, &mut heap_f, &mut mu);
                                 }
-                                let nd = d.saturating_add(w);
-                                if nd >= mu { continue; }
-                                dist_map.relax(v, nd, heap_cur, &mut mu, is_fwd);
+                            } else {
+                                let (d, u) = heap_b.pop();
+                                if d >= mu { break; }
+                                if d > dist_map.get_rev_dist(u) { continue; }
+                                let (e_start, e_end) = (*hr_ptr.add(u as usize) as usize, *hr_ptr.add(u as usize + 1) as usize);
+                                for e in e_start..e_end {
+                                    let packed = *er_ptr.add(e);
+                                    let v = packed & V_MASK;
+                                    let mut w = packed >> V_BITS;
+                                    if e + 1 < e_end {
+                                        let next_v = *er_ptr.add(e + 1) & V_MASK;
+                                        dist_map.prefetch_slot(next_v);
+                                    }
+                                    if has_overflow && w == W_SENTINEL {
+                                        touched_overflow = true;
+                                        if let Ok(pos) = oflow_ref.binary_search_by_key(&((1u32 << 31) | (e as u32)), |&(k, _)| k) {
+                                            w = oflow_ref.get_unchecked(pos).1;
+                                        }
+                                    }
+                                    let nd = d.saturating_add(w);
+                                    if nd >= mu { continue; }
+                                    dist_map.relax_rev(v, nd, &mut heap_b, &mut mu);
+                                }
                             }
                         }
 
@@ -464,6 +507,9 @@ fn main() {
             });
         }
     });
+
+    println!("Queries (with prefetch + fast push): {:?}", t_queries.elapsed());
+    println!("Total Execution: {:?}", t_total.elapsed());
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut f = File::create(format!("{}/distances.txt", out_dir)).expect("distances.txt");
