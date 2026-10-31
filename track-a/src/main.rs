@@ -45,41 +45,23 @@ static N_HR: AtomicU32 = AtomicU32::new(0);
 static N_EP: AtomicU32 = AtomicU32::new(0);
 static N_BLKS: AtomicU32 = AtomicU32::new(0);
 
-struct SharedData {
-    hr_ptr: [*const u8; 144],
-    ep_ptr: [*const u8; 2048],
-    hr_id: [u8; 256],
-    ep_len: [u8; 2048],
-    ord_h: [u8; 144],
-    ep_id: [u16; 8192],
-    ord_e: [u16; 2048],
-    blk_fill: [u16; NUM_BLKS],
-    blk_next: [i32; NUM_BLKS],
-    pool: [Rec; NUM_BLKS * BLK_SZ],
-    ts: [ThreadState; 12],
-    t_out_len: [usize; 12],
-    t_out: [[u8; 360000]; 12],
-}
-
-static mut S: SharedData = SharedData {
-    hr_ptr: [std::ptr::null(); 144],
-    ep_ptr: [std::ptr::null(); 2048],
-    hr_id: [0; 256],
-    ep_len: [0; 2048],
-    ord_h: [0; 144],
-    ep_id: [0; 8192],
-    ord_e: [0; 2048],
-    blk_fill: [0; NUM_BLKS],
-    blk_next: [0; NUM_BLKS],
-    pool: [Rec { lat: 0, eid: 0 }; NUM_BLKS * BLK_SZ],
-    ts: [ThreadState {
-        head_blk: [0; 144],
-        cur_blk: [0; 144],
-        cur_fill: [0; 144],
-    }; 12],
-    t_out_len: [0; 12],
-    t_out: [[0; 360000]; 12],
-};
+static mut HR_PTR: [usize; 144] = [0; 144];
+static mut EP_PTR: [usize; 2048] = [0; 2048];
+static mut HR_ID: [u8; 256] = [0; 256];
+static mut EP_LEN: [u8; 2048] = [0; 2048];
+static mut ORD_H: [u8; 144] = [0; 144];
+static mut EP_ID: [u16; 8192] = [0; 8192];
+static mut ORD_E: [u16; 2048] = [0; 2048];
+static mut BLK_FILL: [u16; NUM_BLKS] = [0; NUM_BLKS];
+static mut BLK_NEXT: [i32; NUM_BLKS] = [0; NUM_BLKS];
+static mut POOL: [Rec; NUM_BLKS * BLK_SZ] = [Rec { lat: 0, eid: 0 }; NUM_BLKS * BLK_SZ];
+static mut TS: [ThreadState; 12] = [ThreadState {
+    head_blk: [0; 144],
+    cur_blk: [0; 144],
+    cur_fill: [0; 144],
+}; 12];
+static mut T_OUT_LEN: [usize; 12] = [0; 12];
+static mut T_OUT: [[u8; 360000]; 12] = [[0; 360000]; 12];
 
 #[inline(always)]
 unsafe fn atomic_load_u64(p: *const u64, ord: Ordering) -> u64 {
@@ -119,7 +101,7 @@ unsafe fn fmt_u32(mut p: *mut u8, mut v: u32) -> *mut u8 {
 }
 
 #[inline(always)]
-unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
+unsafe fn get_hid(p: *const u8) -> u8 {
     let k1 = (p as *const u64).read_unaligned();
     let k2 = (p.add(5) as *const u64).read_unaligned();
     let mut h = _mm_crc32_u64(k1, k2);
@@ -131,17 +113,16 @@ unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
         let p_key = HR_KEY.as_ptr().add(s);
         let k = atomic_load_u64(p_key, Ordering::Acquire);
         if k == h {
-            let hid = (*sd).hr_id[s];
-            if std::slice::from_raw_parts((*sd).hr_ptr[hid as usize], 13)
-                == std::slice::from_raw_parts(p, 13)
-            {
+            let hid = HR_ID[s];
+            let hp = HR_PTR[hid as usize] as *const u8;
+            if std::slice::from_raw_parts(hp, 13) == std::slice::from_raw_parts(p, 13) {
                 return hid;
             }
         }
         if k == 0 && atomic_cas_u64(p_key, 0, 1).is_ok() {
             let id = N_HR.fetch_add(1, Ordering::Relaxed) as u8;
-            (*sd).hr_ptr[id as usize] = p;
-            (*sd).hr_id[s] = id;
+            HR_PTR[id as usize] = p as usize;
+            HR_ID[s] = id;
             atomic_store_u64(p_key, h, Ordering::Release);
             return id;
         }
@@ -149,10 +130,9 @@ unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
             _mm_pause();
         }
         if atomic_load_u64(p_key, Ordering::Acquire) == h {
-            let hid = (*sd).hr_id[s];
-            if std::slice::from_raw_parts((*sd).hr_ptr[hid as usize], 13)
-                == std::slice::from_raw_parts(p, 13)
-            {
+            let hid = HR_ID[s];
+            let hp = HR_PTR[hid as usize] as *const u8;
+            if std::slice::from_raw_parts(hp, 13) == std::slice::from_raw_parts(p, 13) {
                 return hid;
             }
         }
@@ -161,7 +141,7 @@ unsafe fn get_hid(p: *const u8, sd: *mut SharedData) -> u8 {
 }
 
 #[inline(always)]
-unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
+unsafe fn get_eid(ep: *const u8, len: u8) -> u16 {
     let mut h = (len as u64) + 1;
     let mut k = 0usize;
     while k + 8 <= len as usize {
@@ -179,9 +159,10 @@ unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
         let p_key = EP_KEY.as_ptr().add(s);
         let key = atomic_load_u64(p_key, Ordering::Acquire);
         if key == h {
-            let eid = (*sd).ep_id[s];
-            if (*sd).ep_len[eid as usize] == len
-                && std::slice::from_raw_parts((*sd).ep_ptr[eid as usize], len as usize)
+            let eid = EP_ID[s];
+            let ep_ptr = EP_PTR[eid as usize] as *const u8;
+            if EP_LEN[eid as usize] == len
+                && std::slice::from_raw_parts(ep_ptr, len as usize)
                     == std::slice::from_raw_parts(ep, len as usize)
             {
                 return eid;
@@ -189,9 +170,9 @@ unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
         }
         if key == 0 && atomic_cas_u64(p_key, 0, 1).is_ok() {
             let id = N_EP.fetch_add(1, Ordering::Relaxed) as u16;
-            (*sd).ep_ptr[id as usize] = ep;
-            (*sd).ep_len[id as usize] = len;
-            (*sd).ep_id[s] = id;
+            EP_PTR[id as usize] = ep as usize;
+            EP_LEN[id as usize] = len;
+            EP_ID[s] = id;
             atomic_store_u64(p_key, h, Ordering::Release);
             return id;
         }
@@ -199,9 +180,10 @@ unsafe fn get_eid(ep: *const u8, len: u8, sd: *mut SharedData) -> u16 {
             _mm_pause();
         }
         if atomic_load_u64(p_key, Ordering::Acquire) == h {
-            let eid = (*sd).ep_id[s];
-            if (*sd).ep_len[eid as usize] == len
-                && std::slice::from_raw_parts((*sd).ep_ptr[eid as usize], len as usize)
+            let eid = EP_ID[s];
+            let ep_ptr = EP_PTR[eid as usize] as *const u8;
+            if EP_LEN[eid as usize] == len
+                && std::slice::from_raw_parts(ep_ptr, len as usize)
                     == std::slice::from_raw_parts(ep, len as usize)
             {
                 return eid;
@@ -253,7 +235,6 @@ fn main() {
 
         let bar = Barrier::new(12);
         let base_addr = base as usize;
-        let sd = std::ptr::addr_of_mut!(S);
 
         std::thread::scope(|scope| {
             for tid in 0..12 {
@@ -269,7 +250,7 @@ fn main() {
                         e += 1;
                     }
 
-                    let my = &mut (*sd).ts[tid];
+                    let my = &mut TS[tid];
                     my.head_blk.fill(-1);
                     my.cur_blk.fill(-1);
                     my.cur_fill.fill(0);
@@ -306,9 +287,9 @@ fn main() {
                                 != std::slice::from_raw_parts(last_hr, 13)
                         {
                             last_hr = p;
-                            hid = get_hid(p, sd);
+                            hid = get_hid(p);
                         }
-                        let eid = get_eid(ep, elen as u8, sd);
+                        let eid = get_eid(ep, elen as u8);
                         if *cur.sub(3) == b'5' {
                             let p_err = G_ERR.as_ptr().add((hid as usize) * 2048 + (eid as usize));
                             atomic_add_u32(p_err, 1, Ordering::Relaxed);
@@ -318,20 +299,20 @@ fn main() {
                         let mut f = my.cur_fill[hid as usize] as usize;
                         if b < 0 || f == BLK_SZ {
                             if b >= 0 {
-                                (*sd).blk_fill[b as usize] = BLK_SZ as u16;
+                                BLK_FILL[b as usize] = BLK_SZ as u16;
                             }
                             let nb = N_BLKS.fetch_add(1, Ordering::Relaxed) as i32;
-                            (*sd).blk_next[nb as usize] = -1;
+                            BLK_NEXT[nb as usize] = -1;
                             if b < 0 {
                                 my.head_blk[hid as usize] = nb;
                             } else {
-                                (*sd).blk_next[b as usize] = nb;
+                                BLK_NEXT[b as usize] = nb;
                             }
                             my.cur_blk[hid as usize] = nb;
                             b = nb;
                             f = 0;
                         }
-                        (*sd).pool[(b as usize) * BLK_SZ + f] = Rec { lat, eid };
+                        POOL[(b as usize) * BLK_SZ + f] = Rec { lat, eid };
                         my.cur_fill[hid as usize] = (f + 1) as u16;
 
                         p = nl.add(1);
@@ -339,7 +320,7 @@ fn main() {
 
                     for h in 0..144 {
                         if my.cur_blk[h] >= 0 {
-                            (*sd).blk_fill[my.cur_blk[h] as usize] = my.cur_fill[h];
+                            BLK_FILL[my.cur_blk[h] as usize] = my.cur_fill[h];
                         }
                     }
 
@@ -349,24 +330,24 @@ fn main() {
                         let nh = N_HR.load(Ordering::Relaxed) as usize;
                         let ne = N_EP.load(Ordering::Relaxed) as usize;
                         for i in 0..nh {
-                            (*sd).ord_h[i] = i as u8;
+                            ORD_H[i] = i as u8;
                         }
                         for i in 0..ne {
-                            (*sd).ord_e[i] = i as u16;
+                            ORD_E[i] = i as u16;
                         }
-                        (*sd).ord_h[..nh].sort_unstable_by(|&a, &b| {
-                            let sa = std::slice::from_raw_parts((*sd).hr_ptr[a as usize], 13);
-                            let sb = std::slice::from_raw_parts((*sd).hr_ptr[b as usize], 13);
+                        ORD_H[..nh].sort_unstable_by(|&a, &b| {
+                            let sa = std::slice::from_raw_parts(HR_PTR[a as usize] as *const u8, 13);
+                            let sb = std::slice::from_raw_parts(HR_PTR[b as usize] as *const u8, 13);
                             sa.cmp(sb)
                         });
-                        (*sd).ord_e[..ne].sort_unstable_by(|&a, &b| {
+                        ORD_E[..ne].sort_unstable_by(|&a, &b| {
                             let sa = std::slice::from_raw_parts(
-                                (*sd).ep_ptr[a as usize],
-                                (*sd).ep_len[a as usize] as usize,
+                                EP_PTR[a as usize] as *const u8,
+                                EP_LEN[a as usize] as usize,
                             );
                             let sb = std::slice::from_raw_parts(
-                                (*sd).ep_ptr[b as usize],
-                                (*sd).ep_len[b as usize] as usize,
+                                EP_PTR[b as usize] as *const u8,
+                                EP_LEN[b as usize] as usize,
                             );
                             sa.cmp(sb)
                         });
@@ -385,19 +366,19 @@ fn main() {
                         let hi = base_hi + tid;
                         let mut out_len = 0usize;
                         if hi < nh {
-                            let h_id = (*sd).ord_h[hi] as usize;
+                            let h_id = ORD_H[hi] as usize;
                             cnt[..ne].fill(0);
                             let mut tot = 0u32;
                             for t in 0..12 {
-                                let mut b = (*sd).ts[t].head_blk[h_id];
+                                let mut b = TS[t].head_blk[h_id];
                                 while b >= 0 {
-                                    let bf = (*sd).blk_fill[b as usize] as usize;
+                                    let bf = BLK_FILL[b as usize] as usize;
                                     let base_idx = (b as usize) * BLK_SZ;
                                     for i in 0..bf {
-                                        let eid = (*sd).pool[base_idx + i].eid as usize;
+                                        let eid = POOL[base_idx + i].eid as usize;
                                         cnt[eid] += 1;
                                     }
-                                    b = (*sd).blk_next[b as usize];
+                                    b = BLK_NEXT[b as usize];
                                 }
                             }
                             for i in 0..ne {
@@ -407,24 +388,24 @@ fn main() {
                             }
                             lats.resize(tot as usize, 0);
                             for t in 0..12 {
-                                let mut b = (*sd).ts[t].head_blk[h_id];
+                                let mut b = TS[t].head_blk[h_id];
                                 while b >= 0 {
-                                    let bf = (*sd).blk_fill[b as usize] as usize;
+                                    let bf = BLK_FILL[b as usize] as usize;
                                     let base_idx = (b as usize) * BLK_SZ;
                                     for i in 0..bf {
-                                        let r = (*sd).pool[base_idx + i];
+                                        let r = POOL[base_idx + i];
                                         let eid = r.eid as usize;
                                         lats[(off[eid] + cnt[eid]) as usize] = r.lat;
                                         cnt[eid] += 1;
                                     }
-                                    b = (*sd).blk_next[b as usize];
+                                    b = BLK_NEXT[b as usize];
                                 }
                             }
 
-                            let out_base = (*sd).t_out[tid].as_mut_ptr();
+                            let out_base = T_OUT[tid].as_mut_ptr();
                             let mut ptr = out_base;
                             for ei in 0..ne {
-                                let eid = (*sd).ord_e[ei] as usize;
+                                let eid = ORD_E[ei] as usize;
                                 let n = cnt[eid] as usize;
                                 if n == 0 {
                                     continue;
@@ -448,12 +429,14 @@ fn main() {
                                 let err = G_ERR[h_id * 2048 + eid];
                                 let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
 
-                                std::ptr::copy_nonoverlapping((*sd).hr_ptr[h_id], ptr, 13);
+                                let hp = HR_PTR[h_id] as *const u8;
+                                std::ptr::copy_nonoverlapping(hp, ptr, 13);
                                 ptr = ptr.add(13);
                                 std::ptr::copy_nonoverlapping(b":00:00Z ".as_ptr(), ptr, 8);
                                 ptr = ptr.add(8);
-                                let el = (*sd).ep_len[eid] as usize;
-                                std::ptr::copy_nonoverlapping((*sd).ep_ptr[eid], ptr, el);
+                                let el = EP_LEN[eid] as usize;
+                                let ep = EP_PTR[eid] as *const u8;
+                                std::ptr::copy_nonoverlapping(ep, ptr, el);
                                 ptr = ptr.add(el);
                                 *ptr = b' ';
                                 ptr = ptr.add(1);
@@ -474,12 +457,12 @@ fn main() {
                             }
                             out_len = ptr as usize - out_base as usize;
                         }
-                        (*sd).t_out_len[tid] = out_len;
+                        T_OUT_LEN[tid] = out_len;
                         bar_ref.wait();
                         if tid == 0 {
                             for k in 0..12 {
-                                if base_hi + k < nh && (*sd).t_out_len[k] > 0 {
-                                    write_all(out_fd, (*sd).t_out[k].as_ptr(), (*sd).t_out_len[k]);
+                                if base_hi + k < nh && T_OUT_LEN[k] > 0 {
+                                    write_all(out_fd, T_OUT[k].as_ptr(), T_OUT_LEN[k]);
                                 }
                             }
                         }
