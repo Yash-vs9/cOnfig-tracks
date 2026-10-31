@@ -9,9 +9,6 @@ use std::os::unix::io::IntoRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn munmap(a: *mut u8, l: usize) -> i32;
@@ -90,14 +87,9 @@ impl MinHeap4 {
                     let c = (i << 2) + 1;
                     if c >= sz { break; }
                     let mut mc = c;
-                    if c + 4 <= sz {
-                        if *slice.add(c + 1) < *slice.add(mc) { mc = c + 1; }
-                        if *slice.add(c + 2) < *slice.add(mc) { mc = c + 2; }
-                        if *slice.add(c + 3) < *slice.add(mc) { mc = c + 3; }
-                    } else {
-                        for k in c + 1..sz {
-                            if *slice.add(k) < *slice.add(mc) { mc = k; }
-                        }
+                    let ec = (c + 4).min(sz);
+                    for k in c + 1..ec {
+                        if *slice.add(k) < *slice.add(mc) { mc = k; }
                     }
                     if *slice.add(mc) >= last { break; }
                     *slice.add(i) = *slice.add(mc);
@@ -415,6 +407,7 @@ fn main() {
                     heap_b.push(0, t as u32);
 
                     let mut mu = INF32;
+                    let mut touched_overflow = false;
 
                     unsafe {
                         while !heap_f.is_empty() && !heap_b.is_empty() {
@@ -433,15 +426,11 @@ fn main() {
                                 let e_start = *hf_ptr.add(u) as usize;
                                 let e_end = *hf_ptr.add(u + 1) as usize;
                                 for e in e_start..e_end {
-                                    #[cfg(target_arch = "x86_64")]
-                                    if e + 2 < e_end {
-                                        let next_v = (*ef_ptr.add(e + 2) & V_MASK) as usize;
-                                        _mm_prefetch(d_ptr.add(next_v) as *const i8, _MM_HINT_T0);
-                                    }
                                     let packed_edge = *ef_ptr.add(e);
                                     let v = (packed_edge & V_MASK) as usize;
                                     let mut w = packed_edge >> V_BITS;
                                     if has_overflow && w == W_SENTINEL {
+                                        touched_overflow = true;
                                         let key = e as u32;
                                         if let Ok(pos) = oflow_ref.binary_search_by_key(&key, |&(k, _)| k) {
                                             w = oflow_ref.get_unchecked(pos).1;
@@ -470,15 +459,11 @@ fn main() {
                                 let e_start = *hr_ptr.add(u) as usize;
                                 let e_end = *hr_ptr.add(u + 1) as usize;
                                 for e in e_start..e_end {
-                                    #[cfg(target_arch = "x86_64")]
-                                    if e + 2 < e_end {
-                                        let next_v = (*er_ptr.add(e + 2) & V_MASK) as usize;
-                                        _mm_prefetch(d_ptr.add(next_v) as *const i8, _MM_HINT_T0);
-                                    }
                                     let packed_edge = *er_ptr.add(e);
                                     let v = (packed_edge & V_MASK) as usize;
                                     let mut w = packed_edge >> V_BITS;
                                     if has_overflow && w == W_SENTINEL {
+                                        touched_overflow = true;
                                         let key = (1u32 << 31) | (e as u32);
                                         if let Ok(pos) = oflow_ref.binary_search_by_key(&key, |&(k, _)| k) {
                                             w = oflow_ref.get_unchecked(pos).1;
@@ -503,8 +488,8 @@ fn main() {
                         }
 
                         let mut ans_val = if mu == INF32 { -1 } else { mu as i64 };
-                        if ans_val == -1 {
-                            // Exact 64-bit solver for large edge weights (>= 2^31)
+                        if ans_val == -1 && touched_overflow {
+                            // Exact 64-bit solver only when giant edges (>= 2^31) were touched!
                             ans_val = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow_ref);
                         }
                         *ans_ptr.add(q.id as usize) = ans_val;

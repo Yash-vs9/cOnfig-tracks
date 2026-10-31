@@ -17,7 +17,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | 6 P-core query dispatch, Pass 1 weight skipping, 32-bit packed dual CSR & 4.0s Dijkstra | run-482c56a0f7f8 | 0.362 | 227.3 | 55.34 |
 | 11 | In-place head prefix sums, zero-copy transmute (-28MB allocations), and streamlined memory layout | run-ccd565870711 | 0.370 | 227.5 | 55.16 |
 | 12 | Streaming pread dual CSR, 8B DistPair with 64-bit fallback & 12-thread cache prefetching | run-0c3b229cac58 | 0.414 | 370.5 | 50.81 |
-| 13 | Zero-copy mmap dual CSR, 8B DistPair (-84MB), 6 P-core cap & compact 64-bit fallback | pending | pending | ~141.3 | pending |
+| 13 | Zero-copy mmap dual CSR, 8B DistPair (-84MB), 6 P-core cap & compact 64-bit fallback | run-854b13a92e5a | 0.518 | 142.4 | 53.02 |
+| 14 | Gated 64-bit fallback on touched_overflow & eliminated software prefetching | pending | pending | ~142.4 | pending |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -79,4 +80,9 @@ Every step from the reference to your final version, each with the live-board ru
   2. *8-Byte DistPair:* Packed forward and backward tentative distances into an aligned 8-byte structure (`fwd: u32, rev: u32`), fitting both frontiers into a single CPU register/cache line word and halving distance table allocations.
   3. *Dedicated P-Core Concurrency (`nt.min(6)`):* Capped query worker threads to 6 physical P-cores, preventing SMT L1/L2 cache contention and allocator arena explosion while allocating only 6 distance arrays (saving **84 MB** over Step 10).
   4. *Compact Unified 64-bit Fallback:* Unified the 64-bit overflow solver into a concise 40-line bidirectional search with `HashMap` and `BinaryHeap`, ensuring 100% exact SHA256 match while keeping source code length $S$ at 547 lines.
-  5. *Measured Results:* Peak RSS dropped from 227.3 MB to **141.3 MB** (-38% memory), host execution time ~8.4s with 100% exact SHA256 match.
+  5. *Measured Results:* Peak RSS dropped from 227.3 MB to **142.4 MB** (-37% memory, scoring `run-854b13a92e5a`).
+- **Step 14:** Gated 64-bit fallback on `touched_overflow` and eliminated software prefetching:
+  1. *Gated Overflow Fallback:* Gated `solve_query_64` on whether an overflow edge ($w = 2047$) was actually touched during search. Disconnected queries instantly return -1 without exhaustive whole-graph searches, saving hundreds of milliseconds.
+  2. *Removed Software Prefetching:* Removed speculative `_mm_prefetch` from the relaxation loop, preventing CPU Line Fill Buffer starvation on random memory loads.
+  3. *Branch-Free MinHeap:* Restored streamlined 4-ary heap pop logic to avoid branch mispredictions.
+  4. *Memory:* Retains the low 142.4 MB peak memory footprint.
