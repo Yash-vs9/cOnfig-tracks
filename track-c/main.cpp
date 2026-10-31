@@ -62,10 +62,8 @@ int main(int argc, char **argv) {
   struct stat rst{}, mst{}; fstat(rfd, &rst); fstat(mfd, &mst); size_t rsz = rst.st_size, sz = mst.st_size;
   const char *rb = rsz ? (const char *)mmap(0, rsz, PROT_READ, MAP_SHARED, rfd, 0) : nullptr;
   if (rsz && rb == MAP_FAILED) rb = (const char *)mmap(0, rsz, PROT_READ, MAP_PRIVATE, rfd, 0);
-  if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_WILLNEED | MADV_SEQUENTIAL);
   const char *base = sz ? (const char *)mmap(0, sz, PROT_READ, MAP_SHARED, mfd, 0) : nullptr;
   if (sz && base == MAP_FAILED) base = (const char *)mmap(0, sz, PROT_READ, MAP_PRIVATE, mfd, 0);
-  if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
   memset(reg_lut, 0xFF, sizeof(reg_lut));
   if (rsz) {
     for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
@@ -100,7 +98,7 @@ int main(int argc, char **argv) {
   {
     int tid = omp_get_thread_num();
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
-    char tmp[512]; alignas(64) uint64_t tl_cache[4096][2] = {0};
+    char tmp[512]; alignas(64) uint64_t tl_cache[32768][2] = {0};
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
     auto find_q = [&](const char *s) -> const char * {
       if (__builtin_expect(s + 32 <= end, 1)) {
@@ -161,7 +159,7 @@ int main(int argc, char **argv) {
       cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1); p += 3;
       while (p < end && (uint8_t)*p <= ' ') ++p;
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
-      uint32_t tl_idx = (uint32_t)nh & 4095; uint64_t tl_sig = (nh & ~0xFFULL) | cid;
+      uint32_t tl_idx = (uint32_t)nh & 32767; uint64_t tl_sig = (nh & ~0xFFULL) | cid;
       if (tl_cache[tl_idx][0] != tl_sig && tl_cache[tl_idx][1] != tl_sig) {
         tl_cache[tl_idx][1] = tl_cache[tl_idx][0]; tl_cache[tl_idx][0] = tl_sig;
         for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
