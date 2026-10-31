@@ -198,7 +198,8 @@ int main(int argc, char **argv) {
       uint8_t r_cid = rid < 1000000 ? reg_lut[rid] : 0xFF, cid = r_cid == 0xFF ? unm_cid : r_cid;
       bool neg = (*p == '-') && ++p;
       while (*p != '.') cents = cents * 10 + (*p++ - '0');
-      cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3 + 1 + (*p == '\r');
+      cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
+      while (p < end && (uint8_t)*p <= ' ') ++p;
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
       uint32_t tl_idx = (uint32_t)nh & 2047;
