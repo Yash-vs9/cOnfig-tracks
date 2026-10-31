@@ -1,5 +1,5 @@
 // Speed Demon 2026 — Track A (Ingest) Championship Rust Solution
-// Upgrades: 4-load branchless AVX2/CRC32 hash, N_BLK=13312 static arena (24 MB peak), 65k big-lat pool, 2048-slot L1 cache
+// Upgrades: 4-load branchless AVX2/CRC32 hash, 65k big-lat pool, N_BLK=13312 static arena (24 MB peak), 2048-slot L1 cache
 #![allow(
     unsafe_op_in_unsafe_fn,
     dead_code,
@@ -89,15 +89,13 @@ static S: Global<SharedData> = Global(UnsafeCell::new(SharedData {
 
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
-    let (mut b, mut i) = ([b' '; 12], 11);
-    loop {
+    let (mut b, mut i) = ([b' '; 12], 11usize);
+    while {
         i -= 1;
         b[i] = b'0' + (v % 10) as u8;
         v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
+        v > 0
+    } {}
     copy(b.as_ptr().add(i), p, 12 - i);
     p.add(12 - i)
 }
@@ -117,28 +115,34 @@ unsafe fn write_all(fd: i32, mut b: *const u8, mut n: usize) {
 #[cold]
 unsafe fn intern(sd: *mut SharedData, is_ep: bool, p: *const u8, len: u8, h: u64) -> u16 {
     let (tab, mask, ci) = if is_ep {
-        ((*sd).ep_key.as_ptr(), 8191, 1)
+        ((*sd).ep_key.as_ptr(), 8191usize, 1usize)
     } else {
-        ((*sd).hr_key.as_ptr(), 255, 0)
+        ((*sd).hr_key.as_ptr(), 255usize, 0usize)
     };
     let mut s = ((h >> 16) as usize) & mask;
-    loop {
-        let cell = &*(tab.add(s) as *const AtomicU64);
-        let kv = cell.load(Acquire);
+    let check = |kv: u64| -> Option<u16> {
         if (kv ^ h) < 65536 && kv != 0 {
             let id = (kv & 0xFFFF) as u16;
-            if is_ep {
-                if (*sd).ep_len[id as usize] == len
-                    && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize)
-                        == slc(p, len as usize)
-                {
-                    return id;
-                }
-            } else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) {
-                return id;
+            let (ptr, l) = if is_ep {
+                (
+                    (*sd).ep_ptr[id as usize],
+                    (*sd).ep_len[id as usize] as usize,
+                )
+            } else {
+                ((*sd).hr_ptr[id as usize], 13usize)
+            };
+            if l == len as usize && slc(ptr as *const u8, l) == slc(p, l) {
+                return Some(id);
             }
         }
-        if kv == 0 && cell.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
+        None
+    };
+    loop {
+        let cell = &*(tab.add(s) as *const AtomicU64);
+        if let Some(id) = check(cell.load(Acquire)) {
+            return id;
+        }
+        if cell.load(Acquire) == 0 && cell.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let id = (*sd).n_cnt[ci].fetch_add(1, Relaxed) as usize;
             if is_ep {
                 (*sd).ep_ptr[id] = p as usize;
@@ -152,19 +156,8 @@ unsafe fn intern(sd: *mut SharedData, is_ep: bool, p: *const u8, len: u8, h: u64
         while cell.load(Acquire) == 1 {
             _mm_pause();
         }
-        let kv2 = cell.load(Acquire);
-        if (kv2 ^ h) < 65536 && kv2 != 0 {
-            let id = (kv2 & 0xFFFF) as u16;
-            if is_ep {
-                if (*sd).ep_len[id as usize] == len
-                    && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize)
-                        == slc(p, len as usize)
-                {
-                    return id;
-                }
-            } else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) {
-                return id;
-            }
+        if let Some(id) = check(cell.load(Acquire)) {
+            return id;
         }
         s = (s + 1) & mask;
     }
@@ -263,35 +256,31 @@ fn main() {
                                 .unwrap()
                         };
 
-                        let (w0, w1, w2, w3) = if elen >= 16 {
-                            (
-                                (ep as *const u64).read_unaligned(),
-                                (ep.add(8) as *const u64).read_unaligned(),
-                                (ep.add(elen - 16) as *const u64).read_unaligned(),
-                                (ep.add(elen - 8) as *const u64).read_unaligned(),
-                            )
+                        let mut w = [0u64; 4];
+                        if elen >= 16 {
+                            w[0] = (ep as *const u64).read_unaligned();
+                            w[1] = (ep.add(8) as *const u64).read_unaligned();
+                            w[2] = (ep.add(elen - 16) as *const u64).read_unaligned();
+                            w[3] = (ep.add(elen - 8) as *const u64).read_unaligned();
                         } else if elen >= 8 {
-                            let a = (ep as *const u64).read_unaligned();
-                            let b = (ep.add(elen - 8) as *const u64).read_unaligned();
-                            (a, b, a, b)
+                            w[0] = (ep as *const u64).read_unaligned();
+                            w[1] = (ep.add(elen - 8) as *const u64).read_unaligned();
+                            (w[2], w[3]) = (w[0], w[1]);
                         } else {
-                            let mut a = 0u64;
-                            copy(ep, &mut a as *mut u64 as *mut u8, elen);
-                            (a, a, a, a)
-                        };
-                        let h1 = _mm_crc32_u64(
-                            _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(elen as u64, w0), w1), w2),
-                            w3,
-                        );
-                        let h2 = ((w0 ^ w2).wrapping_mul(0x9e3779b97f4a7c15))
-                            ^ ((w1 ^ w3).wrapping_mul(0xbf58476d1ce4e5b9))
+                            copy(ep, w.as_mut_ptr() as *mut u8, elen);
+                            (w[1], w[2], w[3]) = (w[0], w[0], w[0]);
+                        }
+                        let mut h1 = elen as u64;
+                        for x in w {
+                            h1 = _mm_crc32_u64(h1, x);
+                        }
+                        let h2 = ((w[0] ^ w[2]).wrapping_mul(0x9e3779b97f4a7c15))
+                            ^ ((w[1] ^ w[3]).wrapping_mul(0xbf58476d1ce4e5b9))
                             ^ ((elen as u64) << 40);
                         let h = (((h1 << 32) ^ h2) & !0xFFFF) | (1 << 63);
 
-                        let (c_idx, c_kv) = (
-                            ((h >> 16) as usize) & 2047,
-                            tl_ep[((h >> 16) as usize) & 2047],
-                        );
+                        let c_idx = ((h >> 16) as usize) & 2047;
+                        let c_kv = tl_ep[c_idx];
                         let eid = if (c_kv ^ h) < 65536 {
                             (c_kv & 0xFFFF) as u16
                         } else {
@@ -432,11 +421,8 @@ fn main() {
                                     continue;
                                 }
                                 let l = &mut lats[off[eid] as usize..off[eid] as usize + n];
-                                let (i50, i95, i99) = (
-                                    (50 * n + 99) / 100 - 1,
-                                    (95 * n + 99) / 100 - 1,
-                                    (99 * n + 99) / 100 - 1,
-                                );
+                                let pct = |p: usize| (p * n + 99) / 100 - 1;
+                                let (i50, i95, i99) = (pct(50), pct(95), pct(99));
                                 if n <= 32 {
                                     l.sort_unstable();
                                 } else {

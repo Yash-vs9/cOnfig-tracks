@@ -11,3 +11,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Parallel 72-hour bucket sorting, concurrent 12-thread buffer formatting, integer hour ID matching | run-9d3f72b2c8e5 | 0.0697 | 62.9 | 69.60 |
 | 5 | Zero-dependency Rust lock-free block arena, SIMD CRC32, parallel CSR, pdqselect select_nth_unstable | run-9da69da17ae0 | 0.0540 | 50.2 | 69.18 |
 | 6 | Compact 4B packed record arena, 512-entry L1 direct cache, AVX2 line scanner, UnsafeCell static arena | run-0b81b4911a21 | 0.0537 | 42.0 | 69.88 |
+| 7 | 4-load branchless AVX2/CRC32 hash, 2048 L1 cache, 65k big-lat pool, N_BLK=13312 static arena | run-2f56a6016af5 | 0.0534 | 43.2 | 69.75 |
