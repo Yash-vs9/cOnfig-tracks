@@ -111,8 +111,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         } else {
             while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
         }
-        p = c.add(1 + (*c == b'
-') as usize);
+        p = c.add(1 + (*c == b'\r') as usize);
         if cur_f == 256 {
             (cur_b >= 0).then(|| (*s).w.1[cur_b as usize] = 256);
             let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
