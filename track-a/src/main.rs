@@ -1,10 +1,10 @@
 // Speed Demon 2026 — Track A (Ingest) Championship Solution
-#![allow(unsafe_op_in_unsafe_fn, dead_code)]
-use std::{arch::x86_64::*, cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, ptr::copy_nonoverlapping as copy, slice::from_raw_parts as slc, sync::{atomic::{AtomicU32, AtomicU64, Ordering::*}, Barrier}};
+#![allow(unsafe_op_in_unsafe_fn, dead_code, unused_unsafe, dangerous_implicit_autorefs, suspicious_runtime_symbol_definitions)]
+use std::{arch::x86_64::*, cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, ptr::copy_nonoverlapping as copy, slice::{from_raw_parts as slc, from_raw_parts_mut as slc_mut}, sync::{atomic::{AtomicU32, AtomicU64, Ordering::*}, Barrier}};
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn write(fd: i32, b: *const u8, c: usize) -> isize;
+    fn write(fd: i32, b: *const std::ffi::c_void, c: usize) -> isize;
 }
 
 #[repr(transparent)]
@@ -43,7 +43,12 @@ unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
 
 #[inline(always)]
 unsafe fn write_all(fd: i32, mut b: *const u8, mut n: usize) {
-    while n > 0 { let r = write(fd, b, n); if r <= 0 { break; } b = b.add(r as usize); n -= r as usize; }
+    while n > 0 {
+        let r = write(fd, b as *const std::ffi::c_void, n);
+        if r <= 0 { break; }
+        b = b.add(r as usize);
+        n -= r as usize;
+    }
 }
 
 #[cold]
@@ -55,9 +60,8 @@ unsafe fn intern(sd: *mut SharedData, is_ep: bool, p: *const u8, len: u8, h: u64
         let kv = cell.load(Acquire);
         if (kv ^ h) < 65536 && kv != 0 {
             let id = (kv & 0xFFFF) as u16;
-            if is_ep {
-                if (*sd).ep_len[id as usize] == len && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize) == slc(p, len as usize) { return id; }
-            } else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) { return id; }
+            if is_ep { if (*sd).ep_len[id as usize] == len && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize) == slc(p, len as usize) { return id; } }
+            else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) { return id; }
         }
         if kv == 0 && cell.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let id = (*sd).n_cnt[ci].fetch_add(1, Relaxed) as usize;
@@ -69,9 +73,8 @@ unsafe fn intern(sd: *mut SharedData, is_ep: bool, p: *const u8, len: u8, h: u64
         let kv2 = cell.load(Acquire);
         if (kv2 ^ h) < 65536 && kv2 != 0 {
             let id = (kv2 & 0xFFFF) as u16;
-            if is_ep {
-                if (*sd).ep_len[id as usize] == len && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize) == slc(p, len as usize) { return id; }
-            } else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) { return id; }
+            if is_ep { if (*sd).ep_len[id as usize] == len && slc((*sd).ep_ptr[id as usize] as *const u8, len as usize) == slc(p, len as usize) { return id; } }
+            else if slc((*sd).hr_ptr[id as usize] as *const u8, 13) == slc(p, 13) { return id; }
         }
         s = (s + 1) & mask;
     }
@@ -94,7 +97,7 @@ fn main() {
         std::thread::scope(|sc| {
             for tid in 0..12 {
                 let bar_ref = &bar;
-                sc.spawn(move || unsafe {
+                sc.spawn(move || {
                     let sd = S.0.get();
                     let b_ptr = base_addr as *const u8;
                     let (mut s, mut e) = (if tid > 0 { (tid * sz) / 12 } else { 0 }, if tid < 11 { ((tid + 1) * sz) / 12 } else { sz });
@@ -164,10 +167,10 @@ fn main() {
                         let (nh, ne) = ((*sd).n_cnt[0].load(Relaxed) as usize, (*sd).n_cnt[1].load(Relaxed) as usize);
                         for i in 0..nh { (*sd).ord_h[i] = i as u8; }
                         for i in 0..ne { (*sd).ord_e[i] = i as u16; }
-                        (*sd).ord_h[..nh].sort_unstable_by(|&x, &y| unsafe {
+                        slc_mut((*sd).ord_h.as_mut_ptr(), nh).sort_unstable_by(|&x, &y| {
                             slc((*sd).hr_ptr[x as usize] as *const u8, 13).cmp(slc((*sd).hr_ptr[y as usize] as *const u8, 13))
                         });
-                        (*sd).ord_e[..ne].sort_unstable_by(|&x, &y| unsafe {
+                        slc_mut((*sd).ord_e.as_mut_ptr(), ne).sort_unstable_by(|&x, &y| {
                             slc((*sd).ep_ptr[x as usize] as *const u8, (*sd).ep_len[x as usize] as usize)
                                 .cmp(slc((*sd).ep_ptr[y as usize] as *const u8, (*sd).ep_len[y as usize] as usize))
                         });
@@ -216,8 +219,7 @@ fn main() {
                                     if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
                                     if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
                                 }
-                                let err = (*sd).g_err[h_id * 2048 + eid];
-                                let el = (*sd).ep_len[eid] as usize;
+                                let (err, el) = ((*sd).g_err[h_id * 2048 + eid], (*sd).ep_len[eid] as usize);
                                 let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
                                 copy((*sd).hr_ptr[h_id] as *const u8, ptr, 13);
                                 copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
