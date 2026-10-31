@@ -12,10 +12,10 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 65536;
+const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 16;
-const H_MAX_LOAD: u32 = 58000;
+const H_SHIFT: u32 = 32 - 17;
+const H_MAX_LOAD: u32 = 85000;
 const BUF_SZ: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
@@ -249,7 +249,7 @@ fn solve_query_64(
     er: *const u32,
     oflow: &[(u32, u32)],
 ) -> i64 {
-    let (mut dist_f, mut dist_b) = (HashMap::with_capacity(32768), HashMap::with_capacity(32768));
+    let (mut dist_f, mut dist_b) = (HashMap::with_capacity(2048), HashMap::with_capacity(2048));
     let (mut q_f, mut q_b) = (BinaryHeap::new(), BinaryHeap::new());
     dist_f.insert(s as u32, 0u64);
     dist_b.insert(t as u32, 0u64);
@@ -579,9 +579,6 @@ fn main() {
                             let is_fwd = heap_f.data.len() <= heap_b.data.len();
                             let (d, slot_idx) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
                             let top_opp = if is_fwd { top_b } else { top_f };
-                            if d.saturating_add(top_opp) >= mu {
-                                break;
-                            }
 
                             let slot = dist_map.slots.as_ptr().add(slot_idx as usize);
                             let u = (*slot).0;
@@ -601,10 +598,6 @@ fn main() {
                             );
 
                             for e in e_start..e_end {
-                                if dist_map.used >= H_MAX_LOAD {
-                                    table_full = true;
-                                    break;
-                                }
                                 let packed = *e_ptr.add(e);
                                 let (v, mut w) = (packed & V_MASK, packed >> 21);
                                 if e + 1 < e_end {
@@ -628,7 +621,8 @@ fn main() {
                                     dist_map.relax::<false>(v, nd, top_opp, &mut heap_b, &mut mu);
                                 }
                             }
-                            if table_full {
+                            if dist_map.used >= H_MAX_LOAD {
+                                table_full = true;
                                 break;
                             }
                         }
