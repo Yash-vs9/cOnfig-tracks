@@ -22,7 +22,7 @@ static char dense_to_code[256][4], out_buf[65536];
 static Agg G[256], T[12][256];
 static size_t cs[13], qc[12], iq[12];
 
-constexpr uint32_t MBOX_CAP = 40000;
+constexpr uint32_t MBOX_CAP = 45000;
 static uint64_t mbox[12][12][MBOX_CAP];
 static uint32_t mbox_cnt[12][12];
 
@@ -97,11 +97,16 @@ int main(int argc, char **argv) {
   if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
 
   memset(reg_lut, 0xFF, sizeof(reg_lut));
-  if (rsz) {
-    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
-      while (*p++ != ',') {}
-      c_to_dense[(p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1] = 1;
-      while (p < rb + rsz && *p++ != '\n') {}
+  if (rsz && rb) {
+    const char *nl = (const char *)memchr(rb, '\n', rsz);
+    if (nl) {
+      for (const char *p = nl + 1; p < rb + rsz;) {
+        while (p < rb + rsz && *p++ != ',') {}
+        if (p + 3 <= rb + rsz) {
+          c_to_dense[(p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1] = 1;
+        }
+        while (p < rb + rsz && *p++ != '\n') {}
+      }
     }
   }
   uint8_t nc = 0;
@@ -111,17 +116,23 @@ int main(int argc, char **argv) {
       dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
       c_to_dense[c] = nc++;
     }
-  if (rsz) {
-    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
-      uint32_t reg = (uint32_t)parse_u(p);
-      uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
-      if (reg < 1000000) reg_lut[reg] = (uint8_t)c_to_dense[code];
-      while (p < rb + rsz && *p++ != '\n') {}
+  if (rsz && rb) {
+    const char *nl = (const char *)memchr(rb, '\n', rsz);
+    if (nl) {
+      for (const char *p = nl + 1; p < rb + rsz;) {
+        uint32_t reg = (uint32_t)parse_u(p);
+        if (p + 3 <= rb + rsz) {
+          uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
+          if (reg < 1000000) reg_lut[reg] = (uint8_t)c_to_dense[code];
+        }
+        while (p < rb + rsz && *p++ != '\n') {}
+      }
     }
   }
   uint8_t unm_cid = nc;
 
-  size_t bo = sz ? ((const char *)memchr(base, '\n', sz) + 1 - base) : 0;
+  const char *fnl = (sz && base) ? (const char *)memchr(base, '\n', sz) : nullptr;
+  size_t bo = fnl ? (fnl + 1 - base) : 0;
   for (int t = 0; t <= 12; ++t) cs[t] = bo + (sz - bo) * t / 12;
 
   if (sz >= 65536) {
@@ -159,7 +170,7 @@ int main(int argc, char **argv) {
         if (m) return s + __builtin_ctz(m);
         s += 32;
       }
-      return (const char *)memchr(s, '"', end - s);
+      return (s < end) ? (const char *)memchr(s, '"', end - s) : end;
     };
 
     while (p < end) {
@@ -191,7 +202,7 @@ int main(int argc, char **argv) {
           uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), c_vec));
           if (m) q = p + __builtin_ctz(m);
         }
-        if (!q) q = (const char *)memchr(p, ',', end - p);
+        if (!q) q = (p < end) ? (const char *)memchr(p, ',', end - p) : end;
         nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 1;
       }
 
@@ -256,7 +267,7 @@ int main(int argc, char **argv) {
         uint8_t cid = (uint8_t)(e & 0xFF);
         uint64_t nh = e & ~0xFFULL;
 
-        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & TH_MASK;; slot = (slot + 1) & TH_MASK) {
+        for (uint32_t p_step = 0, slot = (uint32_t)(nh ^ (nh >> 32)) & TH_MASK; p_step < TH_CAP; ++p_step, slot = (slot + 1) & TH_MASK) {
           PrivSlot &s = table[slot];
           if (!s.key) {
             s.key = nh, s.bits[cid >> 6] |= (1ULL << (cid & 63)), priv_dn[tid][cid]++;
