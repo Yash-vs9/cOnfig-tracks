@@ -40,8 +40,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 12;
-const FW_CAP: usize = 1_500_000;
-const DP_CAP: usize = 22_000;
+const FW_CAP: usize = 500_000;
+const DP_CAP: usize = 3_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot {
@@ -442,7 +442,7 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     close(fd);
     madvise(p, len, 2);
     std::slice::from_raw_parts(p, len)
@@ -501,10 +501,9 @@ impl<'a> Engine<'a> {
                 &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
             for i in 0..clen {
                 let ld = cand[i] as usize;
-                if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) != 0 {
-                    cand[w] = ld as u16;
-                    w += 1;
-                }
+                let hit = ((*src.get_unchecked(ld >> 6) >> (ld & 63)) & 1) as usize;
+                cand[w] = ld as u16;
+                w += hit;
             }
         } else {
             let o_post = self.chunk_postings(c, t);
@@ -559,10 +558,9 @@ impl<'a> Engine<'a> {
                 &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
             for i in 0..clen {
                 let ld = cand[i] as usize;
-                if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) == 0 {
-                    cand[w] = ld as u16;
-                    w += 1;
-                }
+                let hit = (((*src.get_unchecked(ld >> 6) >> (ld & 63)) ^ 1) & 1) as usize;
+                cand[w] = ld as u16;
+                w += hit;
             }
         } else {
             let o_post = self.chunk_postings(c, t);
@@ -960,10 +958,14 @@ impl<'a> Engine<'a> {
                 'doc_scan: loop {
                     if sp + 32 <= d_len {
                         let chunk = _mm256_loadu_si256(d_ptr.add(sp) as *const __m256i);
-                        let m_ch = _mm256_or_si256(
-                            _mm256_cmpeq_epi8(chunk, v_lo),
-                            _mm256_cmpeq_epi8(chunk, v_up),
-                        );
+                        let m_ch = if first_ch == first_up {
+                            _mm256_cmpeq_epi8(chunk, v_lo)
+                        } else {
+                            _mm256_or_si256(
+                                _mm256_cmpeq_epi8(chunk, v_lo),
+                                _mm256_cmpeq_epi8(chunk, v_up),
+                            )
+                        };
                         let m_nl = _mm256_cmpeq_epi8(chunk, v_nl);
                         let (mask_ch, mask_nl) = (
                             _mm256_movemask_epi8(m_ch) as u32,
@@ -1330,12 +1332,6 @@ unsafe fn run_all() {
     let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
     let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
     let next_b = AtomicUsize::new(0);
-    let mut fw_ptrs = [0usize; NUM_T];
-    let mut dp_ptrs = [0usize; NUM_T];
-    for t in 0..NUM_T {
-        fw_ptrs[t] = alloc_mmap::<u16>(FW_CAP) as usize;
-        dp_ptrs[t] = alloc_mmap::<u32>(DP_CAP) as usize;
-    }
     let next_chunk = AtomicUsize::new(0);
     let phase = AtomicUsize::new(0);
     let ready = AtomicUsize::new(0);
@@ -1353,15 +1349,11 @@ unsafe fn run_all() {
             let next_ref = &next_b;
             let c_post_ptrs_ref = &c_post_ptrs;
             let c_post_lens_ref = &c_post_lens;
-            let fw_ptr_c = fw_ptrs[tid];
-            let dp_ptr_c = dp_ptrs[tid];
             std::thread::Builder::new()
                 .stack_size(131072)
                 .spawn_scoped(s, move || {
                     let aff_mask = 1u64 << (tid % 12);
                     sched_setaffinity(0, 8, &aff_mask);
-                    let fw = fw_ptr_c as *mut u16;
-                    let dp = dp_ptr_c as *mut u32;
                     let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
                     let bs_idx_p = bs_idx_ptr as *const u16;
                     loop {
@@ -1369,6 +1361,8 @@ unsafe fn run_all() {
                         if c >= NUM_C {
                             break;
                         }
+                        let fw = alloc_mmap::<u16>(FW_CAP);
+                        let dp = alloc_mmap::<u32>(DP_CAP);
                         ptr::write_bytes(thread_cnt_p, 0, nt);
                         worker_scan_fw(
                             c,
@@ -1399,31 +1393,37 @@ unsafe fn run_all() {
                         c_post_ptrs_ref[c].store(chunk_u16 as usize, Ordering::Release);
                         c_post_lens_ref[c].store(my_total, Ordering::Relaxed);
                         worker_transpose(c, nt, c_off_p, chunk_u16, ds_ref, de_ref, fw, dp);
+                        free_mmap(fw, FW_CAP);
+                        free_mmap(dp, DP_CAP);
                     }
-                    free_mmap(fw, FW_CAP);
-                    free_mmap(dp, DP_CAP);
-                    if ready_ref.fetch_add(1, Ordering::Release) == NUM_T - 1 {
-                        madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
-                        for i in 0..nt {
-                            if *bs_idx_p.add(i) != u16::MAX {
-                                TINFO[i].df = 65535;
-                            } else {
-                                let mut df = 0u32;
-                                for c in 0..NUM_C {
-                                    let base = c * nt;
-                                    let end = *(c_offs_val as *const u32).add(base + i);
-                                    let start = if i > 0 { *(c_offs_val as *const u32).add(base + i - 1) } else { 0 };
-                                    df += end - start;
-                                }
-                                TINFO[i].df = (df as u16).min(65535);
+                    ready_ref.fetch_add(1, Ordering::Release);
+                    while ready_ref.load(Ordering::Acquire) < NUM_T {
+                        std::hint::spin_loop();
+                    }
+                    let chunk_terms = (nt + NUM_T - 1) / NUM_T;
+                    let t_start = (tid * chunk_terms).min(nt);
+                    let t_end = ((tid + 1) * chunk_terms).min(nt);
+                    for i in t_start..t_end {
+                        if *bs_idx_p.add(i) != u16::MAX {
+                            TINFO[i].df = 65535;
+                        } else {
+                            let mut df = 0u32;
+                            for c in 0..NUM_C {
+                                let base = c * nt;
+                                let end = *(c_offs_val as *const u32).add(base + i);
+                                let start = if i > 0 { *(c_offs_val as *const u32).add(base + i - 1) } else { 0 };
+                                df += end - start;
                             }
+                            TINFO[i].df = (df as u16).min(65535);
                         }
+                    }
+                    if tid == 0 {
+                        madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
                         free_mmap(thread_counts_val as *mut u16, NUM_T * nt);
-                        phase_ref.store(1, Ordering::Release);
-                    } else {
-                        while phase_ref.load(Ordering::Acquire) < 1 {
-                            std::hint::spin_loop();
-                        }
+                    }
+                    phase_ref.fetch_add(1, Ordering::Release);
+                    while phase_ref.load(Ordering::Acquire) < NUM_T {
+                        std::hint::spin_loop();
                     }
                     let mut cp_ptrs = [ptr::null(); NUM_C];
                     for c in 0..NUM_C {
