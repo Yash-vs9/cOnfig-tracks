@@ -506,14 +506,18 @@ pw0[i] = ti.w0;
 pw1[i] = ti.w1;
 plen[i] = ti.len as usize;
 poff[i] = ti.off as usize; }
-let anchor = if k == 2 && TINFO[q_ts[1] as usize].df < TINFO[q_ts[0] as usize].df { 1 } else { 0 };
+let anchor = (0..k).min_by_key(|&i| TINFO[q_ts[i] as usize].df).unwrap();
 let first_ch = (pw0[anchor] & 0xFF) as u8;
 let first_up = if first_ch >= b'a' && first_ch <= b'z' { first_ch - 32 } else { first_ch };
 let (v_lo, v_up, v_nl) = (_mm256_set1_epi8(first_ch as i8), _mm256_set1_epi8(first_up as i8), _mm256_set1_epi8(b'\n' as i8));
 let c1_lo = ((pw0[anchor] >> 8) & 0xFF) as u8;
 let c1_up = if c1_lo >= b'a' && c1_lo <= b'z' { c1_lo - 32 } else { c1_lo };
 let (v1_lo, v1_up) = (_mm256_set1_epi8(c1_lo as i8), _mm256_set1_epi8(c1_up as i8));
+let c2_lo = ((pw0[anchor] >> 16) & 0xFF) as u8;
+let c2_up = if c2_lo >= b'a' && c2_lo <= b'z' { c2_lo - 32 } else { c2_lo };
+let (v2_lo, v2_up) = (_mm256_set1_epi8(c2_lo as i8), _mm256_set1_epi8(c2_up as i8));
 let p0_has_2 = plen[anchor] >= 2;
+let p0_has_3 = plen[anchor] >= 3;
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let cand = cand_uninit.assume_init_mut();
@@ -547,44 +551,80 @@ if clen == 0  { continue; } }
 for &ot in &dist[1..nd] {
 clen = self.intersect_and(c, ot, cs, cand, clen);
 if clen == 0  { break; } }
+if k == 1 {
+    for ci in 0..clen {
+        let d = cs + cand[ci] as u32;
+        record_doc(d, &mut t_cnt, &mut t_sum, &mut top, &mut tc);
+    }
+    continue;
+}
 let (d_ptr, d_len) = (self.d_buf.as_ptr(), self.d_buf.len());
 let is_alnum = |b: u8| -> bool { b.wrapping_sub(b'0') <= 9 || (b | 0x20).wrapping_sub(b'a') <= 25 };
-let try_match = |cand_p: usize| -> bool {
-let mut tp = cand_p;
-for j in 0..k {
-let l = plen[j];
-if tp + l >= d_len  { return false; }
-if l <= 8 {
-if tp + 8 > d_len  { return false; }
-let raw = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
-let mask = if l == 8 { u64::MAX } else { (1u64 << (l * 8)) - 1 };
-if (raw & mask) != pw0[j]  { return false; }
-} else if l <= 16 {
-if tp + 16 > d_len  { return false; }
-let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
-if raw0 != pw0[j]  { return false; }
-let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
-let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
-if (raw1 & mask1) != pw1[j]  { return false; }
-} else {
-if tp + 16 > d_len  { return false; }
-let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
-if raw0 != pw0[j]  { return false; }
-let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
-if raw1 != pw1[j]  { return false; }
-let q_tail = &self.q_buf[poff[j] + 16..poff[j] + l];
-let d_tail = std::slice::from_raw_parts(d_ptr.add(tp + 16), l - 16);
-for t_idx in 0..l - 16 {
-if (d_tail[t_idx] | 0x20) != q_tail[t_idx]  { return false; } } }
-if is_alnum(*d_ptr.add(tp + l))  { return false; }
-tp += l;
-if j + 1 < k {
-if *d_ptr.add(tp) == b' ' && is_alnum(*d_ptr.add(tp + 1))  { tp += 1; } else {
-while !is_alnum(*d_ptr.add(tp)) {
-if *d_ptr.add(tp) == b'\n'  { return false; }
-tp += 1; }
-} } }
-true };
+let match_word = |tp: usize, j: usize| -> bool {
+    let l = plen[j];
+    if tp + l > d_len { return false; }
+    if l <= 8 {
+        let raw = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+        let mask = if l == 8 { u64::MAX } else { (1u64 << (l * 8)) - 1 };
+        (raw & mask) == pw0[j]
+    } else if l <= 16 {
+        let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+        let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
+        let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
+        raw0 == pw0[j] && (raw1 & mask1) == pw1[j]
+    } else {
+        let raw0 = ptr::read_unaligned(d_ptr.add(tp) as *const u64) | 0x2020202020202020;
+        let raw1 = ptr::read_unaligned(d_ptr.add(tp + 8) as *const u64) | 0x2020202020202020;
+        if raw0 != pw0[j] || raw1 != pw1[j] { return false; }
+        let q_tail = &self.q_buf[poff[j] + 16..poff[j] + l];
+        let d_tail = std::slice::from_raw_parts(d_ptr.add(tp + 16), l - 16);
+        for t_idx in 0..l - 16 {
+            if (d_tail[t_idx] | 0x20) != q_tail[t_idx] { return false; }
+        }
+        true
+    }
+};
+let match_phrase = |cand_p: usize, doc_start: usize| -> bool {
+    if is_alnum(*d_ptr.add(cand_p.wrapping_sub(1))) { return false; }
+    let l_a = plen[anchor];
+    if is_alnum(*d_ptr.add(cand_p + l_a)) { return false; }
+    if !match_word(cand_p, anchor) { return false; }
+
+    let mut p = cand_p;
+    for j in (0..anchor).rev() {
+        if p <= doc_start { return false; }
+        let mut lp = p - 1;
+        while lp > doc_start && !is_alnum(*d_ptr.add(lp)) {
+            if *d_ptr.add(lp) == b'\n' { return false; }
+            lp -= 1;
+        }
+        let lj = plen[j];
+        if lp + 1 < doc_start + lj { return false; }
+        let w_start = lp + 1 - lj;
+        if w_start > doc_start && is_alnum(*d_ptr.add(w_start - 1)) { return false; }
+        if !match_word(w_start, j) { return false; }
+        p = w_start;
+    }
+
+    let mut tp = cand_p + l_a;
+    for j in anchor + 1..k {
+        if tp >= d_len { return false; }
+        if *d_ptr.add(tp) == b' ' && is_alnum(*d_ptr.add(tp + 1)) {
+            tp += 1;
+        } else {
+            while !is_alnum(*d_ptr.add(tp)) {
+                if *d_ptr.add(tp) == b'\n' { return false; }
+                tp += 1;
+                if tp >= d_len { return false; }
+            }
+        }
+        let lj = plen[j];
+        if !match_word(tp, j) { return false; }
+        tp += lj;
+        if is_alnum(*d_ptr.add(tp)) { return false; }
+    }
+    true
+};
 for ci in 0..clen {
 let d = cs + cand[ci] as u32;
 let doc_start = *self.doc_ts.get_unchecked(d as usize) as usize;
@@ -599,9 +639,17 @@ let (mut mask_ch, mask_nl) = (_mm256_movemask_epi8(m_ch) as u32, _mm256_movemask
 if p0_has_2 {
     let m_c1 = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v1_lo), _mm256_cmpeq_epi8(chunk, v1_up));
     let mask_c1 = _mm256_movemask_epi8(m_c1) as u32;
-    let next_b = if sp + 32 < d_len { *d_ptr.add(sp + 32) } else { 0 };
-    let c1_boundary = (next_b == c1_lo || next_b == c1_up) as u32;
+    let next_b1 = if sp + 32 < d_len { *d_ptr.add(sp + 32) } else { 0 };
+    let c1_boundary = (next_b1 == c1_lo || next_b1 == c1_up) as u32;
     mask_ch &= (mask_c1 >> 1) | (c1_boundary << 31);
+    if p0_has_3 {
+        let m_c2 = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v2_lo), _mm256_cmpeq_epi8(chunk, v2_up));
+        let mask_c2 = _mm256_movemask_epi8(m_c2) as u32;
+        let next_b2 = if sp + 33 < d_len { *d_ptr.add(sp + 33) } else { 0 };
+        let c2_b30 = (next_b1 == c2_lo || next_b1 == c2_up) as u32;
+        let c2_b31 = (next_b2 == c2_lo || next_b2 == c2_up) as u32;
+        mask_ch &= (mask_c2 >> 2) | (c2_b30 << 30) | (c2_b31 << 31);
+    }
 }
 if mask_ch == 0 && mask_nl == 0 {
 sp += 32; continue; }
@@ -611,75 +659,7 @@ while valid_ch != 0 {
 let bit = valid_ch.trailing_zeros() as usize;
 valid_ch &= valid_ch - 1;
 let cand_p = sp + bit;
-let is_ok = if anchor == 0 {
-    !is_alnum(*d_ptr.add(cand_p - 1)) && try_match(cand_p)
-} else {
-    let l1 = plen[1];
-    let mut ok = !is_alnum(*d_ptr.add(cand_p - 1)) && !is_alnum(*d_ptr.add(cand_p + l1));
-    if ok {
-        let l = l1;
-        if l <= 8 {
-            let raw = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
-            let mask = if l == 8 { u64::MAX } else { (1u64 << (l * 8)) - 1 };
-            if (raw & mask) != pw0[1] { ok = false; }
-        } else if l <= 16 {
-            let raw0 = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
-            let raw1 = ptr::read_unaligned(d_ptr.add(cand_p + 8) as *const u64) | 0x2020202020202020;
-            let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
-            if raw0 != pw0[1] || (raw1 & mask1) != pw1[1] { ok = false; }
-        } else {
-            let raw0 = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
-            let raw1 = ptr::read_unaligned(d_ptr.add(cand_p + 8) as *const u64) | 0x2020202020202020;
-            if raw0 != pw0[1] || raw1 != pw1[1] { ok = false; } else {
-                let q_tail = &self.q_buf[poff[1] + 16..poff[1] + l1];
-                let d_tail = std::slice::from_raw_parts(d_ptr.add(cand_p + 16), l1 - 16);
-                for t_idx in 0..l1 - 16 {
-                    if (d_tail[t_idx] | 0x20) != q_tail[t_idx] { ok = false; break; }
-                }
-            }
-        }
-    }
-    if ok {
-        let mut lp = cand_p - 1;
-        if *d_ptr.add(lp) == b' ' && is_alnum(*d_ptr.add(lp.wrapping_sub(1))) {
-            lp -= 1;
-        } else {
-            while lp > doc_start && !is_alnum(*d_ptr.add(lp)) {
-                if *d_ptr.add(lp) == b'\n' { ok = false; break; }
-                lp -= 1;
-            }
-        }
-        if ok {
-            let l0 = plen[0];
-            if lp + 1 < doc_start + l0 { ok = false; } else {
-                let w0_start = lp + 1 - l0;
-                if w0_start > doc_start && is_alnum(*d_ptr.add(w0_start - 1)) { ok = false; } else {
-                    if l0 <= 8 {
-                        let raw = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
-                        let mask = if l0 == 8 { u64::MAX } else { (1u64 << (l0 * 8)) - 1 };
-                        if (raw & mask) != pw0[0] { ok = false; }
-                    } else if l0 <= 16 {
-                        let raw0 = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
-                        let raw1 = ptr::read_unaligned(d_ptr.add(w0_start + 8) as *const u64) | 0x2020202020202020;
-                        let mask1 = if l0 == 16 { u64::MAX } else { (1u64 << ((l0 - 8) * 8)) - 1 };
-                        if raw0 != pw0[0] || (raw1 & mask1) != pw1[0] { ok = false; }
-                    } else {
-                        let raw0 = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
-                        let raw1 = ptr::read_unaligned(d_ptr.add(w0_start + 8) as *const u64) | 0x2020202020202020;
-                        if raw0 != pw0[0] || raw1 != pw1[0] { ok = false; } else {
-                            let q_tail = &self.q_buf[poff[0] + 16..poff[0] + l0];
-                            let d_tail = std::slice::from_raw_parts(d_ptr.add(w0_start + 16), l0 - 16);
-                            for t_idx in 0..l0 - 16 {
-                                if (d_tail[t_idx] | 0x20) != q_tail[t_idx] { ok = false; break; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    ok
-};
+let is_ok = match_phrase(cand_p, doc_start);
 if is_ok {
 matched = true;
 break 'doc_scan; } }
@@ -688,7 +668,7 @@ sp += 32;
 } else {
 while *CMAP.get_unchecked(*self.d_buf.get_unchecked(sp) as usize) == 0  { sp += 1; }
 if *self.d_buf.get_unchecked(sp) == b'\n'  { break 'doc_scan; }
-if try_match(sp) {
+if match_phrase(sp, doc_start) {
 matched = true;
 break 'doc_scan; }
 let mut tail = [0u8; 16];
@@ -906,6 +886,7 @@ let nb = (queries.len() + QB - 1) / QB;
 let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
 let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
 let next_b = AtomicUsize::new(0);
+
 let mut fw_ptrs = [0usize; NUM_T];
 let mut dp_ptrs = [0usize; NUM_T];
 for t in 0..NUM_T {
@@ -1125,9 +1106,12 @@ let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b);
 for q in &queries[b * QB..((b + 1) * QB).min(queries.len())] {
 if q.ib == 0  { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } }
 });
+
 let _ = std::fs::create_dir_all(&o_dir);
-let mut f = File::create(format!("{}/results.txt", o_dir)).unwrap();
-for ob in &out_bufs  { f.write_all(ob).unwrap(); }
+let f = File::create(format!("{}/results.txt", o_dir)).unwrap();
+let mut writer = std::io::BufWriter::with_capacity(262144, f);
+for ob in &out_bufs  { writer.write_all(ob).unwrap(); }
+writer.flush().unwrap();
 free_mmap(raw_bs_ptr, g_bs_total);
 for c in 0..NUM_C  { free_mmap(c_post_ptrs[c].load(Ordering::Relaxed) as *mut u16, c_post_lens[c].load(Ordering::Relaxed)); }
 free_mmap(c_offs, sc_count);
