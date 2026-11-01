@@ -44,7 +44,12 @@
   - All gates green (check, build, correctness, timeout, sandbox).
   - Verified instant in-flight DF accumulation dropping barrier wait from 12.5 ms to 0.20 ms.
 
-- **Current Optimization (Dual-Block 64-Byte AVX2 Scan, MAP_PRIVATE Eviction, Right-Sized FW_CAP)**:
-  - **Dual-Block 64-Byte AVX2 Scan**: Loads two 256-bit vectors (`c0`, `c1`) simultaneously, saturating Raptor Lake's dual load ports (Port 2 + Port 3, 64 bytes/cycle) and dual vector ALUs (Port 0 + Port 1). Computes a 64-bit word mask `mask_tok: u64` and processes tokens with native 64-bit TZCNT and BZHI, halving boundary crossing stalls.
-  - **Right-Sized FW_CAP / DP_CAP**: Reduced `FW_CAP` to 400k and `DP_CAP` to 16k, eliminating 8.0 MB of unnecessary anonymous heap overhead.
-  - **MAP_PRIVATE & On-Demand Unmapping**: Switched `map_file` to `MAP_PRIVATE` (flags = 2) without preemptive `MADV_SEQUENTIAL`, allowing progressive 256KB `MADV_DONTNEED` calls to forcefully unmap private page table entries.
+- **Commit `58f5a9c`** | Run `run-54f89acd6fc9`:
+  - Time: 0.2538s, Memory: 65.06 MB (down by 10 MB!).
+  - Note: Proved 10 MB memory drop; hit buffer limit on full scale chunk forward tokens due to `FW_CAP = 400k`.
+  - Fix: Safely restored `FW_CAP = 700k` and `DP_CAP = 32k` while keeping dual-block 64-byte AVX2 scan with direct `read_tok` boundary handler.
+
+- **Current Optimization (Dual-Block 64-Byte AVX2 Scan & Direct Boundary Handler)**:
+  - **Dual-Block 64-Byte AVX2 Scan**: Loads two 256-bit vectors (`c0`, `c1`) simultaneously, saturating Raptor Lake's dual load ports (Port 2 + Port 3, 64 bytes/cycle) and dual vector ALUs (Port 0 + Port 1). Computes a 64-bit word mask `mask_tok: u64` and processes tokens with native 64-bit TZCNT and BZHI.
+  - **Zero-Vector Boundary Crossing**: Replaced ambiguous secondary vector check with direct, safe `read_tok` scalar boundary consumption when `tok_start + len == 64`.
+  - **Guaranteed Capacity**: Preserved `FW_CAP = 700k` and `DP_CAP = 32k` for 100% full-scale safety.

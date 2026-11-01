@@ -22,8 +22,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 400_000;
-const DP_CAP: usize = 16_000;
+const FW_CAP: usize = 700_000;
+const DP_CAP: usize = 32_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -211,7 +211,7 @@ let mut mask_tok = (mask0 as u64) | ((mask1 as u64) << 32);
 let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 64 };
 if mask_nl != 0 { mask_tok &= if nl_pos == 64 { u64::MAX } else { (1u64 << nl_pos).wrapping_sub(1) }; }
 let mut offset = 0usize;
-let mut cross = false;
+let mut crossed = false;
 while mask_tok != 0 {
 let zeros = mask_tok.trailing_zeros() as usize;
 let tok_start = offset + zeros;
@@ -219,7 +219,10 @@ let rem = mask_tok >> zeros;
 let len = (!rem).trailing_zeros() as usize;
 if mask_nl == 0 && tok_start + len == 64 {
 *p += tok_start;
-cross = true; break; }
+let r = read_tok(d_buf, p, &mut tail);
+process_token(r.0, r.1, r.2, &tail);
+crossed = true;
+break; }
 let (w0, w1);
 if len <= 8 {
 let raw = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
@@ -242,12 +245,7 @@ if consumed >= 64 { break; }
 mask_tok = rem >> len;
 offset = tok_start + len; }
 if mask_nl != 0 { *p += nl_pos + 1; return; }
-if cross {
-let l = (!tokmask(_mm256_loadu_si256(base.add(*p) as *const __m256i))).trailing_zeros() as usize;
-if l >= 16 || *p + 32 > n {
-let r = read_tok(d_buf, p, &mut tail);
-process_token(r.0, r.1, r.2, &tail); }
-} else { *p += 64; } }
+if !crossed { *p += 64; } }
 // Tail fallback
 while *p < n {
 while *p < n && *CMAP.get_unchecked(*base.add(*p) as usize) == 0  { *p += 1; }
