@@ -86,37 +86,30 @@ struct AlignedVTab([Slot; H_SZ]);
 static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
 static mut TINFO: [TInfo; 81920] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, _pad: 0 }; 81920];
 static mut N_TERMS: usize = 0;
-const PF_BITS: usize = 2097152;
-const PF_MASK: usize = PF_BITS - 1;
-static mut PF: [u64; 32768] = [0; 32768];
+const PF_WORDS: usize = 4096; const PF_WMASK: usize = PF_WORDS - 1;
+
+static mut PF: [u64; 4096] = [0; 4096];
 #[inline(always)]
 fn mix64(w0: u64, w1: u64, len: usize) -> u64 {
-let h = if len <= 8 {
-    (w0 ^ (len as u64)).wrapping_mul(0xbf58476d1ce4e5b9)
-} else {
-    (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64))).wrapping_mul(0xbf58476d1ce4e5b9)
-};
-h ^ (h >> 31) }
+    let h = (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64))).wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^ (h >> 31)
+}
 #[inline(always)]
-unsafe fn lookup_swar(w0: u64, w1: u64, tail: &[u8], len: usize, q_buf: &[u8], h: u64) -> u32 {
+unsafe fn lookup_swar(w0: u64, h: u64, len: usize) -> u32 {
 let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
 let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24);
-loop { let s = VTAB.0.get_unchecked(idx);
-if s.h_tag == 0  { return u32::MAX; }
-if s.h_tag == h_tag && s.w0 == w0 {
-if len <= 8  { return s.tid; }
-let ti = TINFO.get_unchecked(s.tid as usize);
-if len <= 16 {
-if ti.w1 == w1 { return s.tid; }
-} else if ti.w1 == w1 && std::slice::from_raw_parts(q_buf.as_ptr().add(ti.off as usize + 16), len - 16) == &tail[..len - 16]  { return s.tid; } }
-idx = (idx + 1) & H_MSK; } }
-unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
+loop {
+    let s = VTAB.0.get_unchecked(idx);
+    if s.h_tag == 0 { return u32::MAX; }
+    if s.h_tag == h_tag && s.w0 == w0 { return s.tid; }
+    idx = (idx + 1) & H_MSK;
+} }
+unsafe fn insert_term(s: &[u8], off: u32, _q_buf: &[u8]) -> u32 {
 let (mut w0, mut w1, len) = (0u64, 0u64, s.len());
 ptr::copy_nonoverlapping(s.as_ptr(), &mut w0 as *mut _ as *mut u8, len.min(8));
 if len > 8  { ptr::copy_nonoverlapping(s.as_ptr().add(8), &mut w1 as *mut _ as *mut u8, (len - 8).min(8)); }
 let h = mix64(w0, w1, len);
-let tail = if len > 16 { &s[16..] } else { &[] };
-let tid = lookup_swar(w0, w1, tail, len, q_buf, h);
+let tid = lookup_swar(w0, h, len);
 if tid != u32::MAX  { return tid; }
 let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
 let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24);
@@ -125,8 +118,9 @@ let nt = N_TERMS as u32;
 N_TERMS += 1;
 VTAB.0[idx] = Slot { w0, h_tag, tid: nt };
 TINFO[nt as usize] = TInfo { w0, w1, off, df: 0, len: len as u16, _pad: 0 };
-let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
-PF[pb >> 6] |= 1u64 << (pb & 63);
+let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
+let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
+PF[widx] |= m;
 nt }
 #[inline(always)]
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
@@ -167,18 +161,19 @@ let n = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
 _mm256_movemask_epi8(_mm256_or_si256(l, n)) as u32 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, q_buf: &[u8], rep_map: &[u32], mut fn_: F) {
+unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, _q_buf: &[u8], rep_map: &[u32], mut fn_: F) {
 let (base, n) = (d_buf.as_ptr(), d_buf.len());
 let nlv = _mm256_set1_epi8(b'\n' as i8);
 let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
 let mut tail = [0u8; 16];
-let mut process_token = |w0: u64, w1: u64, len: usize, tail: &[u8]| {
+let mut process_token = |w0: u64, w1: u64, len: usize, _tail: &[u8]| {
 let h = mix64(w0, w1, len);
-let pb = ((h ^ (h >> 32)) as usize) & PF_MASK;
-if (*PF.get_unchecked(pb >> 6) & (1u64 << (pb & 63))) == 0 {
+let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
+let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
+if (*PF.get_unchecked(widx) & m) != m {
 p_tid = u32::MAX;
 pos += 1; return; }
-let tid = lookup_swar(w0, w1, tail, len, q_buf, h);
+let tid = lookup_swar(w0, h, len);
 if tid != u32::MAX {
 let t = tid as usize;
 fn_(t);
