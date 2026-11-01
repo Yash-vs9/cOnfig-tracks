@@ -72,6 +72,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let sk = |i: usize| bp.add(if i > 0 && i < sz { i + find(bp.add(i - 1), b'\n') } else { i });
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
+    let (mut phw, mut phid) = (0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
     let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 2048]);
     let mut next_blk = t * 1152;
@@ -80,7 +81,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let hw = u8_at(p.add(5));
         if hw != lhw {
             if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
-            (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
+            if hw == phw {
+                (lhw, phw) = (phw, lhw);
+                (hid, phid) = (phid, hid);
+            } else {
+                (phw, phid) = (lhw, hid);
+                (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
+            }
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
         let x = u8_at(p.add(32)) ^ 0x2F2F_2F2F_2F2F_2F2F;
