@@ -49,8 +49,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 180_000;
-const DP_CAP: usize = 14_000;
+const FW_CAP: usize = 700_000;
+const DP_CAP: usize = 32_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -660,8 +660,12 @@ let match_phrase = |cand_p: usize, doc_start: usize| -> bool {
 for ci in 0..clen {
 if ci + 1 < clen {
     let nd = cs + cand[ci + 1] as u32;
-    let nstart = *self.doc_ts.get_unchecked(nd as usize) as usize;
-    _mm_prefetch(self.d_buf.as_ptr().add(nstart) as *const i8, _MM_HINT_T0);
+    if (nd as usize) < self.doc_ts.len() {
+        let nstart = *self.doc_ts.get_unchecked(nd as usize) as usize;
+        if nstart < self.d_buf.len() {
+            _mm_prefetch(self.d_buf.as_ptr().add(nstart) as *const i8, _MM_HINT_T0);
+        }
+    }
 }
 let d = cs + cand[ci] as u32;
 let doc_start = *self.doc_ts.get_unchecked(d as usize) as usize;
@@ -754,13 +758,15 @@ if bi != u16::MAX {
             nh += 1;
         } else { ov = true; }
         *co_ptr.add(t) += 1;
-        if t < 65535 {
-            *fw_ptr.add(fw_idx) = t as u16;
-            fw_idx += 1;
-        } else {
-            *fw_ptr.add(fw_idx) = 65535;
-            *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
-            fw_idx += 2;
+        if fw_idx + 2 < FW_CAP {
+            if t < 65535 {
+                *fw_ptr.add(fw_idx) = t as u16;
+                fw_idx += 1;
+            } else {
+                *fw_ptr.add(fw_idx) = 65535;
+                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
+                fw_idx += 2;
+            }
         }
     }
 } });
@@ -1000,7 +1006,7 @@ b1_ref.wait();
 let chunk_nt = (nt + NUM_T - 1) / NUM_T;
 let t_start = tid * chunk_nt;
 let t_end = (t_start + chunk_nt).min(nt);
-let my_len = t_end - t_start;
+let my_len = t_end.saturating_sub(t_start);
 let mut local_df = vec![0u32; my_len];
 for c in 0..NUM_C {
     let base = c * nt;
@@ -1106,7 +1112,7 @@ barrier1.wait();
 let chunk_nt = (nt + NUM_T - 1) / NUM_T;
 let t_start = 0;
 let t_end = chunk_nt.min(nt);
-let my_len = t_end - t_start;
+let my_len = t_end.saturating_sub(t_start);
 let mut local_df = vec![0u32; my_len];
 for c in 0..NUM_C {
     let base = c * nt;
