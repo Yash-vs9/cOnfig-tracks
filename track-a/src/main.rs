@@ -8,7 +8,6 @@ use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thre
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn madvise(a: *mut u8, l: usize, b: i32) -> i32;
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
     fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize;
     fn mallopt(p: i32, v: i32) -> i32;
@@ -20,14 +19,14 @@ unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
     k: [AtomicU64; 33024],
-    c: [AtomicU32; 163844],
+    c: [AtomicU32; 163842],
     p: [usize; 2304],
-    q: [u32; 13312 * 256],
-    g: [u32; 65536],
+    q: [u32; 13824 * 256],
+    g: [u32; 49152],
     l: [[u32; 75000]; 12],
-    n: [i32; 13312],
+    n: [i32; 13824],
     h: [[[i32; 128]; 12]; 2],
-    w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]),
+    w: ([[u16; 128]; 12], [u16; 13824], [u16; 2304]),
     u: ([u8; 2304], [[u8; 163840]; 12]),
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
@@ -74,22 +73,25 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
-    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 512]);
-    while p < ec {
+    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 2048]);
+    let mut next_blk = t * 1152;
+    let mut next_hi = t * 4096;
+    let fast_ec = bp.add((ec as usize - bp as usize).saturating_sub(256));
+    while p < fast_ec {
         let hw = u8_at(p.add(5));
         if hw != lhw {
             if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
             (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
-        let mut ep = p.add(32);
-        if *ep != b'/' { ep = ep.add(1); while *ep != b'/' { ep = ep.add(1); } }
-        let m = if ep.add(64) <= ec { sp_m(ep) | (sp_m(ep.add(32)) << 32) } else { 0 };
+        let x = u8_at(p.add(32)) ^ 0x2F2F_2F2F_2F2F_2F2F;
+        let ep = p.add(32 + ((x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080).trailing_zeros() >> 3) as usize);
+        let m = sp_m(ep) | (sp_m(ep.add(32)) << 32);
         let el = if m != 0 {
             m.trailing_zeros() as usize
         } else {
-            let m2 = if ep.add(128) <= ec { sp_m(ep.add(64)) | (sp_m(ep.add(96)) << 32) } else { 0 };
-            if m2 != 0 { 64 + m2.trailing_zeros() as usize } else { find(ep, b' ') }
+            let m2 = sp_m(ep.add(64)) | (sp_m(ep.add(96)) << 32);
+            64 + m2.trailing_zeros() as usize
         };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| u8_at(ep.add(o)) & m8;
@@ -102,36 +104,84 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let h1 = crc(a2, w3);
         let h2 = (h1 << 32) | b1;
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let ci = ((h >> 16) as usize) & 511;
+        let ci = ((h >> 16) as usize) & 2047;
         let mut kv = ep_c[ci];
         if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
         let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
         if *st_p == b'5' { (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed); }
         let lp = st_p.add(4);
-        let sub = if lp.add(8) <= ec { u8_at(lp).wrapping_sub(0x3030_3030_3030_3030) } else { 0 };
-        let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
+        let sub = u8_at(lp).wrapping_sub(0x3030_3030_3030_3030);
         let mask = sub & 0x8080_8080_8080_8080;
-        if mask != 0 {
+        let (c, lat) = if mask != 0 {
             let tz = mask.trailing_zeros();
             let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
             let m64 = (w.wrapping_mul(6553601) >> 16) & 0xFFFF_0000_FFFF;
-            (c, lat) = (lp.add((tz >> 3) as usize), (m64.wrapping_mul(42949672960001) >> 32) as u32);
+            (lp.add((tz >> 3) as usize), (m64.wrapping_mul(42949672960001) >> 32) as u32)
         } else {
+            let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
             while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
-        }
-        p = c.add(1 + (*c == b'\r') as usize);
+            (c, lat)
+        };
+        p = c.add(1);
         if cur_f == 256 {
             if cur_b >= 0 { (*s).w.1[cur_b as usize] = 256; }
-            let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
+            let nb = next_blk as i32; next_blk += 1;
             (*s).n[nb as usize] = -1;
             if cur_b < 0 { (*s).h[0][t][hid] = nb; } else { (*s).n[cur_b as usize] = nb; }
             (cur_b, cur_f) = (nb, 0);
         }
         let mut hb = lat;
         if lat >= 1 << 20 {
-            hb = 0x10_0000 | (*s).c[163843].fetch_add(1, Relaxed);
-            (*s).g[(hb & 0xFFFF) as usize] = lat;
+            let gi = next_hi; next_hi += 1;
+            hb = 0x10_0000 | (gi as u32);
+            (*s).g[gi] = lat;
+        }
+        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
+    }
+    while p < ec {
+        let hw = u8_at(p.add(5));
+        if hw != lhw {
+            if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
+            (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
+            (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
+        }
+        let mut ep = p.add(32);
+        while *ep != b'/' { ep = ep.add(1); }
+        let el = find(ep, b' ');
+        let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
+        let rd = |o: usize| u8_at(ep.add(o)) & m8;
+        let (w0, w1, w2, w3) = (rd(0), rd(d >> 1), rd(d.saturating_sub(8)), rd(d));
+        let a0 = crc(el as u64, w0);
+        let b0 = crc(el as u64, w2 ^ w0);
+        let a1 = crc(a0, w1);
+        let b1 = crc(b0, w3 ^ w1);
+        let a2 = crc(a1, w2);
+        let h1 = crc(a2, w3);
+        let h2 = (h1 << 32) | b1;
+        let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
+        let ci = ((h >> 16) as usize) & 2047;
+        let mut kv = ep_c[ci];
+        if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
+        let eid = (kv & 0xFFFF) as usize;
+        let st_p = ep.add(el + 1);
+        if *st_p == b'5' { (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed); }
+        let lp = st_p.add(4);
+        let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
+        while c < lim as *const u8 && *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
+        p = c.add(1);
+        if cur_f == 256 {
+            if cur_b >= 0 { (*s).w.1[cur_b as usize] = 256; }
+            let nb = next_blk as i32; next_blk += 1;
+            (*s).n[nb as usize] = -1;
+            if cur_b < 0 { (*s).h[0][t][hid] = nb; } else { (*s).n[cur_b as usize] = nb; }
+            (cur_b, cur_f) = (nb, 0);
+        }
+        let mut hb = lat;
+        if lat >= 1 << 20 {
+            let gi = next_hi; next_hi += 1;
+            hb = 0x10_0000 | (gi as u32);
+            (*s).g[gi] = lat;
         }
         ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
     }
@@ -227,7 +277,6 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
-            madvise(base as *mut _, sz, 2);
             let bar = Barrier::new(12);
             let (out_fd, bar) = (outf.as_raw_fd(), &bar);
             std::thread::scope(|sc| {
