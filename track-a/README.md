@@ -1,3 +1,3 @@
-# Track A: Ingest
+# Track A: Ingest (C++23)
 
-High-performance Rust solution for Speed Demon 2026 Track A.(TEST)
+High-performance C++23 zero-copy ingest with OpenMP parallelism and SIMD acceleration.

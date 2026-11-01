@@ -1,5 +1,5 @@
 # Read by the board and the scoring harness.
 track = "a"
 team = "cOnfig"
-language = "rust"
+language = "C++"
 dependency_count = 0
