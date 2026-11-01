@@ -58,6 +58,20 @@ struct Slot { w0: u64, h_tag: u32, tid: u32 }
 struct TInfo { w0: u64, w1: u64, off: u32, df: u32, len: u16, _pad: u16 }
 #[derive(Clone, Copy)]
 struct Query { ib: u8, k: u8, ops: u16, t_idx: u32 }
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct FastEntry {
+    w0: u64,
+    tid: u32,
+    bi: u16,
+    len: u8,
+    _pad: u8,
+}
+const FC_SZ: usize = 1024;
+const FC_MSK: usize = FC_SZ - 1;
+static mut FAST_CACHE: [FastEntry; 1024] = [FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 }; 1024];
+
 const CMAP: [u8; 256] = {
 let mut m = [0u8; 256];
 m[b'\n' as usize] = 1;
@@ -161,12 +175,32 @@ let n = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
 _mm256_movemask_epi8(_mm256_or_si256(l, n)) as u32 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, _q_buf: &[u8], rep_map: &[u32], mut fn_: F) {
+unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, _q_buf: &[u8], rep_map: &[u32], g_bs_ptr: *mut u64, w_per_doc: usize, d_w: usize, d_b: u64, mut fn_: F) {
 let (base, n) = (d_buf.as_ptr(), d_buf.len());
 let nlv = _mm256_set1_epi8(b'\n' as i8);
 let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
 let mut tail = [0u8; 16];
 let mut process_token = |w0: u64, w1: u64, len: usize, _tail: &[u8]| {
+if len <= 8 {
+    let fc_slot = ((w0 ^ (w0 >> 11)) as usize) & FC_MSK;
+    let fc = *FAST_CACHE.get_unchecked(fc_slot);
+    if fc.w0 == w0 && fc.len == len as u8 {
+        let t = fc.tid as usize;
+        if fc.bi != u16::MAX {
+            *g_bs_ptr.add((fc.bi as usize) * w_per_doc + d_w) |= d_b;
+        } else {
+            fn_(t);
+        }
+        if p_tid == fc.tid && pos == p_pos + 1 && t < rep_map.len() {
+            let rt = *rep_map.get_unchecked(t);
+            if rt != u32::MAX { fn_(rt as usize); }
+        }
+        p_tid = fc.tid;
+        p_pos = pos;
+        pos += 1;
+        return;
+    }
+}
 let h = mix64(w0, w1, len);
 let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
 let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
@@ -740,7 +774,7 @@ p += 1;
 let d_w = (d as usize) >> 6;
 let d_b = 1u64 << (d & 63);
 let (mut nh, mut ov) = (0usize, false);
-scan_doc(d_buf, &mut p, q_buf, rep_map, |t| {
+scan_doc(d_buf, &mut p, q_buf, rep_map, g_bs_ptr, w_per_doc, d_w, d_b, |t| {
 let bi = *bs_idx.add(t);
 if bi != u16::MAX {
     *g_bs_ptr.add((bi as usize) * w_per_doc + d_w) |= d_b;
@@ -876,7 +910,7 @@ while sp < f_sz && d_buf[sp] != b'\t'  { sp += 1; }
 if sp >= f_sz  { break; }
 sp += 1;
 let (mut nh, mut ov) = (0usize, false);
-scan_doc(d_buf, &mut sp, q_buf, &rep_map, |t| {
+scan_doc(d_buf, &mut sp, q_buf, &rep_map, std::ptr::null_mut(), 0, 0, 0, |t| {
 let (w, b) = (t >> 6, 1u64 << (t & 63));
 let sw = *s_seen.get_unchecked(w);
 if sw & b == 0 {
@@ -890,6 +924,24 @@ for i in 0..nt {
 if sample_counts[i] >= threshold {
 bs_idx[i] = n_bs as u16;
 n_bs += 1; } }
+let mut term_order: Vec<u32> = (0..nt as u32).collect();
+term_order.sort_unstable_by_key(|&t| std::cmp::Reverse(sample_counts[t as usize]));
+for &t in &term_order {
+    let ti = &TINFO[t as usize];
+    if ti.len <= 8 && sample_counts[t as usize] > 0 {
+        let w0 = ti.w0;
+        let slot = ((w0 ^ (w0 >> 11)) as usize) & FC_MSK;
+        if FAST_CACHE[slot].w0 == 0 {
+            FAST_CACHE[slot] = FastEntry {
+                w0,
+                tid: t,
+                bi: bs_idx[t as usize],
+                len: ti.len as u8,
+                _pad: 0,
+            };
+        }
+    }
+}
 drop(sample_counts);
 let g_bs_total = n_bs * w_per_doc;
 let raw_bs_ptr = alloc_mmap::<u64>(g_bs_total);
