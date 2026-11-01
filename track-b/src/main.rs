@@ -17,10 +17,10 @@ mem::MaybeUninit,
 os::unix::io::IntoRawFd,
 ptr,
 sync::atomic::{AtomicUsize, AtomicU32, Ordering}, };
-extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32; }
+extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; }
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_T: usize = 12;
+const NUM_T: usize = 6;
 const NUM_C: usize = 24;
 const FW_CAP: usize = 700_000;
 const DP_CAP: usize = 32_000;
@@ -988,8 +988,6 @@ let barrier1 = std::sync::Barrier::new(NUM_T);
 let barrier2 = std::sync::Barrier::new(NUM_T);
 std::thread::scope(|s| {
 let do_worker = |tid: usize| {
-let aff_mask = 1u64 << (tid % 12);
-sched_setaffinity(0, 8, &aff_mask);
 let fw = fw_ptrs[tid] as *mut u16;
 let dp = dp_ptrs[tid] as *mut u32;
 let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
