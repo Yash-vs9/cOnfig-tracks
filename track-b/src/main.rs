@@ -22,13 +22,13 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 750_000;
-const DP_CAP: usize = 32_000;
+const FW_CAP: usize = 350_000;
+const DP_CAP: usize = 16_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
 #[derive(Clone, Copy, Default)]
-struct TInfo { w0: u64, w1: u64, off: u32, df: u32, len: u16, _pad: u16 }
+struct TInfo { w0: u64, w1: u64, off: u32, df: u32, len: u16, bi: u16 }
 #[derive(Clone, Copy)]
 struct Query { ib: u8, k: u8, ops: u16, t_idx: u32 }
 
@@ -66,8 +66,8 @@ m };
 #[repr(align(4096))]
 struct AlignedVTab([Slot; H_SZ]);
 static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
-static mut TINFO: [TInfo; 131072] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, _pad: 0 }; 131072];
-static mut GLOBAL_DF: [AtomicU32; 131072] = [const { AtomicU32::new(0) }; 131072];
+static mut TINFO: [TInfo; 65536] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, bi: u16::MAX }; 65536];
+static mut GLOBAL_DF: [AtomicU32; 65536] = [const { AtomicU32::new(0) }; 65536];
 static mut N_TERMS: usize = 0;
 const PF_WORDS: usize = 4096; const PF_WMASK: usize = PF_WORDS - 1;
 
@@ -100,7 +100,7 @@ while VTAB.0[idx].h_tag != 0  { idx = (idx + 1) & H_MSK; }
 let nt = N_TERMS as u32;
 N_TERMS += 1;
 VTAB.0[idx] = Slot { w0, h_tag, tid: nt };
-TINFO[nt as usize] = TInfo { w0, w1, off, df: 0, len: len as u16, _pad: 0 };
+TINFO[nt as usize] = TInfo { w0, w1, off, df: 0, len: len as u16, bi: u16::MAX };
 let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
 let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
 PF[widx] |= m;
@@ -144,7 +144,7 @@ let n = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
 _mm256_movemask_epi8(_mm256_or_si256(l, n)) as u32 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, _q_buf: &[u8], rep_map: &[u32], g_bs_ptr: *mut u64, w_per_doc: usize, d_w: usize, d_b: u64, mut fn_: F) {
+unsafe fn scan_doc<F: FnMut(usize)>(d_buf: &[u8], p: &mut usize, _q_buf: &[u8], rep_map: &[u32], doc_bs: *mut u64, mut fn_: F) {
 let (base, n) = (d_buf.as_ptr(), d_buf.len());
 let nlv = _mm256_set1_epi8(b'\n' as i8);
 let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
@@ -163,7 +163,8 @@ if len <= 8 {
             let t = *b.tids.get_unchecked(lane) as usize;
             let bi = *b.bis.get_unchecked(lane);
             if bi != u16::MAX {
-                *g_bs_ptr.add((bi as usize) * w_per_doc + d_w) |= d_b;
+                let bi_u = bi as usize;
+                *doc_bs.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
             } else {
                 fn_(t);
             }
@@ -187,7 +188,13 @@ pos += 1; return; }
 let tid = lookup_swar(w0, h, len);
 if tid != u32::MAX {
 let t = tid as usize;
-fn_(t);
+let bi = (*TINFO.get_unchecked(t)).bi;
+if bi != u16::MAX {
+    let bi_u = bi as usize;
+    *doc_bs.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
+} else {
+    fn_(t);
+}
 if p_tid == tid && pos == p_pos + 1 && t < rep_map.len() {
 let rt = *rep_map.get_unchecked(t);
 if rt != u32::MAX  { fn_(rt as usize); } }
@@ -196,8 +203,9 @@ p_pos = pos;
 } else { p_tid = u32::MAX; }
 pos += 1; };
 while *p + 64 <= n {
-let c0 = _mm256_loadu_si256(base.add(*p) as *const __m256i);
-let c1 = _mm256_loadu_si256(base.add(*p + 32) as *const __m256i);
+let blk = base.add(*p);
+let c0 = _mm256_loadu_si256(blk as *const __m256i);
+let c1 = _mm256_loadu_si256(blk.add(32) as *const __m256i);
 let mask0 = tokmask(c0);
 let mask1 = tokmask(c1);
 let nl0 = _mm256_cmpeq_epi8(c0, nlv);
@@ -206,8 +214,8 @@ let m_nl0 = _mm256_movemask_epi8(nl0) as u32;
 let m_nl1 = _mm256_movemask_epi8(nl1) as u32;
 let mask_nl = (m_nl0 as u64) | ((m_nl1 as u64) << 32);
 let mut mask_tok = (mask0 as u64) | ((mask1 as u64) << 32);
-let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 64 };
-if mask_nl != 0 { mask_tok &= if nl_pos == 64 { u64::MAX } else { (1u64 << nl_pos).wrapping_sub(1) }; }
+let nl_pos = mask_nl.trailing_zeros() as usize;
+if mask_nl != 0 { mask_tok = core::arch::x86_64::_bzhi_u64(mask_tok, nl_pos as u32); }
 let mut offset = 0usize;
 let mut crossed = false;
 while mask_tok != 0 {
@@ -223,13 +231,13 @@ crossed = true;
 break; }
 let (w0, w1);
 if len <= 8 {
-let raw = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
+let raw = std::ptr::read_unaligned(blk.add(tok_start) as *const u64) | 0x2020202020202020;
 w0 = core::arch::x86_64::_bzhi_u64(raw, (len << 3) as u32);
 w1 = 0;
 process_token(w0, w1, len, &[]);
 } else if len <= 16 {
-w0 = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
-let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) | 0x2020202020202020;
+w0 = std::ptr::read_unaligned(blk.add(tok_start) as *const u64) | 0x2020202020202020;
+let raw1 = std::ptr::read_unaligned(blk.add(tok_start + 8) as *const u64) | 0x2020202020202020;
 w1 = core::arch::x86_64::_bzhi_u64(raw1, ((len - 8) << 3) as u32);
 process_token(w0, w1, len, &[]);
 } else {
@@ -755,32 +763,45 @@ p += 1;
 let d_w = (d as usize) >> 6;
 let d_b = 1u64 << (d & 63);
 let (mut nh, mut ov) = (0usize, false);
-scan_doc(d_buf, &mut p, q_buf, rep_map, g_bs_ptr, w_per_doc, d_w, d_b, |t| {
-let bi = *bs_idx.add(t);
-if bi != u16::MAX {
-    *g_bs_ptr.add((bi as usize) * w_per_doc + d_w) |= d_b;
-} else {
-    let (w, b) = (t >> 6, 1u64 << (t & 63));
-    let sw = *seen.get_unchecked(w);
-    if sw & b == 0 {
-        *seen.get_unchecked_mut(w) = sw | b;
-        if nh < 2048 {
-            *hl.get_unchecked_mut(nh) = t as u32;
-            nh += 1;
-        } else { ov = true; }
-        *co_ptr.add(t) += 1;
-        if fw_idx + 2 < FW_CAP {
-            if t < 65535 {
-                *fw_ptr.add(fw_idx) = t as u16;
-                fw_idx += 1;
-            } else {
-                *fw_ptr.add(fw_idx) = 65535;
-                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
-                fw_idx += 2;
+let mut doc_bs = [0u64; 8];
+let doc_bs_ptr = doc_bs.as_mut_ptr();
+scan_doc(d_buf, &mut p, q_buf, rep_map, doc_bs_ptr, |t| {
+    let bi = *bs_idx.add(t);
+    if bi != u16::MAX {
+        let bi_u = bi as usize;
+        *doc_bs_ptr.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
+    } else {
+        let (w, b) = (t >> 6, 1u64 << (t & 63));
+        let sw = *seen.get_unchecked(w);
+        if sw & b == 0 {
+            *seen.get_unchecked_mut(w) = sw | b;
+            if nh < 2048 {
+                *hl.get_unchecked_mut(nh) = t as u32;
+                nh += 1;
+            } else { ov = true; }
+            *co_ptr.add(t) += 1;
+            if fw_idx + 2 < FW_CAP {
+                if t < 65535 {
+                    *fw_ptr.add(fw_idx) = t as u16;
+                    fw_idx += 1;
+                } else {
+                    *fw_ptr.add(fw_idx) = 65535;
+                    *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
+                    fw_idx += 2;
+                }
             }
         }
     }
-} });
+});
+for w in 0..8 {
+    let mut bits = doc_bs[w];
+    while bits != 0 {
+        let bit = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let bi = (w << 6) | bit;
+        *g_bs_ptr.add(bi * w_per_doc + d_w) |= d_b;
+    }
+}
 if ov  { seen.fill(0); } else {
 for i in 0..nh  { *seen.get_unchecked_mut((*hl.get_unchecked(i) >> 6) as usize) = 0; } }
 d += 1;
@@ -886,7 +907,8 @@ while sp < f_sz && d_buf[sp] != b'\t'  { sp += 1; }
 if sp >= f_sz  { break; }
 sp += 1;
 let (mut nh, mut ov) = (0usize, false);
-scan_doc(d_buf, &mut sp, q_buf, &rep_map, std::ptr::null_mut(), 0, 0, 0, |t| {
+let mut dummy_bs = [0u64; 8];
+scan_doc(d_buf, &mut sp, q_buf, &rep_map, dummy_bs.as_mut_ptr(), |t| {
 let (w, b) = (t >> 6, 1u64 << (t & 63));
 let sw = *s_seen.get_unchecked(w);
 if sw & b == 0 {
