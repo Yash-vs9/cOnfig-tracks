@@ -5,7 +5,6 @@
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 struct Agg {
   uint32_t cnt, dn;
@@ -20,21 +19,23 @@ static uint8_t reg_lut[1000000];
 static uint16_t c_to_dense[17577];
 static char dense_to_code[256][4], out_buf[65536];
 static Agg G[256], T[12][256];
-static size_t cs[13], qc[12], iq[12];
 
 constexpr uint32_t HT_MASK = (1 << 18) - 1;
 static uint64_t name_keys[1 << 18], name_bits[1 << 18][4];
+static size_t cs[13], qc[12], iq[12];
 
 static inline void fmt_cents(char *&p, int64_t c) {
   if (c < 0) *p++ = '-', c = -c;
   p = std::to_chars(p, p + 20, c / 100).ptr;
   *p++ = '.', *p++ = '0' + (c % 100) / 10, *p++ = '0' + (c % 10), *p++ = ' ';
 }
+
 static inline int64_t parse_u(const char *&p) {
   int64_t x = 0;
   while (*p != ',') x = (x << 3) + (x << 1) + (*p++ - '0');
   return ++p, x;
 }
+
 static inline uint64_t hash_bytes(const char *s, uint32_t len) {
   uint64_t h1 = len ^ 0x811c9dc5ULL, h2 = (uint64_t)len * 0x9e3779b97f4a7c15ULL, w = 0, w1 = 0;
   if (__builtin_expect(len - 8U <= 8U, 1)) {
@@ -55,6 +56,7 @@ static inline uint64_t hash_bytes(const char *s, uint32_t len) {
   }
   return ((h1 << 32) ^ h2) | 0x100ULL;
 }
+
 static inline bool is_rec_end(const char *base, size_t sz, const char *nl) {
   const char *p = nl;
   if (p > base && p[-1] == '\r') --p;
@@ -90,16 +92,11 @@ int main(int argc, char **argv) {
   if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
 
   memset(reg_lut, 0xFF, sizeof(reg_lut));
-  if (rsz && rb) {
-    const char *nl = (const char *)memchr(rb, '\n', rsz);
-    if (nl) {
-      for (const char *p = nl + 1; p < rb + rsz;) {
-        while (p < rb + rsz && *p++ != ',') {}
-        if (p + 3 <= rb + rsz) {
-          c_to_dense[(p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1] = 1;
-        }
-        while (p < rb + rsz && *p++ != '\n') {}
-      }
+  if (rsz) {
+    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
+      while (*p++ != ',') {}
+      c_to_dense[(p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1] = 1;
+      while (p < rb + rsz && *p++ != '\n') {}
     }
   }
   uint8_t nc = 0;
@@ -109,23 +106,17 @@ int main(int argc, char **argv) {
       dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
       c_to_dense[c] = nc++;
     }
-  if (rsz && rb) {
-    const char *nl = (const char *)memchr(rb, '\n', rsz);
-    if (nl) {
-      for (const char *p = nl + 1; p < rb + rsz;) {
-        uint32_t reg = (uint32_t)parse_u(p);
-        if (p + 3 <= rb + rsz) {
-          uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
-          if (reg < 1000000) reg_lut[reg] = (uint8_t)c_to_dense[code];
-        }
-        while (p < rb + rsz && *p++ != '\n') {}
-      }
+  if (rsz) {
+    for (const char *p = (const char *)memchr(rb, '\n', rsz) + 1; p < rb + rsz;) {
+      uint32_t reg = (uint32_t)parse_u(p);
+      uint16_t code = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A') + 1;
+      if (reg < 1000000) reg_lut[reg] = (uint8_t)c_to_dense[code];
+      while (p < rb + rsz && *p++ != '\n') {}
     }
   }
   uint8_t unm_cid = nc;
 
-  const char *fnl = (sz && base) ? (const char *)memchr(base, '\n', sz) : nullptr;
-  size_t bo = fnl ? (fnl + 1 - base) : 0;
+  size_t bo = sz ? ((const char *)memchr(base, '\n', sz) + 1 - base) : 0;
   for (int t = 0; t <= 12; ++t) cs[t] = bo + (sz - bo) * t / 12;
 
   if (sz >= 65536) {
@@ -154,15 +145,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 256; ++i) T[tid][i].mi = INT64_MAX, T[tid][i].ma = INT64_MIN;
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[520];
+    alignas(64) uint64_t tl_cache[2048][2] = {0};
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
 
     auto find_q = [&](const char *s) -> const char * {
-      while (s + 32 <= end) {
+      if (__builtin_expect(s + 32 <= end, 1)) {
         uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), q_vec));
         if (m) return s + __builtin_ctz(m);
-        s += 32;
       }
-      return (s < end) ? (const char *)memchr(s, '"', end - s) : end;
+      return (const char *)memchr(s, '"', end - s);
     };
 
     while (p < end) {
@@ -194,7 +185,7 @@ int main(int argc, char **argv) {
           uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), c_vec));
           if (m) q = p + __builtin_ctz(m);
         }
-        if (!q) q = (p < end) ? (const char *)memchr(p, ',', end - p) : end;
+        if (!q) q = (const char *)memchr(p, ',', end - p);
         nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 1;
       }
 
@@ -238,34 +229,30 @@ int main(int argc, char **argv) {
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
 
-      for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
-        uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
-        if (!k) {
-          k = __sync_val_compare_and_swap(&name_keys[slot], 0ULL, nh);
-          if (!k) k = nh;
-        }
-        if (k == nh) {
-          uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-          if (!(*w & mask)) __atomic_fetch_or(w, mask, __ATOMIC_RELAXED);
-          break;
+      uint32_t tl_idx = (uint32_t)nh & 2047;
+      uint64_t tl_sig = (nh & ~0xFFULL) | cid;
+      if (tl_cache[tl_idx][0] != tl_sig && tl_cache[tl_idx][1] != tl_sig) {
+        tl_cache[tl_idx][1] = tl_cache[tl_idx][0];
+        tl_cache[tl_idx][0] = tl_sig;
+        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
+          uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
+          if (!k) {
+            k = __sync_val_compare_and_swap(&name_keys[slot], 0ULL, nh);
+            if (!k) k = nh;
+          }
+          if (k == nh) {
+            uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+            if (!(*w & mask) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
+            break;
+          }
         }
       }
     }
   }
 
-#pragma omp parallel for num_threads(12)
-  for (int cid = 0; cid <= unm_cid; ++cid) {
-    uint32_t word_idx = cid >> 6;
-    uint64_t mask = 1ULL << (cid & 63);
-    uint32_t dn = 0;
-    for (uint32_t slot = 0; slot <= HT_MASK; ++slot) {
-      if (name_bits[slot][word_idx] & mask) dn++;
-    }
-    G[cid].dn = dn;
-  }
-
   for (int cid = 0; cid <= unm_cid; ++cid)
     for (int tid = 0; tid < 12; ++tid) {
+      G[cid].dn += T[tid][cid].dn;
       if (T[tid][cid].cnt) G[cid].add(T[tid][cid]);
     }
 
