@@ -30,8 +30,10 @@
   - Time: 0.252548s, Memory: 74.09 MB, Points: 63.781 (stable, all gates passed).
   - Feature: 1024-slot L1 direct-mapped `FAST_CACHE` pre-populating top query terms.
 
-- **Current Optimization (6 Physical P-Core Architecture & <43.98 MB 50x Memory Cap)**:
-  - **6 Dedicated Physical Core Threads (`NUM_T = 6`)**: Eliminates SMT sibling contention, giving each worker thread exclusive ownership of the 48 KB L1 Data Cache, 2 MB L2 cache, and full 12-port execution pipeline.
-  - **Incremental 512 KB Page Cache Eviction**: Calls `MADV_DONTNEED` every 512 KB during scanning instead of waiting for full chunk completion, ensuring only ~3 MB of file pages are active at any moment across all threads.
-  - **Top-384 Frequency-Ranked Bitset Cap (`MAX_BS = 384`)**: Prioritizes true high-frequency corpus stop words in descending sample count order, shrinking `g_bs` by ~13-19 MB.
-  - **Tighter Buffer Capacities (`FW_CAP = 500k`, `DP_CAP = 16k`)**: Safely accommodates the 24 chunk partitioning while saving ~10 MB of anonymous mapping space. Total peak RSS targeted below 43.98 MB to unlock the maximum 50x memory multiplier.
+- **Experiment: 6 Physical P-Cores vs 12 SMT Threads** | Run `run-1841642801c6` (Commit `e5697e2`):
+  - Time: 0.457495s, Memory: 59.88 MB.
+  - **Empirical Finding**: 6 threads is 1.82x slower than 12 SMT threads (457 ms vs 251 ms). On Raptor Lake Golden Cove P-cores, 2-way SMT delivers nearly double the aggregate pipeline throughput by hiding L2/L3 memory latencies during posting list traversals and hash probes.
+  - Restored 12 SMT threads (`NUM_T = 12`), full `FW_CAP = 700k`, and `DP_CAP = 32k`.
+
+- **Current Optimization (SIMD Postings Intersection & Dual-Block Scanner)**:
+  - 12 threads with L1-resident `FAST_CACHE` and unrolled vector scanning.
