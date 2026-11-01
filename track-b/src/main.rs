@@ -506,13 +506,14 @@ pw0[i] = ti.w0;
 pw1[i] = ti.w1;
 plen[i] = ti.len as usize;
 poff[i] = ti.off as usize; }
-let first_ch = (pw0[0] & 0xFF) as u8;
+let anchor = if k == 2 && TINFO[q_ts[1] as usize].df < TINFO[q_ts[0] as usize].df { 1 } else { 0 };
+let first_ch = (pw0[anchor] & 0xFF) as u8;
 let first_up = if first_ch >= b'a' && first_ch <= b'z' { first_ch - 32 } else { first_ch };
 let (v_lo, v_up, v_nl) = (_mm256_set1_epi8(first_ch as i8), _mm256_set1_epi8(first_up as i8), _mm256_set1_epi8(b'\n' as i8));
-let c1_lo = ((pw0[0] >> 8) & 0xFF) as u8;
+let c1_lo = ((pw0[anchor] >> 8) & 0xFF) as u8;
 let c1_up = if c1_lo >= b'a' && c1_lo <= b'z' { c1_lo - 32 } else { c1_lo };
 let (v1_lo, v1_up) = (_mm256_set1_epi8(c1_lo as i8), _mm256_set1_epi8(c1_up as i8));
-let p0_has_2 = plen[0] >= 2;
+let p0_has_2 = plen[anchor] >= 2;
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let cand = cand_uninit.assume_init_mut();
@@ -586,7 +587,8 @@ tp += 1; }
 true };
 for ci in 0..clen {
 let d = cs + cand[ci] as u32;
-let mut sp = *self.doc_ts.get_unchecked(d as usize) as usize;
+let doc_start = *self.doc_ts.get_unchecked(d as usize) as usize;
+let mut sp = doc_start;
 let mut matched = false;
 'doc_scan: loop {
 if sp + 32 <= d_len {
@@ -609,7 +611,76 @@ while valid_ch != 0 {
 let bit = valid_ch.trailing_zeros() as usize;
 valid_ch &= valid_ch - 1;
 let cand_p = sp + bit;
-if !is_alnum(*d_ptr.add(cand_p - 1)) && try_match(cand_p) {
+let is_ok = if anchor == 0 {
+    !is_alnum(*d_ptr.add(cand_p - 1)) && try_match(cand_p)
+} else {
+    let l1 = plen[1];
+    let mut ok = !is_alnum(*d_ptr.add(cand_p - 1)) && !is_alnum(*d_ptr.add(cand_p + l1));
+    if ok {
+        let l = l1;
+        if l <= 8 {
+            let raw = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
+            let mask = if l == 8 { u64::MAX } else { (1u64 << (l * 8)) - 1 };
+            if (raw & mask) != pw0[1] { ok = false; }
+        } else if l <= 16 {
+            let raw0 = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
+            let raw1 = ptr::read_unaligned(d_ptr.add(cand_p + 8) as *const u64) | 0x2020202020202020;
+            let mask1 = if l == 16 { u64::MAX } else { (1u64 << ((l - 8) * 8)) - 1 };
+            if raw0 != pw0[1] || (raw1 & mask1) != pw1[1] { ok = false; }
+        } else {
+            let raw0 = ptr::read_unaligned(d_ptr.add(cand_p) as *const u64) | 0x2020202020202020;
+            let raw1 = ptr::read_unaligned(d_ptr.add(cand_p + 8) as *const u64) | 0x2020202020202020;
+            if raw0 != pw0[1] || raw1 != pw1[1] { ok = false; } else {
+                let q_tail = &self.q_buf[poff[1] + 16..poff[1] + l1];
+                let d_tail = std::slice::from_raw_parts(d_ptr.add(cand_p + 16), l1 - 16);
+                for t_idx in 0..l1 - 16 {
+                    if (d_tail[t_idx] | 0x20) != q_tail[t_idx] { ok = false; break; }
+                }
+            }
+        }
+    }
+    if ok {
+        let mut lp = cand_p - 1;
+        if *d_ptr.add(lp) == b' ' && is_alnum(*d_ptr.add(lp.wrapping_sub(1))) {
+            lp -= 1;
+        } else {
+            while lp > doc_start && !is_alnum(*d_ptr.add(lp)) {
+                if *d_ptr.add(lp) == b'\n' { ok = false; break; }
+                lp -= 1;
+            }
+        }
+        if ok {
+            let l0 = plen[0];
+            if lp + 1 < doc_start + l0 { ok = false; } else {
+                let w0_start = lp + 1 - l0;
+                if w0_start > doc_start && is_alnum(*d_ptr.add(w0_start - 1)) { ok = false; } else {
+                    if l0 <= 8 {
+                        let raw = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
+                        let mask = if l0 == 8 { u64::MAX } else { (1u64 << (l0 * 8)) - 1 };
+                        if (raw & mask) != pw0[0] { ok = false; }
+                    } else if l0 <= 16 {
+                        let raw0 = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
+                        let raw1 = ptr::read_unaligned(d_ptr.add(w0_start + 8) as *const u64) | 0x2020202020202020;
+                        let mask1 = if l0 == 16 { u64::MAX } else { (1u64 << ((l0 - 8) * 8)) - 1 };
+                        if raw0 != pw0[0] || (raw1 & mask1) != pw1[0] { ok = false; }
+                    } else {
+                        let raw0 = ptr::read_unaligned(d_ptr.add(w0_start) as *const u64) | 0x2020202020202020;
+                        let raw1 = ptr::read_unaligned(d_ptr.add(w0_start + 8) as *const u64) | 0x2020202020202020;
+                        if raw0 != pw0[0] || raw1 != pw1[0] { ok = false; } else {
+                            let q_tail = &self.q_buf[poff[0] + 16..poff[0] + l0];
+                            let d_tail = std::slice::from_raw_parts(d_ptr.add(w0_start + 16), l0 - 16);
+                            for t_idx in 0..l0 - 16 {
+                                if (d_tail[t_idx] | 0x20) != q_tail[t_idx] { ok = false; break; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ok
+};
+if is_ok {
 matched = true;
 break 'doc_scan; } }
 if nl_pos < 32  { break 'doc_scan; }
