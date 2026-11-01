@@ -14,4 +14,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | 4-load branchless AVX2/CRC32 hash, 2048 L1 cache, 65k big-lat pool, N_BLK=13312 static arena | run-2f56a6016af5 | 0.0534 | 43.2 | 69.75 |
 | 8 | Zero-copy mmap, writev batched output, 98k latency slab eliminating heap alloc, 256-entry ep_c cache | 282a0d6 | 0.034 | 35.0 | 76.695 |
 | 9 | Single-pass register loop, madvise, 4k direct cache, right-sized arena | b4cc94d | 0.033 | 34.0 | 77.129 |
-| 10 | Dynamic lock-free hour work-stealing, unchecked hot bounds, single writev | pending | 0.024 | 34.0 | 80.50 |
+| 10 | 8k L1 direct cache, zero-alloc 12-thread batched writev, 4-byte err=0 fastpath, M=34MB | pending | 0.025 | 34.0 | 80.20 |
