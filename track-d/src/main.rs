@@ -13,10 +13,10 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 131072;
+const H_SZ: usize = 65536;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 17;
-const H_MAX_LOAD: u32 = 85000;
+const H_SHIFT: u32 = 32 - 16;
+const H_MAX_LOAD: u32 = 45000;
 const BUF_SZ: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
@@ -24,14 +24,13 @@ struct Query(u32, u32, u32);
 
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
-struct Slot(u32, u32, u32, u32); // (v, fwd, rev, epoch)
+struct Slot(u32, u32, u32, u32);
 
 struct FastDistMap {
     slots: Vec<Slot>,
     epoch: u32,
     used: u32,
 }
-
 impl FastDistMap {
     fn new() -> Self {
         Self { slots: unsafe { std::mem::transmute(vec![0u128; H_SZ]) }, epoch: 1, used: 0 }
@@ -109,7 +108,6 @@ impl FastDistMap {
 struct MinHeap {
     data: Vec<u64>,
 }
-
 impl MinHeap {
     fn with_capacity(cap: usize) -> Self { Self { data: Vec::with_capacity(cap) } }
     #[inline(always)]
@@ -300,12 +298,12 @@ fn main() {
     let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
         let mut handlers = Vec::with_capacity(nt);
         for t in 0..nt {
-            let (start, finish, hf, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &gf);
+            let (start, finish, hf, hr, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
             handlers.push(scope.spawn(move || {
                 let mut local_oflow = Vec::new();
                 let mut buf = vec![0u8; BUF_SZ + 64];
                 let (mut off, mut left) = (start, 0usize);
-                let ef_ptr = ef_addr as *mut u32;
+                let (ef_ptr, er_ptr) = (ef_addr as *mut u32, er_addr as *mut u32);
                 while off < finish {
                     let to_read = (finish - off).min(BUF_SZ);
                     let got = gf_ref.read_at(&mut buf[left..left + to_read], off as u64).unwrap_or(0);
@@ -328,7 +326,12 @@ fn main() {
                                 let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
                                 let ifwd = hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed) as usize;
                                 *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
-                                if pw == W_SENTINEL { local_oflow.push((ifwd as u32, w)); }
+                                let irev = hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed) as usize;
+                                *er_ptr.add(irev) = (pw << 21) | (u & V_MASK);
+                                if pw == W_SENTINEL {
+                                    local_oflow.push((ifwd as u32, w));
+                                    local_oflow.push(((1u32 << 31) | (irev as u32), w));
+                                }
                             }
                         }
                     }
@@ -344,52 +347,16 @@ fn main() {
     drop(bounds);
     drop(gf);
 
-    let mut fwd_oflow: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
-    fwd_oflow.sort_unstable_by_key(|&(idx, _)| idx);
-
-    let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
-    if n > 0 { head_fwd.copy_within(0..n as usize, 1); }
-    head_fwd[0] = 0;
-
-    let n_nodes = n as usize;
-    let chunk_nodes = (n_nodes + nt - 1) / nt;
-    let rev_oflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
-        let mut handlers = Vec::with_capacity(nt);
-        for t in 0..nt {
-            let u_start = t * chunk_nodes;
-            let u_end = (u_start + chunk_nodes).min(n_nodes);
-            let (hf, ef, hr, fof) = (&head_fwd, &edges_fwd, &head_rev, &fwd_oflow);
-            handlers.push(scope.spawn(move || {
-                let mut local_roflow = Vec::new();
-                let er_ptr = er_addr as *mut u32;
-                for u in u_start..u_end {
-                    let e_start = hf[u] as usize;
-                    let e_end = hf[u + 1] as usize;
-                    for e in e_start..e_end {
-                        let packed = ef[e];
-                        let (v, pw) = (packed & V_MASK, packed >> 21);
-                        let irev = hr[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                        unsafe { *er_ptr.add(irev) = (pw << 21) | (u as u32); }
-                        if pw == W_SENTINEL {
-                            if let Ok(pos) = fof.binary_search_by_key(&(e as u32), |&(k, _)| k) {
-                                local_roflow.push(((1u32 << 31) | (irev as u32), fof[pos].1));
-                            }
-                        }
-                    }
-                }
-                local_roflow
-            }));
-        }
-        handlers.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut overflow_map = fwd_oflow;
-    overflow_map.extend(rev_oflows.into_iter().flatten());
+    let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
     overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
 
+    let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
     let mut head_rev: Vec<u32> = unsafe { std::mem::transmute(head_rev) };
-    if n > 0 { head_rev.copy_within(0..n as usize, 1); }
-    head_rev[0] = 0;
+    if n > 0 {
+        head_fwd.copy_within(0..n as usize, 1);
+        head_rev.copy_within(0..n as usize, 1);
+    }
+    head_fwd[0] = 0; head_rev[0] = 0;
 
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries");
     let mut queries = Vec::with_capacity(4096);
@@ -427,7 +394,7 @@ fn main() {
     let next_query = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
-        for _ in 0..6.min(unique_queries.len()) {
+        for _ in 0..nt.min(unique_queries.len()) {
             let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &unique_queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
             let has_oflow = !overflow_map.is_empty();
 
