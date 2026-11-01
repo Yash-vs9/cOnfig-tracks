@@ -264,9 +264,16 @@ unsafe fn intersect_and(&self, c: usize, t: usize, cs: u32, cand: &mut [u16], cl
 let mut w = 0usize;
 if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
+let mut last_w = usize::MAX;
+let mut curr_val = 0u64;
 for i in 0..clen {
 let ld = cand[i] as usize;
-if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) != 0 {
+let widx = ld >> 6;
+if widx != last_w {
+last_w = widx;
+curr_val = *src.get_unchecked(widx);
+}
+if (curr_val & (1u64 << (ld & 63))) != 0 {
 cand[w] = ld as u16;
 w += 1; } }
 } else {
@@ -301,9 +308,16 @@ unsafe fn intersect_not(&self, c: usize, t: usize, cs: u32, cand: &mut [u16], cl
 let mut w = 0usize;
 if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
+let mut last_w = usize::MAX;
+let mut curr_val = 0u64;
 for i in 0..clen {
 let ld = cand[i] as usize;
-if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) == 0 {
+let widx = ld >> 6;
+if widx != last_w {
+last_w = widx;
+curr_val = *src.get_unchecked(widx);
+}
+if (curr_val & (1u64 << (ld & 63))) == 0 {
 cand[w] = ld as u16;
 w += 1; } }
 } else {
