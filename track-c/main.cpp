@@ -21,10 +21,10 @@ struct alignas(64) Agg {
 static uint8_t reg_lut[1000000];
 static uint16_t c_to_dense[17577];
 static char dense_to_code[256][4], out_buf[65536];
-static Agg G[256], T[12][256];
+static Agg T[12][256];
 constexpr uint32_t HT_CAP = 1 << 17, HT_MASK = HT_CAP - 1;
 static uint64_t name_keys[HT_CAP], name_bits[HT_CAP][4];
-static size_t cs[13], rcs[13];
+static size_t cs[13];
 static uint8_t unm_cid;
 
 static inline void fmt_cents(char *&p, int64_t c) {
@@ -33,7 +33,7 @@ static inline void fmt_cents(char *&p, int64_t c) {
   *p++ = '.', *p++ = '0' + (c % 100) / 10, *p++ = '0' + (c % 10), *p++ = ' ';
 }
 static inline uint32_t parse_u(const char *&p) {
-  int64_t x = *p++ - '0';
+  uint32_t x = *p++ - '0';
   while (*p != ',') x = x * 10 + (*p++ - '0');
   return ++p, x;
 }
@@ -55,22 +55,22 @@ static inline uint64_t hash_fast(const char *s, uint32_t len) {
   uint64_t h = (h1 ^ (h2 * 0x9e3779b97f4a7c15ULL));
   return (h ^ (h >> 31)) ? (h ^ (h >> 31)) : 1;
 }
-static inline bool is_rec_end(const char *base, size_t sz, const char *nl) {
-  const char *p = nl;
-  p > base &&p[-1] == '\r' ? --p : 0;
-  if (p - base < 6 || p[-3] != '.' || p[-1] < '0' || p[-1] > '9' || p[-2] < '0' || p[-2] > '9') return false;
+static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
+  const char *p = nl - (nl > b && nl[-1] == '\r');
+  if (p - b < 6 || p[-3] != '.' || (uint32_t)(p[-1] - '0') > 9 || (uint32_t)(p[-2] - '0') > 9) return 0;
   p -= 3;
-  int d_am = 0, d_reg = 0, d_id = 0;
-  while (p > base && p[-1] >= '0' && p[-1] <= '9') --p, ++d_am;
-  if (!d_am || (p > base && p[-1] == '-' && --p, p <= base || p[-1] != ',')) return false;
-  --p;
-  while (p > base && p[-1] >= '0' && p[-1] <= '9') --p, ++d_reg;
-  if (!d_reg || p <= base || p[-1] != ',') return false;
+  const char *s = p;
+  while (p > b && (uint32_t)(p[-1] - '0') <= 9) --p;
+  if (p == s || (p > b && p[-1] == '-' && --p, p <= b || p[-1] != ',')) return 0;
+  s = --p;
+  while (p > b && (uint32_t)(p[-1] - '0') <= 9) --p;
+  if (p == s || p <= b || p[-1] != ',') return 0;
   const char *nx = nl + 1;
-  if (nx >= base + sz) return true;
-  if (nx + 3 <= base + sz && (uint8_t)nx[0] == 0xEF && (uint8_t)nx[1] == 0xBB && (uint8_t)nx[2] == 0xBF) nx += 3;
-  while (nx < base + sz && *nx >= '0' && *nx <= '9') ++nx, ++d_id;
-  return d_id > 0 && nx < base + sz && *nx == ',';
+  if (nx >= b + sz) return 1;
+  nx += (nx + 3 <= b + sz && (uint8_t)nx[0] == 0xEF && (uint8_t)nx[1] == 0xBB && (uint8_t)nx[2] == 0xBF) ? 3 : 0;
+  s = nx;
+  while (nx < b + sz && (uint32_t)(*nx - '0') <= 9) ++nx;
+  return nx > s && nx < b + sz && *nx == ',';
 }
 
 int main(int argc, char **argv) {
@@ -88,54 +88,46 @@ int main(int argc, char **argv) {
   };
   const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
 
-  size_t ro = rsz ? ((const char *)memchr(rb, '\n', rsz) + 1 - rb) : 0;
-  for (int t = 0; t <= 12; ++t) rcs[t] = ro + (rsz - ro) * t / 12;
+  if (rsz) {
+    const char *rp = (const char *)memchr(rb, '\n', rsz) + 1, *rend = rb + rsz, *rstart = rp;
+    while (rp < rend) {
+      while (*rp++ != ',') {}
+      uint16_t code = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + (rp[2] - 'A') + 1;
+      c_to_dense[code] = 1, rp += (rp[3] == '\r' ? 5 : 4);
+    }
+    uint8_t nc = 0;
+    for (uint16_t c = 1; c <= 17576; ++c) {
+      if (c_to_dense[c]) {
+        uint16_t v = c - 1;
+        dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
+        c_to_dense[c] = nc++;
+      }
+    }
+    unm_cid = nc, rp = rstart;
+    while (rp < rend) {
+      uint32_t reg = parse_u(rp);
+      uint16_t code = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + (rp[2] - 'A') + 1;
+      if (reg < 1000000) reg_lut[reg] = (uint8_t)(c_to_dense[code] + 1);
+      rp += (rp[3] == '\r' ? 5 : 4);
+    }
+  }
+
   size_t bo = sz ? ((const char *)memchr(base, '\n', sz) + 1 - base) : 0;
   for (int t = 0; t <= 12; ++t) cs[t] = bo + (sz - bo) * t / 12;
 
 #pragma omp parallel num_threads(12)
   {
     int tid = omp_get_thread_num();
-    if (tid > 0 && rsz) {
-      const char *p = (const char *)memchr(rb + rcs[tid], '\n', (rb + rsz) - (rb + rcs[tid]));
-      rcs[tid] = p ? (p - rb + 1) : rsz;
-    }
+    for (size_t i = (HT_CAP * 8) * tid / 12; i < (HT_CAP * 8) * (tid + 1) / 12; i += 4096)
+      ((volatile char *)name_keys)[i] = 0;
+    for (size_t i = (HT_CAP * 32) * tid / 12; i < (HT_CAP * 32) * (tid + 1) / 12; i += 4096)
+      ((volatile char *)name_bits)[i] = 0;
+
     if (tid > 0 && sz) {
       for (const char *p = base + cs[tid]; p < base + sz; ++p) {
         p = (const char *)memchr(p, '\n', (base + sz) - p);
         if (!p) { cs[tid] = sz; break; }
         if (is_rec_end(base, sz, p)) { cs[tid] = p - base + 1; break; }
-      }
-    }
-#pragma omp barrier
-    if (rsz) {
-      const char *rp = rb + rcs[tid], *rend = rb + rcs[tid + 1];
-      while (rp < rend) {
-        while (*rp++ != ',') {}
-        uint16_t code = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + (rp[2] - 'A') + 1;
-        c_to_dense[code] = 1, rp += (rp[3] == '\r' ? 5 : 4);
-      }
-    }
-#pragma omp barrier
-    if (tid == 0) {
-      uint8_t nc = 0;
-      for (uint16_t c = 1; c <= 17576; ++c) {
-        if (c_to_dense[c]) {
-          uint16_t v = c - 1;
-          dense_to_code[nc][0] = 'A' + v / 676, dense_to_code[nc][1] = 'A' + (v / 26) % 26, dense_to_code[nc][2] = 'A' + v % 26;
-          c_to_dense[c] = nc++;
-        }
-      }
-      unm_cid = nc;
-    }
-#pragma omp barrier
-    if (rsz) {
-      const char *rp = rb + rcs[tid], *rend = rb + rcs[tid + 1];
-      while (rp < rend) {
-        uint32_t reg = parse_u(rp);
-        uint16_t code = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + (rp[2] - 'A') + 1;
-        if (reg < 1000000) reg_lut[reg] = (uint8_t)(c_to_dense[code] + 1);
-        rp += (rp[3] == '\r' ? 5 : 4);
       }
     }
 #pragma omp barrier
@@ -155,7 +147,8 @@ int main(int argc, char **argv) {
 
     while (p < end) {
       if (__builtin_expect((uint8_t)*p == 0xEF, 0)) p += 3;
-      int64_t id = parse_u(p), nb = 0, ntb = 0;
+      uint32_t id = parse_u(p);
+      int64_t nb = 0, ntb = 0;
       uint64_t nh = 0;
 
       if (__builtin_expect(*p == '"', 1)) {
@@ -279,15 +272,15 @@ int main(int argc, char **argv) {
   }
 
   for (int cid = 0; cid <= unm_cid; ++cid)
-    for (int tid = 0; tid < 12; ++tid) {
-      G[cid].dn += T[tid][cid].dn;
-      if (T[tid][cid].cnt) G[cid].add(T[tid][cid]);
+    for (int tid = 1; tid < 12; ++tid) {
+      T[0][cid].dn += T[tid][cid].dn;
+      if (T[tid][cid].cnt) T[0][cid].add(T[tid][cid]);
     }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) { ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' '; };
   for (int cid = 0; cid <= unm_cid; ++cid) {
-    Agg &g = G[cid];
+    Agg &g = T[0][cid];
     if (!g.cnt) continue;
     if (cid == unm_cid) memcpy(ptr, "_UNMATCHED ", 11), ptr += 11;
     else memcpy(ptr, dense_to_code[cid], 3), ptr[3] = ' ', ptr += 4;

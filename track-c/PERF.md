@@ -91,9 +91,16 @@ The unoptimized Python/reference baseline took 20.64 s and consumed 367 MB RSS.
 - **Scorer Line Counting Diagnostics:** Clarified that the official leaderboard runs `clang-format` before running `scc`, expanding single-statement lines to 377 lines (371 in C++ + 6 in Dockerfile).
 - **Result:** $T$ dropped to a record **0.041 s**, memory held at **10.0 MB**, score reached **75.012 pts**.
 
-### Step 14: 59% Name Branch Misprediction Fix, Branchless 0-Loop Amount Fastpath, 32-Bit `parse_u` (`pending`)
-- **Branch Misprediction Fix in `hash_fast`:** 59.1% of all customer names in the dataset are $\le 8$ bytes. In Step 13, this branch was marked `__builtin_expect(len <= 8, 0)` (unlikely), causing the hardware branch predictor to mispredict on ~60% of all 3.32 million names (~15-20 cycles wasted per row). Changing the hint to `1` and using clean `_bzhi_u64(w, len << 3)` eliminates the mispredictions.
+### Step 14: 59% Name Branch Misprediction Fix, Branchless 0-Loop Amount Fastpath, 32-Bit `parse_u` (`572b9ec`, 75.188 pts)
+- **Branch Misprediction Fix in `hash_fast`:** 59.1% of all customer names in the dataset are $\le 8$ bytes. Marked `__builtin_expect(len <= 8, 1)` and used `_bzhi_u64(w, len << 3)` to eliminate branch mispredictions on 1.96M rows.
 - **Branchless / 0-Loop Fast Amount Parsing:** 39.7% of all rows (1.32M rows) have 1-digit amounts before the decimal point (`0.00`, `5.25`). Adding `if (*p != '.')` skips the `while` multiplication loop entirely on 40% of rows.
 - **Skip Redundant 64-Byte Note Rescan:** When two 32-byte AVX2 scans find no comma in unquoted notes, advancing `p = s + 64` prevents `memchr` from rescanning the first 64 bytes.
 - **32-Bit Integer Parsing:** Reduced register pressure by converting `id` and `rid` parsing to `uint32_t`.
-- **Result:** Average full dataset runtime dropped from 220 ms to 182 ms (-17.2% reduction locally).
+- **Result:** Official board scored $T = 0.0406\text{ s}$ (40.6 ms), $M = 9.84\text{ MB}$, $S = 380$, $K = 31.898$, score reached **75.188 pts** (`run-7e3624df8e04`).
+
+### Step 15: Single-Thread 1.4ms Region Parsing, 1-Barrier OpenMP Architecture, Parallel BSS Prefault, S=373 (`pending`, target 77–80+ pts)
+- **Single-Threaded Sequential 2-Pass Region Parsing:** Since `regions.csv` is only ~1.5 MB and already mapped in RAM, parsing sequentially in two fast passes takes only 1.49 ms total. Eliminates `rcs[13]`, deletes 3 OpenMP thread barriers, and removes 36 lines of synchronization code.
+- **Single OpenMP Barrier Architecture:** Worker threads now perform only one synchronization step: determining their `cs[tid]` record boundary offset via `is_rec_end` and immediately proceeding to streaming record parsing.
+- **Parallel BSS Memory Pre-Faulting:** Concurrently touches `name_keys` (1 MB) and `name_bits` (4 MB) across all 12 worker threads during thread launch (~0.2 ms), eliminating 1,280 on-demand soft page faults during record processing.
+- **Direct Accumulation into `T[0][cid]`:** Removed global `Agg G[256]` static array, aggregating threads 1..11 directly into thread 0's accumulator array.
+- **Concise Logic & Line Compression:** Streamlined `is_rec_end` and `fmt_cents` with unsigned comparisons, reducing canonical lines from 380 to 373 (`scc`).
