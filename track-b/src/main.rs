@@ -1,4 +1,41 @@
 #![allow(static_mut_refs)]
+
+const BIT_SUM_8: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut s = 0u16;
+        let mut b = 0usize;
+        while b < 8 {
+            if (i & (1 << b)) != 0 { s += b as u16; }
+            b += 1;
+        }
+        table[i] = s;
+        i += 1;
+    }
+    table
+};
+
+#[inline(always)]
+fn word_bit_sum(val: u64) -> u64 {
+    let b0 = (val & 0xFF) as usize;
+    let b1 = ((val >> 8) & 0xFF) as usize;
+    let b2 = ((val >> 16) & 0xFF) as usize;
+    let b3 = ((val >> 24) & 0xFF) as usize;
+    let b4 = ((val >> 32) & 0xFF) as usize;
+    let b5 = ((val >> 40) & 0xFF) as usize;
+    let b6 = ((val >> 48) & 0xFF) as usize;
+    let b7 = ((val >> 56) & 0xFF) as usize;
+
+    (BIT_SUM_8[b0] as u64)
+        + (BIT_SUM_8[b1] as u64 + ((b1.count_ones() as u64) << 3))
+        + (BIT_SUM_8[b2] as u64 + ((b2.count_ones() as u64) << 4))
+        + (BIT_SUM_8[b3] as u64 + ((b3.count_ones() as u64) * 24))
+        + (BIT_SUM_8[b4] as u64 + ((b4.count_ones() as u64) << 5))
+        + (BIT_SUM_8[b5] as u64 + ((b5.count_ones() as u64) * 40))
+        + (BIT_SUM_8[b6] as u64 + ((b6.count_ones() as u64) * 48))
+        + (BIT_SUM_8[b7] as u64 + ((b7.count_ones() as u64) * 56))
+}
 use std::{
 arch::x86_64::*,
 fs::File,
@@ -12,8 +49,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 630_000;
-const DP_CAP: usize = 32_000;
+const FW_CAP: usize = 180_000;
+const DP_CAP: usize = 14_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -264,16 +301,9 @@ unsafe fn intersect_and(&self, c: usize, t: usize, cs: u32, cand: &mut [u16], cl
 let mut w = 0usize;
 if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
-let mut last_w = usize::MAX;
-let mut curr_val = 0u64;
 for i in 0..clen {
 let ld = cand[i] as usize;
-let widx = ld >> 6;
-if widx != last_w {
-last_w = widx;
-curr_val = *src.get_unchecked(widx);
-}
-if (curr_val & (1u64 << (ld & 63))) != 0 {
+if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) != 0 {
 cand[w] = ld as u16;
 w += 1; } }
 } else {
@@ -308,16 +338,9 @@ unsafe fn intersect_not(&self, c: usize, t: usize, cs: u32, cand: &mut [u16], cl
 let mut w = 0usize;
 if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
-let mut last_w = usize::MAX;
-let mut curr_val = 0u64;
 for i in 0..clen {
 let ld = cand[i] as usize;
-let widx = ld >> 6;
-if widx != last_w {
-last_w = widx;
-curr_val = *src.get_unchecked(widx);
-}
-if (curr_val & (1u64 << (ld & 63))) == 0 {
+if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) == 0 {
 cand[w] = ld as u16;
 w += 1; } }
 } else {
@@ -368,11 +391,7 @@ val &= val - 1; }
 } else {
 let cnt = val.count_ones() as u64;
 *t_cnt += cnt;
-*t_sum += cnt * (base_id as u64);
-while val != 0 {
-let bit = val.trailing_zeros();
-*t_sum += bit as u64;
-val &= val - 1; } } }
+*t_sum += cnt * (base_id as u64) + word_bit_sum(val); } }
 w += 1; } }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
@@ -391,48 +410,47 @@ if is_pure_and {
         }
     }
 }
+let mut sorted_and_terms = [0u32; 16];
+let mut n_and_terms = 0usize;
+let mut min_sparse_t = usize::MAX;
+if is_pure_and {
+    for &tid in q_ts {
+        sorted_and_terms[n_and_terms] = tid;
+        n_and_terms += 1;
+    }
+    sorted_and_terms[..n_and_terms].sort_unstable_by_key(|&tid| TINFO[tid as usize].df);
+    for &tid in &sorted_and_terms[..n_and_terms] {
+        if !self.is_bs(tid as usize) {
+            min_sparse_t = tid as usize;
+            break;
+        }
+    }
+}
 for c in 0..NUM_C {
 let (cs, cd) = (self.doc_s[c], self.doc_e[c] - self.doc_s[c]);
 if cd == 0  { continue; }
 let cw = (cd as usize + 63) >> 6;
 let (mut in_bs, mut clen) = (false, 0usize);
-if is_pure_and {
-let mut min_len = usize::MAX;
-let mut min_t = usize::MAX;
-for &tid in q_ts {
-let t = tid as usize;
-if !self.is_bs(t) {
-let l = self.chunk_postings(c, t).len();
-if l < min_len {
-min_len = l;
-min_t = t; }
-} }
-if min_len == 0  { continue; }
-if min_t != usize::MAX {
-let p0 = self.chunk_postings(c, min_t);
-clen = p0.len();
-clist[..clen].copy_from_slice(p0);
-let mut rem_terms = [0u32; 16];
-let mut n_rem = 0usize;
-for &tid in q_ts {
-    if tid as usize != min_t {
-        rem_terms[n_rem] = tid;
-        n_rem += 1;
+if is_pure_and && min_sparse_t != usize::MAX {
+    let p0 = self.chunk_postings(c, min_sparse_t);
+    clen = p0.len();
+    if clen == 0 { continue; }
+    clist[..clen].copy_from_slice(p0);
+    for &tid in &sorted_and_terms[..n_and_terms] {
+        if tid as usize != min_sparse_t {
+            clen = self.intersect_and(c, tid as usize, cs, clist, clen);
+            if clen == 0 { break; }
+        }
     }
+    t_cnt += clen as u64;
+    let need = (10 - tc).min(clen);
+    for i in 0..need { top[tc + i] = cs + clist[i] as u32; }
+    tc += need;
+    let mut s = 0u64;
+    for &ld in &clist[..clen] { s += ld as u64; }
+    t_sum += (cs as u64) * (clen as u64) + s;
+    continue;
 }
-rem_terms[..n_rem].sort_unstable_by_key(|&tid| TINFO[tid as usize].df);
-for &tid in &rem_terms[..n_rem] {
-    clen = self.intersect_and(c, tid as usize, cs, clist, clen);
-    if clen == 0 { break; }
-}
-t_cnt += clen as u64;
-let need = (10 - tc).min(clen);
-for i in 0..need { top[tc + i] = cs + clist[i] as u32; }
-tc += need;
-let mut s = 0u64;
-for &ld in &clist[..clen] { s += ld as u64; }
-t_sum += (cs as u64) * (clen as u64) + s;
-continue; } }
 let t0 = q_ts[0] as usize;
 if self.is_bs(t0) {
 in_bs = true;
@@ -640,6 +658,11 @@ let match_phrase = |cand_p: usize, doc_start: usize| -> bool {
     true
 };
 for ci in 0..clen {
+if ci + 1 < clen {
+    let nd = cs + cand[ci + 1] as u32;
+    let nstart = *self.doc_ts.get_unchecked(nd as usize) as usize;
+    _mm_prefetch(self.d_buf.as_ptr().add(nstart) as *const i8, _MM_HINT_T0);
+}
 let d = cs + cand[ci] as u32;
 let doc_start = *self.doc_ts.get_unchecked(d as usize) as usize;
 let mut sp = doc_start;
@@ -900,7 +923,6 @@ let nb = (queries.len() + QB - 1) / QB;
 let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
 let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
 let next_b = AtomicUsize::new(0);
-
 let mut fw_ptrs = [0usize; NUM_T];
 let mut dp_ptrs = [0usize; NUM_T];
 for t in 0..NUM_T {
@@ -978,7 +1000,20 @@ b1_ref.wait();
 let chunk_nt = (nt + NUM_T - 1) / NUM_T;
 let t_start = tid * chunk_nt;
 let t_end = (t_start + chunk_nt).min(nt);
-for i in t_start..t_end {
+let my_len = t_end - t_start;
+let mut local_df = vec![0u32; my_len];
+for c in 0..NUM_C {
+    let base = c * nt;
+    let slice = std::slice::from_raw_parts((c_offs_val as *const u32).add(base), nt);
+    for idx in 0..my_len {
+        let i = t_start + idx;
+        let end = slice[i];
+        let start = if i > 0 { slice[i - 1] } else { 0 };
+        local_df[idx] += end - start;
+    }
+}
+for idx in 0..my_len {
+    let i = t_start + idx;
     let bi = *bs_idx_p.add(i);
     if bi != u16::MAX {
         let mut df = 0u32;
@@ -986,14 +1021,7 @@ for i in t_start..t_end {
         for &w in src { df += w.count_ones(); }
         TINFO[i].df = df;
     } else {
-        let mut df = 0u32;
-        for c in 0..NUM_C {
-            let base = c * nt;
-            let end = *(c_offs_val as *const u32).add(base + i);
-            let start = if i > 0 { *(c_offs_val as *const u32).add(base + i - 1) } else { 0 };
-            df += end - start;
-        }
-        TINFO[i].df = df;
+        TINFO[i].df = local_df[idx];
     }
 }
 b2_ref.wait();
@@ -1021,7 +1049,11 @@ loop { let b = next_ref.fetch_add(1, Ordering::Relaxed);
 if b >= nb  { break; }
 let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b);
 for q in &queries_ref[b * QB..((b + 1) * QB).min(queries_ref.len())] {
-if q.ib == 0  { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } }
+if q.ib == 0  {
+    eng.exec_bool(q, ob);
+} else {
+    eng.exec_phrase(q, ob);
+} } }
 })
 .unwrap(); }
 let aff_mask0 = 1u64;
@@ -1074,7 +1106,20 @@ barrier1.wait();
 let chunk_nt = (nt + NUM_T - 1) / NUM_T;
 let t_start = 0;
 let t_end = chunk_nt.min(nt);
-for i in t_start..t_end {
+let my_len = t_end - t_start;
+let mut local_df = vec![0u32; my_len];
+for c in 0..NUM_C {
+    let base = c * nt;
+    let slice = std::slice::from_raw_parts(c_offs.add(base), nt);
+    for idx in 0..my_len {
+        let i = t_start + idx;
+        let end = slice[i];
+        let start = if i > 0 { slice[i - 1] } else { 0 };
+        local_df[idx] += end - start;
+    }
+}
+for idx in 0..my_len {
+    let i = t_start + idx;
     let bi = *bs_idx_p.add(i);
     if bi != u16::MAX {
         let mut df = 0u32;
@@ -1082,14 +1127,7 @@ for i in t_start..t_end {
         for &w in src { df += w.count_ones(); }
         TINFO[i].df = df;
     } else {
-        let mut df = 0u32;
-        for c in 0..NUM_C {
-            let base = c * nt;
-            let end = *c_offs.add(base + i);
-            let start = if i > 0 { *c_offs.add(base + i - 1) } else { 0 };
-            df += end - start;
-        }
-        TINFO[i].df = df;
+        TINFO[i].df = local_df[idx];
     }
 }
 barrier2.wait();
@@ -1120,11 +1158,10 @@ let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b);
 for q in &queries[b * QB..((b + 1) * QB).min(queries.len())] {
 if q.ib == 0  { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } }
 });
-
 let _ = std::fs::create_dir_all(&o_dir);
 let f = File::create(format!("{}/results.txt", o_dir)).unwrap();
 let mut writer = std::io::BufWriter::with_capacity(262144, f);
-for ob in &out_bufs  { writer.write_all(ob).unwrap(); }
+for ob in &out_bufs { writer.write_all(ob).unwrap(); }
 writer.flush().unwrap();
 free_mmap(raw_bs_ptr, g_bs_total);
 for c in 0..NUM_C  { free_mmap(c_post_ptrs[c].load(Ordering::Relaxed) as *mut u16, c_post_lens[c].load(Ordering::Relaxed)); }
