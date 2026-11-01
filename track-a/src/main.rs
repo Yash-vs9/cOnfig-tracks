@@ -85,6 +85,7 @@ unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> u64 {
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
 unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let (s, lim, sv) = (S.0.get(), bp as usize + sz, _mm256_set1_epi8(b' ' as i8));
+    let q_base = (*s).q.as_mut_ptr();
     let u8_at = |q: *const u8| (q as *const u64).read_unaligned();
     let find = |q: *const u8, b: u8| memchr(q, b as _, lim - q as usize) as usize - q as usize;
     let sk = |i: usize| bp.add(if i > 0 && i < sz { i + find(bp.add(i - 1), b'\n') } else { i });
@@ -93,6 +94,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let (mut phw, mut phid) = (0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t]) = ([-1; 128], [-1; 128]);
     let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 4096]);
+    let mut cur_ptr: *mut u32 = std::ptr::null_mut();
     let (mut next_blk, mut next_hi) = (t * 1024, t * 4096);
 
     while p < ec {
@@ -103,6 +105,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             (phw, phid, lhw, hid) = (lhw, hid, hw, nhid);
             cur_b = (*s).h[1][t][hid];
             cur_f = if cur_b >= 0 { (*s).w.0[cur_b as usize] as usize } else { 256 };
+            cur_ptr = if cur_b >= 0 { q_base.add(cur_b as usize * 256 + cur_f) } else { std::ptr::null_mut() };
         }
         let x = u8_at(p.add(32)) ^ 0x2F2F_2F2F_2F2F_2F2F;
         let ep = p.add(32 + ((x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080).trailing_zeros() >> 3) as usize);
@@ -150,6 +153,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             (*s).n[nb as usize] = -1;
             if cur_b < 0 { (*s).h[0][t][hid] = nb; } else { (*s).n[cur_b as usize] = nb; }
             (cur_b, cur_f) = (nb, 0);
+            cur_ptr = q_base.add(nb as usize * 256);
         }
         let mut hb = lat;
         if lat >= 1 << 20 {
@@ -157,7 +161,9 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             hb = 0x10_0000 | (gi as u32);
             (*s).g[gi] = lat;
         }
-        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
+        *cur_ptr = (hb << 11) | (eid as u32);
+        cur_ptr = cur_ptr.add(1);
+        cur_f += 1;
     }
     if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[cur_b as usize] = cur_f as u16; }
     bar.wait();
@@ -208,6 +214,9 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                 let (i50, i95, i99) = (pct(50), pct(95), pct(99));
                 if n <= 2 {
                     if n == 2 && l[0] > l[1] { l.swap(0, 1); }
+                } else if n == 3 {
+                    if l[0] > l[1] { l.swap(0, 1); }
+                    if l[1] > l[2] { l.swap(1, 2); if l[0] > l[1] { l.swap(0, 1); } }
                 } else if n <= 32 {
                     l.sort_unstable();
                 } else {
@@ -221,9 +230,15 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                 copy((*s).p[eid] as *const u8, ptr.add(21), el);
                 *ptr.add(21 + el) = b' ';
                 ptr = ptr.add(22 + el);
-                let ppm = if err == 0 { 0 } else { ((err as u64) * 1_000_000 / (n as u64)) as u32 };
-                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
-                *ptr.sub(1) = b'\n';
+                for v in [n as u32, l[i50], l[i95], l[i99]] { ptr = fmt_u32_sp(ptr, v); }
+                if err == 0 {
+                    copy(b"0 0\n".as_ptr(), ptr, 4);
+                    ptr = ptr.add(4);
+                } else {
+                    let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
+                    ptr = fmt_u32_sp(fmt_u32_sp(ptr, err), ppm);
+                    *ptr.sub(1) = b'\n';
+                }
             }
         }
         (*s).p[2176 + t] = ptr as usize - out_b as usize;
