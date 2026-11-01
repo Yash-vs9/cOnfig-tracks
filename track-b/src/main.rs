@@ -84,17 +84,6 @@ m[(i - 32) as usize] = i; }
 if i == 255  { break; }
 i += 1; }
 m };
-const MASKS: [u64; 9] = [
-    0,
-    0x00000000000000FF,
-    0x000000000000FFFF,
-    0x0000000000FFFFFF,
-    0x00000000FFFFFFFF,
-    0x000000FFFFFFFFFF,
-    0x0000FFFFFFFFFFFF,
-    0x00FFFFFFFFFFFFFF,
-    0xFFFFFFFFFFFFFFFF,
-];
 #[repr(align(4096))]
 struct AlignedVTab([Slot; H_SZ]);
 static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
@@ -237,13 +226,13 @@ cross = true; break; }
 let (w0, w1);
 if len <= 8 {
 let raw = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
-w0 = raw & *MASKS.get_unchecked(len);
+w0 = core::arch::x86_64::_bzhi_u64(raw, (len << 3) as u32);
 w1 = 0;
 process_token(w0, w1, len, &[]);
 } else if len <= 16 {
 w0 = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
 let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) | 0x2020202020202020;
-w1 = raw1 & *MASKS.get_unchecked(len - 8);
+w1 = core::arch::x86_64::_bzhi_u64(raw1, ((len - 8) << 3) as u32);
 process_token(w0, w1, len, &[]);
 } else {
 let mut tp = *p + tok_start;
@@ -332,9 +321,8 @@ if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
 for i in 0..clen {
 let ld = cand[i] as usize;
-if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) != 0 {
 cand[w] = ld as u16;
-w += 1; } }
+w += ((*src.get_unchecked(ld >> 6) >> (ld & 63)) & 1) as usize; }
 } else {
 let o_post = self.chunk_postings(c, t);
 let olen = o_post.len();
@@ -369,9 +357,8 @@ if self.is_bs(t) {
 let src = &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
 for i in 0..clen {
 let ld = cand[i] as usize;
-if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) == 0 {
 cand[w] = ld as u16;
-w += 1; } }
+w += (((*src.get_unchecked(ld >> 6) >> (ld & 63)) & 1) ^ 1) as usize; }
 } else {
 let o_post = self.chunk_postings(c, t);
 let (mut i, mut j, olen) = (0usize, 0usize, o_post.len());
