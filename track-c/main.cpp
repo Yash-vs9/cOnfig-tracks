@@ -44,13 +44,8 @@ static inline uint64_t hash_fast(const char *s, uint32_t len) {
   uint64_t h1 = len ^ 0x811c9dc5ULL, h2 = (uint64_t)len * 0x9e3779b97f4a7c15ULL;
   if (__builtin_expect(len <= 8, 0)) {
     uint64_t w = 0;
-    if (len >= 4) {
-      uint32_t a, b;
-      memcpy(&a, s, 4), memcpy(&b, s + len - 4, 4);
-      w = ((uint64_t)b << 32) | a;
-    } else if (len > 0) {
-      for (uint32_t i = 0; i < len; ++i) w = (w << 8) | (uint8_t)s[i];
-    }
+    memcpy(&w, s, 8);
+    w = len ? _bzhi_u64(w, len * 8) : 0;
     h1 = _mm_crc32_u64(h1, w), h2 ^= w;
   } else if (__builtin_expect(len <= 16, 1)) {
     uint64_t a, b;
@@ -164,7 +159,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 256; ++i) T[tid][i].mi = INT64_MAX, T[tid][i].ma = INT64_MIN;
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[520];
-    uint64_t tl[1024][2] = {};
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
 
     auto find_q = [&](const char *s) -> const char * {
@@ -227,10 +221,22 @@ int main(int argc, char **argv) {
         const char *s = ++p;
         if (__builtin_expect(p + 32 <= end, 1)) {
           uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), q_vec));
-          uint32_t idx = __builtin_ctz(m);
-          if (__builtin_expect(m && s[idx + 1] != '"', 1)) {
-            ntb = idx, p = s + idx + 2;
-            goto note_done;
+          if (m) {
+            uint32_t idx = __builtin_ctz(m);
+            if (__builtin_expect(s[idx + 1] != '"', 1)) {
+              ntb = idx, p = s + idx + 2;
+              goto note_done;
+            }
+          } else if (__builtin_expect(p + 64 <= end, 1)) {
+            uint32_t m2 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(s + 32)), q_vec));
+            if (m2) {
+              uint32_t idx2 = __builtin_ctz(m2);
+              if (__builtin_expect(s[32 + idx2 + 1] != '"', 1)) {
+                ntb = 32 + idx2, p = s + 32 + idx2 + 2;
+                goto note_done;
+              }
+            }
+            p = s + 32;
           }
         }
         while (p + 32 <= end) {
@@ -271,24 +277,22 @@ int main(int argc, char **argv) {
       cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
       p += 1 + (*p == '\r');
 
-      T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
+      Agg &a = T[tid][cid];
+      a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
+      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
 
-      uint64_t sig = (nh & ~0xFFULL) | cid, *tc = tl[((uint32_t)(nh >> 8) ^ (cid * 131U)) & 1023];
-      if (__builtin_expect(tc[0] != sig && tc[1] != sig, 0)) {
-        tc[1] = tc[0], tc[0] = sig;
-        uint32_t slot;
-        for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
-          uint64_t k = name_keys[slot];
-          if (__builtin_expect(k == nh, 1)) break;
-          if (!k) {
-            if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) && name_keys[slot] != nh) continue;
-            break;
-          }
+      uint32_t slot;
+      for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
+        uint64_t k = name_keys[slot];
+        if (__builtin_expect(k == nh, 1)) break;
+        if (!k) {
+          if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) && name_keys[slot] != nh) continue;
+          break;
         }
-
-        uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-        if (__builtin_expect(!(*w & mask), 1) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
       }
+
+      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+      if (__builtin_expect(!(*w & mask), 1) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) a.dn++;
     }
   }
 
