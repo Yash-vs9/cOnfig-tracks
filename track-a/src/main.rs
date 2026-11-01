@@ -9,6 +9,7 @@ use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thre
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
+    fn madvise(a: *mut u8, l: usize, b: i32) -> i32;
     fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize;
 }
 
@@ -66,7 +67,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
-    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 2048]);
+    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 512]);
     while p < ec {
         let hw = u8_at(p.add(5));
         if hw != lhw {
@@ -76,7 +77,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         }
         let mut ep = p.add(32);
         if *ep != b'/' { ep = ep.add(1); while *ep != b'/' { ep = ep.add(1); } }
-        let m = if ep.add(32) <= ec { sp_m(ep) } else { 0 };
+        let m = if ep.add(64) <= ec { sp_m(ep) | (sp_m(ep.add(32)) << 32) } else { 0 };
         let el = if m != 0 { m.trailing_zeros() as usize } else { find(ep, b' ') };
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| u8_at(ep.add(o)) & m8;
@@ -84,7 +85,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let ci = ((h >> 16) as usize) & 2047;
+        let ci = ((h >> 16) as usize) & 511;
         let mut kv = ep_c[ci];
         if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
         let eid = (kv & 0xFFFF) as usize;
@@ -201,6 +202,7 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
+            madvise(base as *mut _, sz, 2);
             let bar = Barrier::new(12);
             let (out_fd, bar) = (outf.as_raw_fd(), &bar);
             std::thread::scope(|sc| {
