@@ -28,8 +28,8 @@ static size_t cs[13];
 static uint8_t unm_cid;
 
 static inline uint32_t mm_find(const char *p, __m256i v) {
-  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-      _mm256_loadu_si256((const __m256i *)p), v));
+  __m256i l = _mm256_loadu_si256((const __m256i *)p);
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(l, v));
 }
 static inline void fmt_cents(char *&p, int64_t c) {
   c < 0 ? (*p++ = '-', c = -c) : 0;
@@ -64,7 +64,8 @@ static inline uint64_t hash_fast(const char *s, uint32_t len) {
       h2 = (h2 * 31) + (uint8_t)s[i];
   }
   uint64_t h = (h1 ^ (h2 * 0x9e3779b97f4a7c15ULL));
-  return (h ^ (h >> 31)) ? (h ^ (h >> 31)) : 1;
+  h ^= (h >> 31);
+  return h ? h : 1;
 }
 static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
   const char *p = nl - (nl > b && nl[-1] == '\r');
@@ -96,11 +97,10 @@ int main(int argc, char **argv) {
   size_t rsz = rst.st_size, sz = mst.st_size;
   auto map_f = [&](int fd, size_t len) -> const char * {
     if (!len) return nullptr;
-    const char *b = (const char *)mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
-    if (b == MAP_FAILED)
-      b = (const char *)mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (b != MAP_FAILED) madvise((void *)b, len, MADV_WILLNEED | MADV_SEQUENTIAL);
-    return b;
+    auto m = mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) m = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m != MAP_FAILED) madvise(m, len, MADV_WILLNEED | MADV_SEQUENTIAL);
+    return (const char *)m;
   };
   const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
 
@@ -290,16 +290,13 @@ int main(int argc, char **argv) {
       a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
       a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
 
-      uint32_t slot;
-      for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
+      uint32_t slot = slot0;
+      for (;; slot = (slot + 1) & HT_MASK) {
         uint64_t k = name_keys[slot];
         if (__builtin_expect(k == nh, 1)) break;
-        if (!k) {
-          if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) &&
-              name_keys[slot] != nh)
-            continue;
+        if (!k && (__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) ||
+                   name_keys[slot] == nh))
           break;
-        }
       }
       uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
       if (__builtin_expect(!(*w & mask), 1) &&
@@ -327,8 +324,8 @@ int main(int argc, char **argv) {
     fmt_cents(ptr, g.ma), emit_u(g.dn), emit_u(g.nb);
     ptr = std::to_chars(ptr, ptr + 24, g.ntb).ptr, *ptr++ = '\n';
   }
-  int ofd = open(argc > 3 ? argv[3] : "/out/aggregates.txt",
-                 O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  const char *out_path = argc > 3 ? argv[3] : "/out/aggregates.txt";
+  int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (write(ofd, out_buf, ptr - out_buf) < 0) {}
   close(ofd);
   return 0;
