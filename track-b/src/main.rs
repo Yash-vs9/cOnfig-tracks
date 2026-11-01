@@ -202,17 +202,11 @@ unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
     let mut w0 = 0u64;
     let mut len = 0usize;
-    if *p >= d.len() {
-        return (0, 0, 0);
-    }
     let mut m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
     while len < 8 {
         w0 |= (m as u64) << (len * 8);
         len += 1;
         *p += 1;
-        if *p >= d.len() {
-            return (w0, 0, len);
-        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, 0, len);
@@ -223,9 +217,6 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
         w1 |= (m as u64) << ((len - 8) * 8);
         len += 1;
         *p += 1;
-        if *p >= d.len() {
-            return (w0, w1, len);
-        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, w1, len);
@@ -235,9 +226,6 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
         *tail.get_unchecked_mut(len - 16) = m;
         len += 1;
         *p += 1;
-        if *p >= d.len() {
-            return (w0, w1, len);
-        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, w1, len);
@@ -246,9 +234,6 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
     while m > 1 {
         *p += 1;
         len += 1;
-        if *p >= d.len() {
-            return (w0, w1, len);
-        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
     }
     (w0, w1, len)
@@ -516,9 +501,10 @@ impl<'a> Engine<'a> {
                 &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
             for i in 0..clen {
                 let ld = cand[i] as usize;
-                let hit = ((*src.get_unchecked(ld >> 6) >> (ld & 63)) & 1) as usize;
-                cand[w] = ld as u16;
-                w += hit;
+                if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) != 0 {
+                    cand[w] = ld as u16;
+                    w += 1;
+                }
             }
         } else {
             let o_post = self.chunk_postings(c, t);
@@ -573,9 +559,10 @@ impl<'a> Engine<'a> {
                 &self.g_bs[(self.bs_idx[t] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
             for i in 0..clen {
                 let ld = cand[i] as usize;
-                let hit = (((*src.get_unchecked(ld >> 6) >> (ld & 63)) ^ 1) & 1) as usize;
-                cand[w] = ld as u16;
-                w += hit;
+                if (*src.get_unchecked(ld >> 6) & (1u64 << (ld & 63))) == 0 {
+                    cand[w] = ld as u16;
+                    w += 1;
+                }
             }
         } else {
             let o_post = self.chunk_postings(c, t);
@@ -973,14 +960,10 @@ impl<'a> Engine<'a> {
                 'doc_scan: loop {
                     if sp + 32 <= d_len {
                         let chunk = _mm256_loadu_si256(d_ptr.add(sp) as *const __m256i);
-                        let m_ch = if first_ch == first_up {
-                            _mm256_cmpeq_epi8(chunk, v_lo)
-                        } else {
-                            _mm256_or_si256(
-                                _mm256_cmpeq_epi8(chunk, v_lo),
-                                _mm256_cmpeq_epi8(chunk, v_up),
-                            )
-                        };
+                        let m_ch = _mm256_or_si256(
+                            _mm256_cmpeq_epi8(chunk, v_lo),
+                            _mm256_cmpeq_epi8(chunk, v_up),
+                        );
                         let m_nl = _mm256_cmpeq_epi8(chunk, v_nl);
                         let (mask_ch, mask_nl) = (
                             _mm256_movemask_epi8(m_ch) as u32,
@@ -1347,6 +1330,12 @@ unsafe fn run_all() {
     let mut out_bufs: Vec<Vec<u8>> = (0..nb).map(|_| Vec::with_capacity(QB * 30)).collect();
     let out_bufs_ptr = out_bufs.as_mut_ptr() as usize;
     let next_b = AtomicUsize::new(0);
+    let mut fw_ptrs = [0usize; NUM_T];
+    let mut dp_ptrs = [0usize; NUM_T];
+    for t in 0..NUM_T {
+        fw_ptrs[t] = alloc_mmap::<u16>(FW_CAP) as usize;
+        dp_ptrs[t] = alloc_mmap::<u32>(DP_CAP) as usize;
+    }
     let next_chunk = AtomicUsize::new(0);
     let phase = AtomicUsize::new(0);
     let ready = AtomicUsize::new(0);
@@ -1364,11 +1353,15 @@ unsafe fn run_all() {
             let next_ref = &next_b;
             let c_post_ptrs_ref = &c_post_ptrs;
             let c_post_lens_ref = &c_post_lens;
+            let fw_ptr_c = fw_ptrs[tid];
+            let dp_ptr_c = dp_ptrs[tid];
             std::thread::Builder::new()
                 .stack_size(131072)
                 .spawn_scoped(s, move || {
                     let aff_mask = 1u64 << ((tid * 2) % 12);
                     sched_setaffinity(0, 8, &aff_mask);
+                    let fw = fw_ptr_c as *mut u16;
+                    let dp = dp_ptr_c as *mut u32;
                     let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
                     let bs_idx_p = bs_idx_ptr as *const u16;
                     loop {
@@ -1376,8 +1369,6 @@ unsafe fn run_all() {
                         if c >= NUM_C {
                             break;
                         }
-                        let fw = alloc_mmap::<u16>(FW_CAP);
-                        let dp = alloc_mmap::<u32>(DP_CAP);
                         ptr::write_bytes(thread_cnt_p, 0, nt);
                         worker_scan_fw(
                             c,
@@ -1408,9 +1399,9 @@ unsafe fn run_all() {
                         c_post_ptrs_ref[c].store(chunk_u16 as usize, Ordering::Release);
                         c_post_lens_ref[c].store(my_total, Ordering::Relaxed);
                         worker_transpose(c, nt, c_off_p, chunk_u16, ds_ref, de_ref, fw, dp);
-                        free_mmap(fw, FW_CAP);
-                        free_mmap(dp, DP_CAP);
                     }
+                    free_mmap(fw, FW_CAP);
+                    free_mmap(dp, DP_CAP);
                     if ready_ref.fetch_add(1, Ordering::Release) == NUM_T - 1 {
                         madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
                         for i in 0..nt {
