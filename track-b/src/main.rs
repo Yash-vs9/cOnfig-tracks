@@ -21,9 +21,9 @@ extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_C: usize = 32;
-const FW_CAP: usize = 400_000;
-const DP_CAP: usize = 12_000;
+const NUM_C: usize = 24;
+const FW_CAP: usize = 750_000;
+const DP_CAP: usize = 32_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -405,9 +405,9 @@ w += 1; } }
 unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
-let mut curr_uninit = MaybeUninit::<[u64; 160]>::uninit();
+let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
 let curr = curr_uninit.assume_init_mut();
-let mut clist_uninit = MaybeUninit::<[u16; 8192]>::uninit();
+let mut clist_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let clist = clist_uninit.assume_init_mut();
 
 let is_pure_and = (1..q.k as usize).all(|i| ((q.ops >> ((i - 1) * 2)) & 3) == 1);
@@ -559,7 +559,7 @@ let (v2_lo, v2_up) = (_mm256_set1_epi8(c2_lo as i8), _mm256_set1_epi8(c2_up as i
 let p0_has_2 = plen[anchor] >= 2;
 let p0_has_3 = plen[anchor] >= 3;
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-let mut cand_uninit = MaybeUninit::<[u16; 8192]>::uninit();
+let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let cand = cand_uninit.assume_init_mut();
 let record_doc = |d: u32, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize| {
 *t_cnt += 1;
@@ -892,11 +892,10 @@ if sw & b == 0 {
 if nh < 2048 { *s_hl.get_unchecked_mut(nh) = t as u32; nh += 1; } else { ov = true; }
 sample_counts[t] = sample_counts[t].saturating_add(1); } });
 if ov { s_seen.fill(0); } else { for i in 0..nh { *s_seen.get_unchecked_mut((*s_hl.get_unchecked(i) >> 6) as usize) = 0; } } }
-// Terms with >= 40 hits in 600 docs (~6.7%) are designated bitset terms, capped at 192
-let max_bs = 192;
-let threshold = if total_docs >= 25000 { 40 } else { 15 };
+// Terms with >= 34 hits in 600 docs (~5.6%) are designated bitset terms
+let threshold = if total_docs >= 25000 { 34 } else { 15 };
 for i in 0..nt {
-if sample_counts[i] >= threshold && n_bs < max_bs {
+if sample_counts[i] >= threshold {
 bs_idx[i] = n_bs as u16;
 n_bs += 1;
 TINFO[i].df = 65536 + (sample_counts[i] as u32) * 500; } }
