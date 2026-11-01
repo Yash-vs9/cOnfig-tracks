@@ -15,12 +15,11 @@
 - **Commit `075c21c`** | Run `run-bf60b18ace24`:
   - Time: 0.2845s, Memory: 70.96 MB, Points: 62.818 (all gates green, fully stable).
 
-- **Current Optimization (Raptor Lake L1D Cache & Port Exploitation)**:
-  - **32 KB L1D-Resident 2-Bit Blocked Bloom Filter (`PF`)**: Reduced Bloom filter from 256 KB to 32 KB (4,096 `u64` words) so it resides 100% inside the Raptor Lake P-core's 48 KB L1 Data Cache. Employs 2-bit-in-word hashing `(word & mask) == mask` to reject >92% of non-query tokens with a single 8-byte memory load in 4 cycles, eliminating L2 and DRAM cache misses across 3.7 million tokens.
-  - **Zero-Collision Single-Probe `lookup_swar`**: Incorporating 24 bits of mixed hash into `h_tag` guarantees zero collisions for `(w0, h_tag)` across the vocabulary. Eliminates secondary reads of the 2 MB `TINFO` array during token scanning.
-  - **Branchless `mix64`**: Eliminates conditional branches on token length across millions of token evaluations.
-  - **Hardware-Aligned DF Reduction**: Sequential memory streaming across chunks for DF calculation.
-  - **Branchless Table-Based Bit Sum (`BIT_SUM_8`)**: L1D table lookups and single-cycle `popcnt` on Port 1.
-  - **Global Pre-Sorting of Pure AND Terms**: Sorted once per query rather than 24 times per query.
-  - **Candidate Document Prefetching**: `_mm_prefetch` hides DRAM latency.
-  - **Guaranteed Bounds Safety**: Maintained `FW_CAP = 700_000` with bounds assertions.
+- **Commit `c6170ce`** | Run `run-df1a1f69b6b2`:
+  - Time: 0.267393s, Memory: 73.67 MB, Points: 63.360 (ALL-TIME PERSONAL RECORD FOR cOnfig ON TRACK B).
+  - Optimizations: 32 KB L1D-resident 2-bit blocked Bloom filter, single-probe zero-collision `lookup_swar`, branchless `mix64`.
+
+- **Current Optimization (Cgroup v2 Memory Eviction & Instant Startup)**:
+  - **Removed `MAP_POPULATE`**: Eliminated the synchronous 0x8000 flag on `docs.txt` mmap, cutting startup syscall overhead and preventing the kernel from charging all 254 MB of document file pages to Peak RSS at process init.
+  - **Chunk-by-Chunk `MADV_DONTNEED` Eviction**: In `worker_scan_fw`, as soon as each chunk finishes scanning, its page-aligned memory slice is uncharged via `madvise(..., MADV_DONTNEED)`, driving memory peak toward the 43.9 MB cap (maximum 50x multiplier).
+  - All Phase 1, Phase 2, and Phase 3 SIMD/AVX2 optimizations and bounds safety guarantees retained.

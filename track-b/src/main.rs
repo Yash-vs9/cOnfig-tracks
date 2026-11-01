@@ -257,7 +257,7 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 let f = File::open(path).unwrap();
 let len = f.metadata().unwrap().len() as usize;
 let fd = f.into_raw_fd();
-let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
+let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
 close(fd);
 madvise(p, len, 2);
 std::slice::from_raw_parts(p, len) }
@@ -769,7 +769,12 @@ if ov  { seen.fill(0); } else {
 for i in 0..nh  { *seen.get_unchecked_mut((*hl.get_unchecked(i) >> 6) as usize) = 0; } }
 d += 1;
 ld += 1; }
-*dp_ptr.add(ld as usize) = fw_idx as u32; }
+*dp_ptr.add(ld as usize) = fw_idx as u32;
+let page_start = c_byte[c] & !4095;
+let page_end = (c_byte[c + 1] + 4095) & !4095;
+if page_end > page_start {
+    madvise(d_buf.as_ptr().add(page_start) as *mut u8, page_end - page_start, 4);
+} }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_transpose(
 c: usize,
