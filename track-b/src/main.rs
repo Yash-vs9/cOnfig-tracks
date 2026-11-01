@@ -22,8 +22,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 350_000;
-const DP_CAP: usize = 16_000;
+const FW_CAP: usize = 750_000;
+const DP_CAP: usize = 32_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -33,21 +33,23 @@ struct TInfo { w0: u64, w1: u64, off: u32, df: u32, len: u16, bi: u16 }
 struct Query { ib: u8, k: u8, ops: u16, t_idx: u32 }
 
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
-struct FastSlot {
-    key: u64,
-    tid: u32,
-    bi: u16,
-    _pad: u16,
+#[repr(C, align(64))]
+struct FastBucket4 {
+    keys: [u64; 4],
+    tids: [u32; 4],
+    bis: [u16; 4],
+    lens: [u8; 4],
+    _pad: [u8; 4],
 }
-const FC_SZ: usize = 2048;
+const FC_SZ: usize = 1024;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastSlot; 2048] = [FastSlot {
-    key: 0,
-    tid: u32::MAX,
-    bi: u16::MAX,
-    _pad: 0,
-}; 2048];
+static mut FAST_CACHE: [FastBucket4; 1024] = [FastBucket4 {
+    keys: [0; 4],
+    tids: [u32::MAX; 4],
+    bis: [u16::MAX; 4],
+    lens: [0; 4],
+    _pad: [0; 4],
+}; 1024];
 
 const CMAP: [u8; 256] = {
 let mut m = [0u8; 256];
@@ -151,25 +153,32 @@ let mut process_token = |w0: u64, w1: u64, len: usize, _tail: &[u8]| {
 if len <= 8 {
     let fc_slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
     let b = FAST_CACHE.get_unchecked(fc_slot);
-    if b.key == w0 {
-        let t = b.tid as usize;
-        let bi = b.bi;
-        if bi != u16::MAX {
-            let bi_u = bi as usize;
-            if bi_u < 1024 {
-                *doc_bs.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
+    let keys_v = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+    let target_v = _mm256_set1_epi64x(w0 as i64);
+    let eq = _mm256_cmpeq_epi64(keys_v, target_v);
+    let mask = _mm256_movemask_pd(_mm256_castsi256_pd(eq));
+    if mask != 0 {
+        let lane = mask.trailing_zeros() as usize;
+        if *b.lens.get_unchecked(lane) == len as u8 {
+            let t = *b.tids.get_unchecked(lane) as usize;
+            let bi = *b.bis.get_unchecked(lane);
+            if bi != u16::MAX {
+                let bi_u = bi as usize;
+                if bi_u < 1024 {
+                    *doc_bs.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
+                }
+            } else {
+                fn_(t);
             }
-        } else {
-            fn_(t);
+            if p_tid == (t as u32) && pos == p_pos + 1 && t < rep_map.len() {
+                let rt = *rep_map.get_unchecked(t);
+                if rt != u32::MAX { fn_(rt as usize); }
+            }
+            p_tid = t as u32;
+            p_pos = pos;
+            pos += 1;
+            return;
         }
-        if p_tid == (t as u32) && pos == p_pos + 1 && t < rep_map.len() {
-            let rt = *rep_map.get_unchecked(t);
-            if rt != u32::MAX { fn_(rt as usize); }
-        }
-        p_tid = t as u32;
-        p_pos = pos;
-        pos += 1;
-        return;
     }
 }
 let h = mix64(w0, w1, len);
@@ -211,13 +220,14 @@ let mask_nl = (m_nl0 as u64) | ((m_nl1 as u64) << 32);
 let mut mask_tok = (mask0 as u64) | ((mask1 as u64) << 32);
 let nl_pos = mask_nl.trailing_zeros() as usize;
 if mask_nl != 0 { mask_tok = core::arch::x86_64::_bzhi_u64(mask_tok, nl_pos as u32); }
+let mut offset = 0usize;
 let mut crossed = false;
 while mask_tok != 0 {
-let tok_start = mask_tok.trailing_zeros() as usize;
-let tok_end_mask = mask_tok.wrapping_add(1u64 << tok_start);
-let tok_end = if tok_end_mask != 0 { tok_end_mask.trailing_zeros() as usize } else { 64 };
-let len = tok_end - tok_start;
-if mask_nl == 0 && tok_end == 64 {
+let zeros = mask_tok.trailing_zeros() as usize;
+let tok_start = offset + zeros;
+let rem = mask_tok >> zeros;
+let len = (!rem).trailing_zeros() as usize;
+if mask_nl == 0 && tok_start + len == 64 {
 *p += tok_start;
 let r = read_tok(d_buf, p, &mut tail);
 process_token(r.0, r.1, r.2, &tail);
@@ -240,8 +250,10 @@ process_token(w0, w1, len, &[]);
     w0 = r.0;
     w1 = r.1;
     process_token(w0, w1, len, &tail); }
-let clear_prefix = core::arch::x86_64::_bzhi_u64(!0u64, tok_end as u32);
-mask_tok = core::arch::x86_64::_andn_u64(clear_prefix, mask_tok); }
+let consumed = zeros + len;
+if consumed >= 64 { break; }
+mask_tok = rem >> len;
+offset = tok_start + len; }
 if mask_nl != 0 { *p += nl_pos + 1; return; }
 if !crossed { *p += 64; } }
 // Tail fallback
@@ -926,10 +938,14 @@ for &t in &term_order {
         let w0 = ti.w0;
         let slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
         let b = &mut FAST_CACHE[slot];
-        if b.key == 0 {
-            b.key = w0;
-            b.tid = t;
-            b.bi = bs_idx[t as usize];
+        for lane in 0..4 {
+            if b.keys[lane] == 0 {
+                b.keys[lane] = w0;
+                b.tids[lane] = t;
+                b.bis[lane] = bs_idx[t as usize];
+                b.lens[lane] = ti.len as u8;
+                break;
+            }
         }
     }
 }
@@ -1021,9 +1037,6 @@ for i in t_start..t_end {
 barrier2.wait();
 if tid == 0 {
     madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
-    madvise(GLOBAL_DF.as_mut_ptr() as *mut u8, size_of::<[AtomicU32; 131072]>(), 4);
-    madvise(FAST_CACHE.as_mut_ptr() as *mut u8, size_of::<[FastSlot; 2048]>(), 4);
-    madvise(PF.as_mut_ptr() as *mut u8, size_of::<[u64; 4096]>(), 4);
     free_mmap(thread_counts_val as *mut u16, NUM_T * nt);
 }
 let mut cp_ptrs = [ptr::null(); NUM_C];
