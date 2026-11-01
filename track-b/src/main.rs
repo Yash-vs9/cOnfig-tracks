@@ -509,6 +509,10 @@ poff[i] = ti.off as usize; }
 let first_ch = (pw0[0] & 0xFF) as u8;
 let first_up = if first_ch >= b'a' && first_ch <= b'z' { first_ch - 32 } else { first_ch };
 let (v_lo, v_up, v_nl) = (_mm256_set1_epi8(first_ch as i8), _mm256_set1_epi8(first_up as i8), _mm256_set1_epi8(b'\n' as i8));
+let c1_lo = ((pw0[0] >> 8) & 0xFF) as u8;
+let c1_up = if c1_lo >= b'a' && c1_lo <= b'z' { c1_lo - 32 } else { c1_lo };
+let (v1_lo, v1_up) = (_mm256_set1_epi8(c1_lo as i8), _mm256_set1_epi8(c1_up as i8));
+let p0_has_2 = plen[0] >= 2;
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
 let cand = cand_uninit.assume_init_mut();
@@ -589,7 +593,14 @@ if sp + 32 <= d_len {
 let chunk = _mm256_loadu_si256(d_ptr.add(sp) as *const __m256i);
 let m_ch = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v_lo), _mm256_cmpeq_epi8(chunk, v_up));
 let m_nl = _mm256_cmpeq_epi8(chunk, v_nl);
-let (mask_ch, mask_nl) = (_mm256_movemask_epi8(m_ch) as u32, _mm256_movemask_epi8(m_nl) as u32);
+let (mut mask_ch, mask_nl) = (_mm256_movemask_epi8(m_ch) as u32, _mm256_movemask_epi8(m_nl) as u32);
+if p0_has_2 {
+    let m_c1 = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v1_lo), _mm256_cmpeq_epi8(chunk, v1_up));
+    let mask_c1 = _mm256_movemask_epi8(m_c1) as u32;
+    let next_b = if sp + 32 < d_len { *d_ptr.add(sp + 32) } else { 0 };
+    let c1_boundary = (next_b == c1_lo || next_b == c1_up) as u32;
+    mask_ch &= (mask_c1 >> 1) | (c1_boundary << 31);
+}
 if mask_ch == 0 && mask_nl == 0 {
 sp += 32; continue; }
 let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() } else { 32 };
