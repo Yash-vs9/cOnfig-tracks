@@ -233,11 +233,12 @@ let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) 
 w1 = core::arch::x86_64::_bzhi_u64(raw1, ((len - 8) << 3) as u32);
 process_token(w0, w1, len, &[]);
 } else {
-let mut tp = *p + tok_start;
-let r = read_tok(d_buf, &mut tp, &mut tail);
-w0 = r.0;
-w1 = r.1;
-process_token(w0, w1, len, &tail); }
+    let raw0 = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
+    let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) | 0x2020202020202020;
+    tail[0] = *base.add(*p + tok_start + 16) | 0x20;
+    w0 = raw0;
+    w1 = raw1;
+    process_token(w0, w1, len, &tail); }
 let consumed = zeros + len;
 if consumed >= 64 { break; }
 mask_tok = rem >> len;
@@ -767,15 +768,9 @@ if bi != u16::MAX {
             nh += 1;
         } else { ov = true; }
         *co_ptr.add(t) += 1;
-        if fw_idx + 2 < FW_CAP {
-            if t < 65535 {
-                *fw_ptr.add(fw_idx) = t as u16;
-                fw_idx += 1;
-            } else {
-                *fw_ptr.add(fw_idx) = 65535;
-                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
-                fw_idx += 2;
-            }
+        if fw_idx < FW_CAP {
+            *fw_ptr.add(fw_idx) = t as u16;
+            fw_idx += 1;
         }
     }
 } });
@@ -801,11 +796,8 @@ let start = *dp_ptr.add(ld) as usize;
 let end = *dp_ptr.add(ld + 1) as usize;
 let mut i = start;
 while i < end {
-let mut t = *fw_ptr.add(i) as usize;
+let t = *fw_ptr.add(i) as usize;
 i += 1;
-if t == 65535 {
-t = 65535 + *fw_ptr.add(i) as usize;
-i += 1; }
 let pos = *cur_ptr.add(t);
 *cur_ptr.add(t) = pos + 1;
 *chunk_u16_ptr.add(pos as usize) = ld as u16; }
@@ -903,7 +895,7 @@ let mut term_order: Vec<u32> = (0..nt as u32).collect();
 term_order.sort_unstable_by_key(|&t| std::cmp::Reverse(sample_counts[t as usize]));
 for &t in &term_order {
     let ti = &TINFO[t as usize];
-    if ti.len <= 8 && sample_counts[t as usize] > 0 {
+    if ti.len <= 8 {
         let w0 = ti.w0;
         let slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
         let b = &mut FAST_CACHE[slot];
