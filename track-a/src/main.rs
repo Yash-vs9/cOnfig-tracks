@@ -19,7 +19,7 @@ unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
     k: [AtomicU64; 33024],
-    c: [AtomicU32; 163844],
+    c: [AtomicU32; 163842],
     p: [usize; 2304],
     q: [u32; 13824 * 256],
     g: [u32; 49152],
@@ -27,7 +27,7 @@ struct SharedData {
     n: [i32; 13824],
     h: [[[i32; 128]; 12]; 2],
     w: ([[u16; 128]; 12], [u16; 13824], [u16; 2304]),
-    u: ([u8; 2304], [[u8; 152000]; 100]),
+    u: ([u8; 2304], [[u8; 163840]; 12]),
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 
@@ -169,55 +169,61 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             }
         };
     }
-    let (mut cnt, mut off) = ([0u32; 2048], [0u32; 2048]);
+    let (mut cnt, mut off, mut bh) = ([0u32; 2048], [0u32; 2048], 0);
     let (g_ptr, lp) = ((*s).g.as_ptr(), (*s).l[t].as_mut_ptr());
     let val = |v: u32| if (v as i32) < 0 { *g_ptr.add((v >> 11) as u16 as usize) } else { v >> 11 };
-    loop {
-        let hi = (*s).c[163842].fetch_add(1, Relaxed) as usize;
-        if hi >= nh { break; }
-        let out_b = (*s).u.1[hi].as_mut_ptr();
+    while bh < nh {
+        let hi = bh + t;
+        let out_b = (*s).u.1[t].as_mut_ptr();
         let mut ptr = out_b;
-        let (h_id, mut tot) = ((*s).w.2[2048 + hi] as usize, 0u32);
-        cnt[..ne].fill(0);
-        iter_b!(h_id, |v| cnt[(v & 2047) as usize] += 1);
-        (0..ne).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
-        iter_b!(h_id, |v| {
-            let e = (v & 2047) as usize;
-            *lp.add((off[e] + cnt[e]) as usize) = val(v);
-            cnt[e] += 1;
-        });
-        for &eid_u in (*s).w.2[..ne].iter().filter(|&&e| cnt[e as usize] > 0) {
-            let (eid, n) = (eid_u as usize, cnt[eid_u as usize] as usize);
-            let l = slc_mut(lp.add(off[eid] as usize), n);
-            let pct = |p| (p * n + 99) / 100 - 1;
-            let (i50, i95, i99) = (pct(50), pct(95), pct(99));
-            if n <= 2 {
-                if n == 2 && l[0] > l[1] { l.swap(0, 1); }
-            } else if n <= 32 {
-                l.sort_unstable();
-            } else {
-                l.select_nth_unstable(i50);
-                if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
-                if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
+        if hi < nh {
+            let (h_id, mut tot) = ((*s).w.2[2048 + hi] as usize, 0u32);
+            cnt[..ne].fill(0);
+            iter_b!(h_id, |v| cnt[(v & 2047) as usize] += 1);
+            (0..ne).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
+            iter_b!(h_id, |v| {
+                let e = (v & 2047) as usize;
+                *lp.add((off[e] + cnt[e]) as usize) = val(v);
+                cnt[e] += 1;
+            });
+            let mut hr_pfx = [0u8; 21];
+            copy((*s).p[2048 + h_id] as *const u8, hr_pfx.as_mut_ptr(), 13);
+            copy(b":00:00Z ".as_ptr(), hr_pfx.as_mut_ptr().add(13), 8);
+            for &eid_u in (*s).w.2[..ne].iter().filter(|&&e| cnt[e as usize] > 0) {
+                let (eid, n) = (eid_u as usize, cnt[eid_u as usize] as usize);
+                let l = slc_mut(lp.add(off[eid] as usize), n);
+                let pct = |p| (p * n + 99) / 100 - 1;
+                let (i50, i95, i99) = (pct(50), pct(95), pct(99));
+                if n <= 2 {
+                    if n == 2 && l[0] > l[1] { l.swap(0, 1); }
+                } else if n <= 32 {
+                    l.sort_unstable();
+                } else {
+                    l.select_nth_unstable(i50);
+                    if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
+                    if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
+                }
+                let err = (*s).c[h_id * 2048 + eid].load(Relaxed);
+                let el = (*s).u.0[eid] as usize;
+                copy(hr_pfx.as_ptr(), ptr, 21);
+                copy((*s).p[eid] as *const u8, ptr.add(21), el);
+                *ptr.add(21 + el) = b' ';
+                ptr = ptr.add(22 + el);
+                let ppm = if err == 0 { 0 } else { ((err as u64) * 1_000_000 / (n as u64)) as u32 };
+                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
+                *ptr.sub(1) = b'\n';
             }
-            let err = (*s).c[h_id * 2048 + eid].load(Relaxed);
-            let el = (*s).u.0[eid] as usize;
-            copy((*s).p[2048 + h_id] as *const u8, ptr, 13);
-            copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
-            copy((*s).p[eid] as *const u8, ptr.add(21), el);
-            *ptr.add(21 + el) = b' ';
-            ptr = ptr.add(22 + el);
-            let ppm = if err == 0 { 0 } else { ((err as u64) * 1_000_000 / (n as u64)) as u32 };
-            for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
-            *ptr.sub(1) = b'\n';
         }
-        (*s).p[2176 + hi] = ptr as usize - out_b as usize;
-    }
-    bar.wait();
-    if t == 0 {
-        let mut iov = [[0usize; 2]; 128];
-        for k in 0..nh { iov[k] = [(*s).u.1[k].as_ptr() as usize, (*s).p[2176 + k]]; }
-        writev(out_fd, iov.as_ptr(), nh as i32);
+        (*s).p[2176 + t] = ptr as usize - out_b as usize;
+        bar.wait();
+        if t == 0 {
+            let cur_batch = (nh - bh).min(12);
+            let mut iov = [[0usize; 2]; 12];
+            for k in 0..cur_batch { iov[k] = [(*s).u.1[k].as_ptr() as usize, (*s).p[2176 + k]]; }
+            writev(out_fd, iov.as_ptr(), cur_batch as i32);
+        }
+        bar.wait();
+        bh += 12;
     }
 }
 
