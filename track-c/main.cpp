@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-struct Agg {
+struct alignas(64) Agg {
   uint32_t cnt, dn;
   int64_t id_s, am_s, mi, ma, nb, ntb;
   void add(const Agg &t) {
@@ -18,13 +18,18 @@ struct Agg {
   }
 };
 
+struct Entry40 {
+  uint64_t key;
+  uint64_t bits[4];
+};
+
 static uint8_t reg_lut[1000000];
 static uint16_t c_to_dense[17577];
 static char dense_to_code[256][4], out_buf[65536];
 static Agg G[256], T[12][256];
 
 constexpr uint32_t HT_CAP = 1 << 17, HT_MASK = HT_CAP - 1;
-static uint64_t name_keys[HT_CAP], name_bits[HT_CAP][4];
+static Entry40 table[HT_CAP];
 static size_t cs[13], rcs[13];
 static uint8_t unm_cid;
 
@@ -213,8 +218,8 @@ int main(int argc, char **argv) {
       }
     name_done:
       uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
-      _mm_prefetch((const char *)&name_keys[slot0], _MM_HINT_T0);
-      _mm_prefetch((const char *)&name_bits[slot0], _MM_HINT_T0);
+      _mm_prefetch((const char *)&table[slot0], _MM_HINT_T0);
+      _mm_prefetch(((const char *)&table[slot0]) + 32, _MM_HINT_T0);
 
       if (__builtin_expect(*p == '"', 1)) {
         const char *s = ++p;
@@ -294,15 +299,15 @@ int main(int argc, char **argv) {
 
       uint32_t slot;
       for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
-        uint64_t k = name_keys[slot];
+        uint64_t k = table[slot].key;
         if (__builtin_expect(k == nh, 1)) break;
         if (!k) {
-          if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) && name_keys[slot] != nh) continue;
+          if (!__sync_bool_compare_and_swap(&table[slot].key, 0ULL, nh) && table[slot].key != nh) continue;
           break;
         }
       }
 
-      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+      uint64_t mask = 1ULL << (cid & 63), *w = &table[slot].bits[cid >> 6];
       if (__builtin_expect(!(*w & mask), 1) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) a.dn++;
     }
   }
