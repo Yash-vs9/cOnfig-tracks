@@ -105,12 +105,14 @@ int main(int argc, char **argv) {
   const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
 
   if (rsz) {
+    auto c_code = [](const char *x) -> uint16_t {
+      return (x[0] - 'A') * 676 + (x[1] - 'A') * 26 + x[2] - 'A' + 1;
+    };
     const char *rp = (const char *)memchr(rb, '\n', rsz) + 1, *rend = rb + rsz,
                *rstart = rp;
     while (rp < rend) {
       while (*rp++ != ',') {}
-      uint16_t cd = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + rp[2] - 'A' + 1;
-      c_to_dense[cd] = 1, rp += (rp[3] == '\r' ? 5 : 4);
+      c_to_dense[c_code(rp)] = 1, rp += (rp[3] == '\r' ? 5 : 4);
     }
     uint8_t nc = 0;
     for (uint16_t c = 1; c <= 17576; ++c) {
@@ -124,8 +126,7 @@ int main(int argc, char **argv) {
     unm_cid = nc, rp = rstart;
     while (rp < rend) {
       uint32_t reg = parse_u(rp);
-      uint16_t cd = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + rp[2] - 'A' + 1;
-      if (reg < 1000000) reg_lut[reg] = (uint8_t)(c_to_dense[cd] + 1);
+      if (reg < 1000000) reg_lut[reg] = (uint8_t)(c_to_dense[c_code(rp)] + 1);
       rp += (rp[3] == '\r' ? 5 : 4);
     }
   }
@@ -137,10 +138,13 @@ int main(int argc, char **argv) {
   {
     int tid = omp_get_thread_num();
     if (tid > 0 && sz) {
-      for (const char *p = base + cs[tid]; p < base + sz; ++p) {
-        p = (const char *)memchr(p, '\n', (base + sz) - p);
-        if (!p) { cs[tid] = sz; break; }
-        if (is_rec_end(base, sz, p)) { cs[tid] = p - base + 1; break; }
+      const char *p = base + cs[tid], *bend = base + sz;
+      for (; p < bend; ++p) {
+        p = (const char *)memchr(p, '\n', bend - p);
+        if (!p || is_rec_end(base, sz, p)) {
+          cs[tid] = p ? (p - base + 1) : sz;
+          break;
+        }
       }
     }
 #pragma omp barrier
@@ -287,38 +291,42 @@ int main(int argc, char **argv) {
       p += 1 + (*p == '\r');
 
       uint32_t slot = slot0;
-      for (;; slot = (slot + 1) & HT_MASK) {
-        uint64_t k = name_keys[slot];
-        if (__builtin_expect(k == nh, 1)) break;
-        if (!k && (__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) ||
-                   name_keys[slot] == nh))
-          break;
+      uint64_t k = name_keys[slot];
+      if (__builtin_expect(k != nh, 0) &&
+          (k || (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) &&
+                 name_keys[slot] != nh))) {
+        do {
+          slot = (slot + 1) & HT_MASK, k = name_keys[slot];
+        } while (k != nh &&
+                 (k || (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) &&
+                        name_keys[slot] != nh)));
       }
       uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
       uint32_t is_dn = __builtin_expect(!(*w & mask), 1) &&
                        !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask);
 
       Agg &a = T[tid][cid];
-      a.cnt++, a.dn += is_dn, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
+      a.cnt++, a.dn += is_dn, a.id_s += id, a.am_s += cents;
+      a.nb += nb, a.ntb += ntb;
       a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
     }
   }
 
-  for (int cid = 0; cid <= unm_cid; ++cid)
-    for (int tid = 1; tid < 12; ++tid) {
-      T[0][cid].dn += T[tid][cid].dn;
-      if (T[tid][cid].cnt) T[0][cid].add(T[tid][cid]);
+  for (int c = 0; c <= unm_cid; ++c)
+    for (int t = 1; t < 12; ++t) {
+      T[0][c].dn += T[t][c].dn;
+      if (T[t][c].cnt) T[0][c].add(T[t][c]);
     }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) {
     ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' ';
   };
-  for (int cid = 0; cid <= unm_cid; ++cid) {
-    Agg &g = T[0][cid];
+  for (int c = 0; c <= unm_cid; ++c) {
+    Agg &g = T[0][c];
     if (!g.cnt) continue;
-    if (cid == unm_cid) memcpy(ptr, "_UNMATCHED ", 11), ptr += 11;
-    else memcpy(ptr, dense_to_code[cid], 3), ptr[3] = ' ', ptr += 4;
+    if (c == unm_cid) memcpy(ptr, "_UNMATCHED ", 11), ptr += 11;
+    else memcpy(ptr, dense_to_code[c], 3), ptr[3] = ' ', ptr += 4;
     emit_u(g.cnt), emit_u(g.id_s), fmt_cents(ptr, g.am_s), fmt_cents(ptr, g.mi);
     fmt_cents(ptr, g.ma), emit_u(g.dn), emit_u(g.nb);
     ptr = std::to_chars(ptr, ptr + 24, g.ntb).ptr, *ptr++ = '\n';
