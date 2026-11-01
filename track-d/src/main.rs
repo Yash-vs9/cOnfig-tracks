@@ -1,4 +1,4 @@
-extern "C" { fn mallopt(param: i32, value: i32) -> i32; }
+extern "C" { fn mallopt(p: i32, v: i32) -> i32; }
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -31,57 +31,40 @@ struct FastDistMap {
     epoch: u32,
     used: u32,
 }
+
 impl FastDistMap {
     fn new() -> Self {
-        Self {
-            slots: unsafe { std::mem::transmute(vec![0u128; H_SZ]) },
-            epoch: 1,
-            used: 0,
-        }
+        Self { slots: unsafe { std::mem::transmute(vec![0u128; H_SZ]) }, epoch: 1, used: 0 }
     }
     #[inline(always)]
     fn next_query(&mut self) {
         self.used = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            for s in &mut self.slots {
-                s.3 = 0;
-            }
+            for s in &mut self.slots { s.3 = 0; }
             self.epoch = 1;
         }
     }
     #[inline(always)]
-    unsafe fn init_start(&mut self, s: u32, t: u32) {
+    unsafe fn init_start(&mut self, s: u32, t: u32) -> (u32, u32) {
         let ep = self.epoch;
         let base = self.slots.as_mut_ptr();
-        for &(v, fwd, rev) in &[(s, 0, INF), (t, INF, 0)] {
+        let mut s_idx = 0;
+        let mut t_idx = 0;
+        for &(v, is_s) in &[(s, true), (t, false)] {
             let mut idx = (v.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
             loop {
                 let slot = base.add(idx);
                 if (*slot).3 != ep || (*slot).0 == v {
-                    *slot = Slot(v, fwd, rev, ep);
+                    *slot = if is_s { Slot(s, 0, INF, ep) } else { Slot(t, INF, 0, ep) };
                     self.used += 1;
+                    if is_s { s_idx = idx as u32; } else { t_idx = idx as u32; }
                     break;
                 }
                 idx = (idx + 1) & H_MSK;
             }
         }
-    }
-    #[inline(always)]
-    unsafe fn get_dist<const IS_FWD: bool>(&self, v: u32) -> u32 {
-        let ep = self.epoch;
-        let mut idx = (v.wrapping_mul(0x9E3779B9) >> H_SHIFT) as usize;
-        let base = self.slots.as_ptr();
-        loop {
-            let slot = base.add(idx);
-            if (*slot).3 != ep {
-                return INF;
-            }
-            if (*slot).0 == v {
-                return if IS_FWD { (*slot).1 } else { (*slot).2 };
-            }
-            idx = (idx + 1) & H_MSK;
-        }
+        (s_idx, t_idx)
     }
     #[inline(always)]
     unsafe fn prefetch(&self, v: u32) {
@@ -99,7 +82,7 @@ impl FastDistMap {
                 if nd.saturating_add(top_opp) < *mu {
                     *slot = if IS_FWD { Slot(v, nd, INF, ep) } else { Slot(v, INF, nd, ep) };
                     self.used += 1;
-                    heap.push(nd, v);
+                    heap.push(nd, idx as u32);
                 }
                 return;
             }
@@ -108,11 +91,12 @@ impl FastDistMap {
                 if nd < *my_d {
                     let opp_d = if IS_FWD { (*slot).2 } else { (*slot).1 };
                     if opp_d != INF {
-                        *mu = (*mu).min(nd.saturating_add(opp_d));
+                        let cand = nd.saturating_add(opp_d);
+                        if cand < *mu { *mu = cand; }
                     }
                     if nd.saturating_add(top_opp) < *mu {
                         *my_d = nd;
-                        heap.push(nd, v);
+                        heap.push(nd, idx as u32);
                     }
                 }
                 return;
@@ -125,10 +109,9 @@ impl FastDistMap {
 struct MinHeap {
     data: Vec<u64>,
 }
+
 impl MinHeap {
-    fn with_capacity(cap: usize) -> Self {
-        Self { data: Vec::with_capacity(cap) }
-    }
+    fn with_capacity(cap: usize) -> Self { Self { data: Vec::with_capacity(cap) } }
     #[inline(always)]
     fn clear(&mut self) { self.data.clear(); }
     #[inline(always)]
@@ -194,10 +177,8 @@ unsafe fn parse_u32(p: &mut *const u8) -> u32 {
 fn solve_query_64(s: usize, t: usize, hf: *const u32, hr: *const u32, ef: *const u32, er: *const u32, oflow: &[(u32, u32)]) -> i64 {
     let (mut dist_f, mut dist_b) = (HashMap::with_capacity(2048), HashMap::with_capacity(2048));
     let (mut q_f, mut q_b) = (BinaryHeap::new(), BinaryHeap::new());
-    dist_f.insert(s as u32, 0u64);
-    dist_b.insert(t as u32, 0u64);
-    q_f.push((Reverse(0u64), s as u32));
-    q_b.push((Reverse(0u64), t as u32));
+    dist_f.insert(s as u32, 0u64); dist_b.insert(t as u32, 0u64);
+    q_f.push((Reverse(0u64), s as u32)); q_b.push((Reverse(0u64), t as u32));
     let mut mu = u64::MAX;
     unsafe {
         while !q_f.is_empty() && !q_b.is_empty() {
@@ -292,7 +273,7 @@ fn main() {
                         let (mut cur, end_p) = (buf.as_ptr(), buf.as_ptr().add(vend));
                         while cur < end_p {
                             let u = parse_u32(&mut cur); cur = cur.add(1);
-                            let v = parse_u32(&mut cur); cur = cur.add(2);
+                            let v = parse_u32(&mut cur); cur = cur.add(1);
                             while *cur != b'\n' { cur = cur.add(1); }
                             cur = cur.add(1);
                             if u != v {
@@ -319,12 +300,12 @@ fn main() {
     let overflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
         let mut handlers = Vec::with_capacity(nt);
         for t in 0..nt {
-            let (start, finish, hf, hr, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
+            let (start, finish, hf, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &gf);
             handlers.push(scope.spawn(move || {
                 let mut local_oflow = Vec::new();
                 let mut buf = vec![0u8; BUF_SZ + 64];
                 let (mut off, mut left) = (start, 0usize);
-                let (ef_ptr, er_ptr) = (ef_addr as *mut u32, er_addr as *mut u32);
+                let ef_ptr = ef_addr as *mut u32;
                 while off < finish {
                     let to_read = (finish - off).min(BUF_SZ);
                     let got = gf_ref.read_at(&mut buf[left..left + to_read], off as u64).unwrap_or(0);
@@ -347,12 +328,7 @@ fn main() {
                                 let pw = if w < W_SENTINEL { w } else { W_SENTINEL };
                                 let ifwd = hf.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed) as usize;
                                 *ef_ptr.add(ifwd) = (pw << 21) | (v & V_MASK);
-                                let irev = hr.get_unchecked(v as usize).fetch_add(1, Ordering::Relaxed) as usize;
-                                *er_ptr.add(irev) = (pw << 21) | (u & V_MASK);
-                                if pw == W_SENTINEL {
-                                    local_oflow.push((ifwd as u32, w));
-                                    local_oflow.push(((1u32 << 31) | (irev as u32), w));
-                                }
+                                if pw == W_SENTINEL { local_oflow.push((ifwd as u32, w)); }
                             }
                         }
                     }
@@ -368,16 +344,52 @@ fn main() {
     drop(bounds);
     drop(gf);
 
-    let mut overflow_map: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
-    overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
+    let mut fwd_oflow: Vec<(u32, u32)> = overflows.into_iter().flatten().collect();
+    fwd_oflow.sort_unstable_by_key(|&(idx, _)| idx);
 
     let mut head_fwd: Vec<u32> = unsafe { std::mem::transmute(head_fwd) };
+    if n > 0 { head_fwd.copy_within(0..n as usize, 1); }
+    head_fwd[0] = 0;
+
+    let n_nodes = n as usize;
+    let chunk_nodes = (n_nodes + nt - 1) / nt;
+    let rev_oflows: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
+        let mut handlers = Vec::with_capacity(nt);
+        for t in 0..nt {
+            let u_start = t * chunk_nodes;
+            let u_end = (u_start + chunk_nodes).min(n_nodes);
+            let (hf, ef, hr, fof) = (&head_fwd, &edges_fwd, &head_rev, &fwd_oflow);
+            handlers.push(scope.spawn(move || {
+                let mut local_roflow = Vec::new();
+                let er_ptr = er_addr as *mut u32;
+                for u in u_start..u_end {
+                    let e_start = hf[u] as usize;
+                    let e_end = hf[u + 1] as usize;
+                    for e in e_start..e_end {
+                        let packed = ef[e];
+                        let (v, pw) = (packed & V_MASK, packed >> 21);
+                        let irev = hr[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                        unsafe { *er_ptr.add(irev) = (pw << 21) | (u as u32); }
+                        if pw == W_SENTINEL {
+                            if let Ok(pos) = fof.binary_search_by_key(&(e as u32), |&(k, _)| k) {
+                                local_roflow.push(((1u32 << 31) | (irev as u32), fof[pos].1));
+                            }
+                        }
+                    }
+                }
+                local_roflow
+            }));
+        }
+        handlers.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut overflow_map = fwd_oflow;
+    overflow_map.extend(rev_oflows.into_iter().flatten());
+    overflow_map.sort_unstable_by_key(|&(idx, _)| idx);
+
     let mut head_rev: Vec<u32> = unsafe { std::mem::transmute(head_rev) };
-    if n > 0 {
-        head_fwd.copy_within(0..n as usize, 1);
-        head_rev.copy_within(0..n as usize, 1);
-    }
-    head_fwd[0] = 0; head_rev[0] = 0;
+    if n > 0 { head_rev.copy_within(0..n as usize, 1); }
+    head_rev[0] = 0;
 
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries");
     let mut queries = Vec::with_capacity(4096);
@@ -415,7 +427,7 @@ fn main() {
     let next_query = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
-        for _ in 0..nt.min(12).min(unique_queries.len()) {
+        for _ in 0..6.min(unique_queries.len()) {
             let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &unique_queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
             let has_oflow = !overflow_map.is_empty();
 
@@ -434,80 +446,82 @@ fn main() {
                     for qi in base..end {
                         let q = qref[qi];
                         let (s, t) = (q.0 as usize, q.1 as usize);
-                    if s == t { unsafe { *ans_ptr.add(q.2 as usize) = 0; } continue; }
+                        if s == t { unsafe { *ans_ptr.add(q.2 as usize) = 0; } continue; }
 
-                    unsafe {
-                        if *hf_ptr.add(s + 1) == *hf_ptr.add(s) || *hr_ptr.add(t + 1) == *hr_ptr.add(t) {
-                            *ans_ptr.add(q.2 as usize) = -1;
-                            continue;
+                        unsafe {
+                            if *hf_ptr.add(s + 1) == *hf_ptr.add(s) || *hr_ptr.add(t + 1) == *hr_ptr.add(t) {
+                                *ans_ptr.add(q.2 as usize) = -1;
+                                continue;
+                            }
                         }
-                    }
 
-                    dist_map.next_query();
-                    heap_f.clear();
-                    heap_b.clear();
-                    unsafe { dist_map.init_start(s as u32, t as u32); }
-                    heap_f.push(0, s as u32);
-                    heap_b.push(0, t as u32);
+                        dist_map.next_query();
+                        heap_f.clear();
+                        heap_b.clear();
+                        let (s_slot, t_slot) = unsafe { dist_map.init_start(s as u32, t as u32) };
+                        heap_f.push(0, s_slot);
+                        heap_b.push(0, t_slot);
 
-                    let mut mu = INF;
-                    let (mut touched_oflow, mut table_full) = (false, false);
+                        let mut mu = INF;
+                        let (mut touched_oflow, mut table_full) = (false, false);
 
-                    unsafe {
-                        while !heap_f.is_empty() && !heap_b.is_empty() {
-                            let (top_f, top_b) = (heap_f.min_key(), heap_b.min_key());
-                            if top_f.saturating_add(top_b) >= mu { break; }
-                            if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
-
-                            let is_fwd = heap_f.data.len() <= heap_b.data.len();
-                            let (d, u) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
-                            let top_opp = if is_fwd { top_b } else { top_f };
-                            if d.saturating_add(top_opp) >= mu { break; }
-                            let my_d = if is_fwd { dist_map.get_dist::<true>(u) } else { dist_map.get_dist::<false>(u) };
-                            if d > 0 && d > my_d { continue; }
-
-                            let (h_ptr, e_ptr, mask) = if is_fwd { (hf_ptr, ef_ptr, 0u32) } else { (hr_ptr, er_ptr, 1u32 << 31) };
-                            let (e_start, e_end) = (*h_ptr.add(u as usize) as usize, *h_ptr.add(u as usize + 1) as usize);
-
-                            for e in e_start..e_end {
+                        unsafe {
+                            let slots_base = dist_map.slots.as_ptr();
+                            let ep = dist_map.epoch;
+                            while !heap_f.is_empty() && !heap_b.is_empty() {
+                                let (top_f, top_b) = (heap_f.min_key(), heap_b.min_key());
+                                if top_f.saturating_add(top_b) >= mu { break; }
                                 if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
-                                let packed = *e_ptr.add(e);
-                                let (v, mut w) = (packed & V_MASK, packed >> 21);
-                                if e + 1 < e_end {
-                                    dist_map.prefetch(*e_ptr.add(e + 1) & V_MASK);
-                                }
-                                if has_oflow && w == W_SENTINEL {
-                                    touched_oflow = true;
-                                    if let Ok(pos) = oflow.binary_search_by_key(&(mask | (e as u32)), |&(k, _)| k) {
-                                        w = oflow.get_unchecked(pos).1;
+
+                                let is_fwd = heap_f.data.len() <= heap_b.data.len();
+                                let (d, slot_idx) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
+                                let top_opp = if is_fwd { top_b } else { top_f };
+                                if d.saturating_add(top_opp) >= mu { break; }
+
+                                let slot_p = slots_base.add(slot_idx as usize);
+                                if (*slot_p).3 != ep { continue; }
+                                let my_d = if is_fwd { (*slot_p).1 } else { (*slot_p).2 };
+                                if d > my_d { continue; }
+                                let u = (*slot_p).0;
+
+                                let (h_ptr, e_ptr, mask) = if is_fwd { (hf_ptr, ef_ptr, 0u32) } else { (hr_ptr, er_ptr, 1u32 << 31) };
+                                let (e_start, e_end) = (*h_ptr.add(u as usize) as usize, *h_ptr.add(u as usize + 1) as usize);
+
+                                for e in e_start..e_end {
+                                    if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
+                                    let packed = *e_ptr.add(e);
+                                    let (v, mut w) = (packed & V_MASK, packed >> 21);
+                                    if e + 1 < e_end { dist_map.prefetch(*e_ptr.add(e + 1) & V_MASK); }
+                                    if has_oflow && w == W_SENTINEL {
+                                        touched_oflow = true;
+                                        if let Ok(pos) = oflow.binary_search_by_key(&(mask | (e as u32)), |&(k, _)| k) {
+                                            w = oflow.get_unchecked(pos).1;
+                                        }
+                                    }
+                                    let nd = d.saturating_add(w);
+                                    if nd >= mu { continue; }
+                                    if is_fwd {
+                                        dist_map.relax::<true>(v, nd, top_opp, &mut heap_f, &mut mu);
+                                    } else {
+                                        dist_map.relax::<false>(v, nd, top_opp, &mut heap_b, &mut mu);
                                     }
                                 }
-                                let nd = d.saturating_add(w);
-                                if nd >= mu { continue; }
-                                if is_fwd {
-                                    dist_map.relax::<true>(v, nd, top_opp, &mut heap_f, &mut mu);
-                                } else {
-                                    dist_map.relax::<false>(v, nd, top_opp, &mut heap_b, &mut mu);
-                                }
+                                if table_full { break; }
                             }
-                            if table_full { break; }
-                        }
 
-                        let mut ans = if mu == INF { -1 } else { mu as i64 };
-                        if table_full || (ans == -1 && touched_oflow) {
-                            ans = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow);
+                            let mut ans = if mu == INF { -1 } else { mu as i64 };
+                            if table_full || (ans == -1 && touched_oflow) {
+                                ans = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow);
+                            }
+                            *ans_ptr.add(q.2 as usize) = ans;
                         }
-                        *ans_ptr.add(q.2 as usize) = ans;
-                    }
                     }
                 }
             });
         }
     });
 
-    for &(tid, sid) in &duplicates {
-        answers[tid as usize] = answers[sid as usize];
-    }
+    for &(tid, sid) in &duplicates { answers[tid as usize] = answers[sid as usize]; }
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut f = File::create(format!("{}/distances.txt", out_dir)).expect("out");
