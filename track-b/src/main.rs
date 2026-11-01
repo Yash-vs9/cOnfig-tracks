@@ -47,10 +47,10 @@ sync::atomic::{AtomicUsize, Ordering}, };
 extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32; }
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_T: usize = 12;
+const NUM_T: usize = 6;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 700_000;
-const DP_CAP: usize = 32_000;
+const FW_CAP: usize = 500_000;
+const DP_CAP: usize = 16_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -766,6 +766,7 @@ let mut seen = [0u64; 1280];
 let mut hl = [0u32; 2048];
 let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
 let mut fw_idx = 0usize;
+let mut last_evict = c_byte[c];
 while p < pe {
 while *d_buf.get_unchecked(p) != b'\t'  { p += 1; }
 p += 1;
@@ -803,10 +804,18 @@ if bi != u16::MAX {
 if ov  { seen.fill(0); } else {
 for i in 0..nh  { *seen.get_unchecked_mut((*hl.get_unchecked(i) >> 6) as usize) = 0; } }
 d += 1;
-ld += 1; }
+ld += 1;
+if p.saturating_sub(last_evict) >= 524288 {
+    let e_start = last_evict & !4095;
+    let e_end = p & !4095;
+    if e_end > e_start {
+        madvise(d_buf.as_ptr().add(e_start) as *mut u8, e_end - e_start, 4);
+    }
+    last_evict = p;
+} }
 *dp_ptr.add(ld as usize) = fw_idx as u32;
-let page_start = c_byte[c] & !4095;
-let page_end = (c_byte[c + 1] + 4095) & !4095;
+let page_start = last_evict & !4095;
+let page_end = (pe + 4095) & !4095;
 if page_end > page_start {
     madvise(d_buf.as_ptr().add(page_start) as *mut u8, page_end - page_start, 4);
 } }
@@ -918,14 +927,17 @@ if sw & b == 0 {
 if nh < 2048 { *s_hl.get_unchecked_mut(nh) = t as u32; nh += 1; } else { ov = true; }
 sample_counts[t] = sample_counts[t].saturating_add(1); } });
 if ov { s_seen.fill(0); } else { for i in 0..nh { *s_seen.get_unchecked_mut((*s_hl.get_unchecked(i) >> 6) as usize) = 0; } } }
-// Terms with >= 34 hits in 600 docs (~5.6%) are designated bitset terms
-let threshold = if total_docs >= 25000 { 34 } else { 15 };
-for i in 0..nt {
-if sample_counts[i] >= threshold {
-bs_idx[i] = n_bs as u16;
-n_bs += 1; } }
 let mut term_order: Vec<u32> = (0..nt as u32).collect();
 term_order.sort_unstable_by_key(|&t| std::cmp::Reverse(sample_counts[t as usize]));
+// Top frequent terms with >= threshold hits in 600 docs (~5.6%) are designated bitset terms (capped at 384 for <43.98MB memory cap)
+let threshold = if total_docs >= 25000 { 34 } else { 15 };
+for &t in &term_order {
+    let tid = t as usize;
+    if sample_counts[tid] >= threshold && n_bs < 384 {
+        bs_idx[tid] = n_bs as u16;
+        n_bs += 1;
+    }
+}
 for &t in &term_order {
     let ti = &TINFO[t as usize];
     if ti.len <= 8 && sample_counts[t as usize] > 0 {

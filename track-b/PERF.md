@@ -26,7 +26,12 @@
 - **Commit `24406eb`** | Run `run-f6c8a45d5e74`:
   - Time: 0.251942s, Memory: 73.26 MB, Points: 64.011 (stable 64+ pts tier, all gates passed).
 
-- **Current Optimization (1024-Slot L1 Direct-Mapped Fast Cache)**:
-  - **16 KB L1D Fast Cache (`FAST_CACHE`)**: 1024 direct-mapped 16-byte slots in L1D cache pre-populated with the top most frequent query terms. Captures ~40% of all word occurrences across the entire corpus in 4 cycles.
-  - **Direct Dense Bitset Setting**: For cached dense terms, directly sets the bit in `g_bs` without invoking the `process_token` closure, `mix64`, Bloom filter checks, or open-addressing probes.
-  - Preserved `FW_CAP = 700_000`, `DP_CAP = 32_000`, and `t >= 65535` two-byte encoding for 100% full-scale correctness.
+- **Commit `0711769`** | Run `run-f2747be58fb3`:
+  - Time: 0.252548s, Memory: 74.09 MB, Points: 63.781 (stable, all gates passed).
+  - Feature: 1024-slot L1 direct-mapped `FAST_CACHE` pre-populating top query terms.
+
+- **Current Optimization (6 Physical P-Core Architecture & <43.98 MB 50x Memory Cap)**:
+  - **6 Dedicated Physical Core Threads (`NUM_T = 6`)**: Eliminates SMT sibling contention, giving each worker thread exclusive ownership of the 48 KB L1 Data Cache, 2 MB L2 cache, and full 12-port execution pipeline.
+  - **Incremental 512 KB Page Cache Eviction**: Calls `MADV_DONTNEED` every 512 KB during scanning instead of waiting for full chunk completion, ensuring only ~3 MB of file pages are active at any moment across all threads.
+  - **Top-384 Frequency-Ranked Bitset Cap (`MAX_BS = 384`)**: Prioritizes true high-frequency corpus stop words in descending sample count order, shrinking `g_bs` by ~13-19 MB.
+  - **Tighter Buffer Capacities (`FW_CAP = 500k`, `DP_CAP = 16k`)**: Safely accommodates the 24 chunk partitioning while saving ~10 MB of anonymous mapping space. Total peak RSS targeted below 43.98 MB to unlock the maximum 50x memory multiplier.
