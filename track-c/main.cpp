@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 1;
       }
     name_done:
-      uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
+      uint32_t slot0 = (uint32_t)nh & HT_MASK;
       _mm_prefetch((const char *)&name_keys[slot0], _MM_HINT_T0);
       _mm_prefetch((const char *)&name_bits[slot0], _MM_HINT_T0);
 
