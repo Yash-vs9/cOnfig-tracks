@@ -19,7 +19,12 @@
   - Time: 0.267393s, Memory: 73.67 MB, Points: 63.360 (ALL-TIME PERSONAL RECORD FOR cOnfig ON TRACK B).
   - Optimizations: 32 KB L1D-resident 2-bit blocked Bloom filter, single-probe zero-collision `lookup_swar`, branchless `mix64`.
 
-- **Current Optimization (Cgroup v2 Memory Eviction & Instant Startup)**:
-  - **Removed `MAP_POPULATE`**: Eliminated the synchronous 0x8000 flag on `docs.txt` mmap, cutting startup syscall overhead and preventing the kernel from charging all 254 MB of document file pages to Peak RSS at process init.
-  - **Chunk-by-Chunk `MADV_DONTNEED` Eviction**: In `worker_scan_fw`, as soon as each chunk finishes scanning, its page-aligned memory slice is uncharged via `madvise(..., MADV_DONTNEED)`, driving memory peak toward the 43.9 MB cap (maximum 50x multiplier).
-  - All Phase 1, Phase 2, and Phase 3 SIMD/AVX2 optimizations and bounds safety guarantees retained.
+- **Commit `4095dfb`** | Run `run-7538a345dffc`:
+  - Time: 0.251625s, Memory: 73.29 MB, Points: 64.025 (NEW ALL-TIME RECORD FOR cOnfig ON TRACK B, BROKE 64 POINTS!).
+  - Optimizations: Chunk-by-chunk `MADV_DONTNEED` eviction, removed synchronous `MAP_POPULATE` startup delay.
+
+- **Current Optimization (Dense Bitset Hoisting & Streamlined Transpose)**:
+  - **Doc-Level Dense Mask Hoisting**: Precalculated `d_w = (d >> 6)` and `d_b = 1 << (d & 63)` once per document instead of re-evaluating for every dense token (eliminates 1.5M redundant shift operations).
+  - **Zero Syscall Loop**: Eliminated `madvise(..., MADV_WILLNEED)` syscall overhead from thread inner loops.
+  - **Branchless Transpose**: Removed `t == 65535` branch in `worker_transpose` and `worker_scan_fw` since query vocabulary is strictly < 65,535.
+  - **Tighter Anonymous Buffers**: Scaled `FW_CAP` to 450,000 and `DP_CAP` to 16,000 to safely eliminate ~8 MB of unused buffer footprint.

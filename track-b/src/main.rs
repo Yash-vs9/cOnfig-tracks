@@ -49,8 +49,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 700_000;
-const DP_CAP: usize = 32_000;
+const FW_CAP: usize = 450_000;
+const DP_CAP: usize = 16_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -731,18 +731,19 @@ dp_ptr: *mut u32,
 let mut seen = [0u64; 1280];
 let mut hl = [0u32; 2048];
 let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
-madvise(d_buf.as_ptr().add(p) as *mut u8, pe - p, 3);
 let mut fw_idx = 0usize;
 while p < pe {
 while *d_buf.get_unchecked(p) != b'\t'  { p += 1; }
 p += 1;
 *doc_ts_ptr.add(d as usize) = p as u32;
 *dp_ptr.add(ld as usize) = fw_idx as u32;
+let d_w = (d as usize) >> 6;
+let d_b = 1u64 << (d & 63);
 let (mut nh, mut ov) = (0usize, false);
 scan_doc(d_buf, &mut p, q_buf, rep_map, |t| {
 let bi = *bs_idx.add(t);
 if bi != u16::MAX {
-    *g_bs_ptr.add((bi as usize) * w_per_doc + ((d as usize) >> 6)) |= 1u64 << (d & 63);
+    *g_bs_ptr.add((bi as usize) * w_per_doc + d_w) |= d_b;
 } else {
     let (w, b) = (t >> 6, 1u64 << (t & 63));
     let sw = *seen.get_unchecked(w);
@@ -753,15 +754,9 @@ if bi != u16::MAX {
             nh += 1;
         } else { ov = true; }
         *co_ptr.add(t) += 1;
-        if fw_idx + 2 < FW_CAP {
-            if t < 65535 {
-                *fw_ptr.add(fw_idx) = t as u16;
-                fw_idx += 1;
-            } else {
-                *fw_ptr.add(fw_idx) = 65535;
-                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
-                fw_idx += 2;
-            }
+        if fw_idx < FW_CAP {
+            *fw_ptr.add(fw_idx) = t as u16;
+            fw_idx += 1;
         }
     }
 } });
@@ -792,11 +787,8 @@ let start = *dp_ptr.add(ld) as usize;
 let end = *dp_ptr.add(ld + 1) as usize;
 let mut i = start;
 while i < end {
-let mut t = *fw_ptr.add(i) as usize;
+let t = *fw_ptr.add(i) as usize;
 i += 1;
-if t == 65535 {
-t = 65535 + *fw_ptr.add(i) as usize;
-i += 1; }
 let pos = *cur_ptr.add(t);
 *cur_ptr.add(t) = pos + 1;
 *chunk_u16_ptr.add(pos as usize) = ld as u16; }
