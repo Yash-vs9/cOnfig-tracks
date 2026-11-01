@@ -21,9 +21,9 @@ extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_C: usize = 24;
-const FW_CAP: usize = 750_000;
-const DP_CAP: usize = 32_000;
+const NUM_C: usize = 48;
+const FW_CAP: usize = 250_000;
+const DP_CAP: usize = 10_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -1037,6 +1037,8 @@ for i in t_start..t_end {
 barrier2.wait();
 if tid == 0 {
     madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
+    madvise(FAST_CACHE.as_mut_ptr() as *mut u8, size_of_val(&FAST_CACHE), 4);
+    madvise(PF.as_mut_ptr() as *mut u8, size_of_val(&PF), 4);
     free_mmap(thread_counts_val as *mut u16, NUM_T * nt);
 }
 let mut cp_ptrs = [ptr::null(); NUM_C];
