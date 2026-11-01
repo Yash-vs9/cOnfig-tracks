@@ -1,10 +1,15 @@
 // Speed Demon 2026 — Track C (Aggregates in C++23) Championship Solution
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <charconv>
+#include <climits>
+#include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 struct Agg {
   uint32_t cnt, dn;
@@ -31,33 +36,27 @@ static inline void fmt_cents(char *&p, int64_t c) {
 }
 
 static inline int64_t parse_u(const char *&p) {
-  int64_t x = 0;
+  int64_t x = *p++ - '0';
   while (*p != ',')
-    x = (x << 3) + (x << 1) + (*p++ - '0');
+    x = x * 10 + (*p++ - '0');
   return ++p, x;
 }
 
-static inline uint64_t hash_bytes(const char *s, uint32_t len) {
-  uint64_t h1 = len ^ 0x811c9dc5ULL, h2 = (uint64_t)len * 0x9e3779b97f4a7c15ULL,
-           w = 0, w1 = 0;
-  if (__builtin_expect(len - 8U <= 8U, 1)) {
+static inline uint64_t hash_fast(const char *s, uint32_t len) {
+  uint64_t h1 = len ^ 0x811c9dc5ULL, h2 = (uint64_t)len * 0x9e3779b97f4a7c15ULL;
+  if (__builtin_expect(len >= 8, 1)) {
+    uint64_t w = 0, w1 = 0;
     memcpy(&w, s, 8), memcpy(&w1, s + len - 8, 8);
     h1 = _mm_crc32_u64(_mm_crc32_u64(h1, w), w1);
     h2 = _mm_crc32_u64(_mm_crc32_u64(h2, w1), w);
-    uint64_t h = (h1 ^ (h2 * 0x9e3779b97f4a7c15ULL));
-    h ^= (h >> 31);
-    return h ? h : 1;
-  }
-  uint32_t k = 0;
-  for (; k + 8 <= len; k += 8) {
-    memcpy(&w, s + k, 8);
-    h1 = _mm_crc32_u64(h1, w), h2 = _mm_crc32_u64(h2, w);
-  }
-  if (k < len) {
-    uint64_t tail = 0;
-    for (uint32_t i = k; i < len; ++i)
-      tail = (tail << 8) | (uint8_t)s[i];
-    h1 = _mm_crc32_u64(h1, tail), h2 = _mm_crc32_u64(h2, tail);
+  } else if (len >= 4) {
+    uint32_t a = 0, b = 0;
+    memcpy(&a, s, 4), memcpy(&b, s + len - 4, 4);
+    h1 = _mm_crc32_u32((uint32_t)h1, a), h2 = _mm_crc32_u32((uint32_t)h2, b);
+  } else {
+    for (uint32_t i = 0; i < len; ++i)
+      h1 = _mm_crc32_u8((uint32_t)h1, (uint8_t)s[i]),
+      h2 = (h2 * 31) + (uint8_t)s[i];
   }
   uint64_t h = (h1 ^ (h2 * 0x9e3779b97f4a7c15ULL));
   h ^= (h >> 31);
@@ -168,7 +167,8 @@ int main(int argc, char **argv) {
       T[tid][i].mi = INT64_MAX, T[tid][i].ma = INT64_MIN;
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[520];
-    alignas(64) uint64_t tl_cache[2048][2] = {0};
+    alignas(64) uint64_t tl_k[4096][2] = {0};
+    alignas(64) uint32_t tl_s[4096][2] = {0};
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
 
     auto find_q = [&](const char *s) -> const char * {
@@ -184,13 +184,13 @@ int main(int argc, char **argv) {
     while (p < end) {
       if (__builtin_expect((uint8_t)*p == 0xEF, 0))
         p += 3;
-      int64_t id = parse_u(p), nb = 0, ntb = 0, cents = 0;
+      int64_t id = parse_u(p), nb = 0, ntb = 0;
       uint64_t nh = 0;
 
       if (__builtin_expect(*p == '"', 1)) {
         const char *q = find_q(++p);
         if (__builtin_expect(q[1] != '"', 1)) {
-          nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 2;
+          nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 2;
         } else {
           for (;;) {
             size_t seg = q - p + 1;
@@ -205,7 +205,7 @@ int main(int argc, char **argv) {
               break;
             }
           }
-          nh = hash_bytes(tmp, (uint32_t)std::min<int64_t>(nb, 512));
+          nh = hash_fast(tmp, (uint32_t)(nb < 512 ? nb : 512));
         }
       } else {
         const char *q = nullptr;
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
         }
         if (!q)
           q = (const char *)memchr(p, ',', end - p);
-        nb = q - p, nh = hash_bytes(p, (uint32_t)nb), p = q + 1;
+        nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 1;
       }
 
       if (__builtin_expect(*p == '"', 1)) {
@@ -264,9 +264,10 @@ int main(int argc, char **argv) {
       }
 
       uint32_t rid = (uint32_t)parse_u(p);
-      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0;
-      uint8_t cid = r ? (r - 1) : unm_cid;
+      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0,
+              cid = r ? (r - 1) : unm_cid;
       bool neg = (*p == '-') && ++p;
+      int64_t cents = *p++ - '0';
       while (*p != '.')
         cents = cents * 10 + (*p++ - '0');
       cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
@@ -274,12 +275,14 @@ int main(int argc, char **argv) {
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
 
-      uint32_t tl_idx = (uint32_t)nh & 2047;
-      uint64_t tl_sig = (nh & ~0xFFULL) | cid;
-      if (tl_cache[tl_idx][0] != tl_sig && tl_cache[tl_idx][1] != tl_sig) {
-        tl_cache[tl_idx][1] = tl_cache[tl_idx][0];
-        tl_cache[tl_idx][0] = tl_sig;
-        for (uint32_t slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;;
+      uint32_t idx = (uint32_t)(nh ^ (nh >> 20)) & 4095;
+      uint32_t slot;
+      if (__builtin_expect(tl_k[idx][0] == nh, 1)) {
+        slot = tl_s[idx][0];
+      } else if (tl_k[idx][1] == nh) {
+        slot = tl_s[idx][1];
+      } else {
+        for (slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;;
              slot = (slot + 1) & HT_MASK) {
           uint64_t k = __atomic_load_n(&name_keys[slot], __ATOMIC_RELAXED);
           if (!k) {
@@ -287,15 +290,17 @@ int main(int argc, char **argv) {
             if (!k)
               k = nh;
           }
-          if (k == nh) {
-            uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-            if (!(*w & mask) &&
-                !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask))
-              T[tid][cid].dn++;
+          if (k == nh)
             break;
-          }
         }
+        tl_k[idx][1] = tl_k[idx][0], tl_s[idx][1] = tl_s[idx][0],
+        tl_k[idx][0] = nh, tl_s[idx][0] = slot;
       }
+
+      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+      if (!(*w & mask) &&
+          !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask))
+        T[tid][cid].dn++;
     }
   }
 
