@@ -91,11 +91,11 @@ int main(int argc, char **argv) {
   size_t rsz = rst.st_size, sz = mst.st_size;
   const char *rb = rsz ? (const char *)mmap(0, rsz, PROT_READ, MAP_SHARED, rfd, 0) : nullptr;
   if (rsz && rb == MAP_FAILED) rb = (const char *)mmap(0, rsz, PROT_READ, MAP_PRIVATE, rfd, 0);
-  if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_WILLNEED | MADV_SEQUENTIAL);
+  if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_SEQUENTIAL);
 
   const char *base = sz ? (const char *)mmap(0, sz, PROT_READ, MAP_SHARED, mfd, 0) : nullptr;
   if (sz && base == MAP_FAILED) base = (const char *)mmap(0, sz, PROT_READ, MAP_PRIVATE, mfd, 0);
-  if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
+  if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_SEQUENTIAL);
 
   size_t ro = rsz ? ((const char *)memchr(rb, '\n', rsz) + 1 - rb) : 0;
   for (int t = 0; t <= 12; ++t) rcs[t] = ro + (rsz - ro) * t / 12;
@@ -176,32 +176,31 @@ int main(int argc, char **argv) {
 
       if (__builtin_expect(*p == '"', 1)) {
         const char *s = ++p;
+        uint32_t m = 0, idx = 0;
         if (__builtin_expect(p + 32 <= end, 1)) {
-          uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), q_vec));
-          uint32_t idx = __builtin_ctz(m);
+          m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), q_vec));
+          idx = __builtin_ctz(m);
           if (__builtin_expect(m && s[idx + 1] != '"', 1)) {
             nb = idx, nh = hash_fast(s, idx), p = s + idx + 2;
             goto name_done;
           }
         }
-        {
-          const char *q = find_q(p);
-          if (__builtin_expect(q[1] != '"', 1)) {
-            nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 2;
-          } else {
-            for (;;) {
-              size_t seg = q - p + 1;
-              if (nb + (int64_t)seg <= 512) memcpy(tmp + nb, p, seg);
-              nb += seg, p = q + 2, q = find_q(p);
-              if (q[1] != '"') {
-                size_t rem = q - p;
-                if (nb + (int64_t)rem <= 512) memcpy(tmp + nb, p, rem);
-                nb += rem, p = q + 2;
-                break;
-              }
+        const char *q = m ? (s + idx) : find_q(p);
+        if (q[1] != '"') {
+          nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 2;
+        } else {
+          for (;;) {
+            size_t seg = q - p + 1;
+            if (nb + (int64_t)seg <= 512) memcpy(tmp + nb, p, seg);
+            nb += seg, p = q + 2, q = find_q(p);
+            if (q[1] != '"') {
+              size_t rem = q - p;
+              if (nb + (int64_t)rem <= 512) memcpy(tmp + nb, p, rem);
+              nb += rem, p = q + 2;
+              break;
             }
-            nh = hash_fast(tmp, (uint32_t)nb);
           }
+          nh = hash_fast(tmp, (uint32_t)nb);
         }
       } else {
         const char *q = nullptr;
@@ -258,14 +257,24 @@ int main(int argc, char **argv) {
         ntb += p - s, p += 2;
       } else {
         const char *s = p;
-        while (p + 32 <= end) {
-          uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), c_vec));
-          if (m) { p += __builtin_ctz(m); goto found_c; }
-          p += 32;
+        if (__builtin_expect(p + 32 <= end, 1)) {
+          uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), c_vec));
+          if (m) {
+            uint32_t idx = __builtin_ctz(m);
+            ntb = idx, p = s + idx + 1;
+            goto note_done;
+          }
+          if (__builtin_expect(p + 64 <= end, 1)) {
+            uint32_t m2 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(s + 32)), c_vec));
+            if (m2) {
+              uint32_t idx2 = __builtin_ctz(m2);
+              ntb = 32 + idx2, p = s + 32 + idx2 + 1;
+              goto note_done;
+            }
+          }
         }
         p = (const char *)memchr(p, ',', end - p);
-      found_c:
-        ntb += p - s, ++p;
+        ntb = p - s, ++p;
       }
     note_done:
 
@@ -274,7 +283,9 @@ int main(int argc, char **argv) {
       bool neg = (*p == '-') && ++p;
       int64_t cents = *p++ - '0';
       while (*p != '.') cents = cents * 10 + (*p++ - '0');
-      cents = (cents * 100 + p[1] * 10 + p[2] - 528) * (neg ? -1 : 1), p += 3;
+      cents = cents * 100 + p[1] * 10 + p[2] - 528;
+      if (__builtin_expect(neg, 0)) cents = -cents;
+      p += 3;
       p += 1 + (*p == '\r');
 
       Agg &a = T[tid][cid];
