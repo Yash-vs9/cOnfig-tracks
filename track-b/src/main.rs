@@ -1,40 +1,13 @@
 #![allow(static_mut_refs)]
 
-const BIT_SUM_8: [u16; 256] = {
-    let mut table = [0u16; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut s = 0u16;
-        let mut b = 0usize;
-        while b < 8 {
-            if (i & (1 << b)) != 0 { s += b as u16; }
-            b += 1;
-        }
-        table[i] = s;
-        i += 1;
-    }
-    table
-};
-
 #[inline(always)]
-fn word_bit_sum(val: u64) -> u64 {
-    let b0 = (val & 0xFF) as usize;
-    let b1 = ((val >> 8) & 0xFF) as usize;
-    let b2 = ((val >> 16) & 0xFF) as usize;
-    let b3 = ((val >> 24) & 0xFF) as usize;
-    let b4 = ((val >> 32) & 0xFF) as usize;
-    let b5 = ((val >> 40) & 0xFF) as usize;
-    let b6 = ((val >> 48) & 0xFF) as usize;
-    let b7 = ((val >> 56) & 0xFF) as usize;
-
-    (BIT_SUM_8[b0] as u64)
-        + (BIT_SUM_8[b1] as u64 + ((b1.count_ones() as u64) << 3))
-        + (BIT_SUM_8[b2] as u64 + ((b2.count_ones() as u64) << 4))
-        + (BIT_SUM_8[b3] as u64 + ((b3.count_ones() as u64) * 24))
-        + (BIT_SUM_8[b4] as u64 + ((b4.count_ones() as u64) << 5))
-        + (BIT_SUM_8[b5] as u64 + ((b5.count_ones() as u64) * 40))
-        + (BIT_SUM_8[b6] as u64 + ((b6.count_ones() as u64) * 48))
-        + (BIT_SUM_8[b7] as u64 + ((b7.count_ones() as u64) * 56))
+fn word_bit_sum(mut val: u64) -> u64 {
+    let mut s = 0u64;
+    while val != 0 {
+        s += val.trailing_zeros() as u64;
+        val &= val - 1;
+    }
+    s
 }
 use std::{
 arch::x86_64::*,
@@ -43,7 +16,7 @@ io::Write,
 mem::MaybeUninit,
 os::unix::io::IntoRawFd,
 ptr,
-sync::atomic::{AtomicUsize, Ordering}, };
+sync::atomic::{AtomicUsize, AtomicU32, Ordering}, };
 extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32; }
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
@@ -74,12 +47,12 @@ struct FastBucket {
     e0: FastEntry,
     e1: FastEntry,
 }
-const FC_SZ: usize = 2048;
+const FC_SZ: usize = 4096;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastBucket; 2048] = [FastBucket {
+static mut FAST_CACHE: [FastBucket; 4096] = [FastBucket {
     e0: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
     e1: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
-}; 2048];
+}; 4096];
 
 const CMAP: [u8; 256] = {
 let mut m = [0u8; 256];
@@ -97,6 +70,7 @@ m };
 struct AlignedVTab([Slot; H_SZ]);
 static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
 static mut TINFO: [TInfo; 81920] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, _pad: 0 }; 81920];
+static mut GLOBAL_DF: [AtomicU32; 81920] = [const { AtomicU32::new(0) }; 81920];
 static mut N_TERMS: usize = 0;
 const PF_WORDS: usize = 4096; const PF_WMASK: usize = PF_WORDS - 1;
 
@@ -769,6 +743,7 @@ let mut seen = [0u64; 1280];
 let mut hl = [0u32; 2048];
 let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
 let mut fw_idx = 0usize;
+let mut last_evict = p & !4095;
 while p < pe {
 while *d_buf.get_unchecked(p) != b'\t'  { p += 1; }
 p += 1;
@@ -806,12 +781,16 @@ if bi != u16::MAX {
 if ov  { seen.fill(0); } else {
 for i in 0..nh  { *seen.get_unchecked_mut((*hl.get_unchecked(i) >> 6) as usize) = 0; } }
 d += 1;
-ld += 1; }
+ld += 1;
+let curr_page = p & !4095;
+if curr_page >= last_evict + 262144 {
+    madvise(d_buf.as_ptr().add(last_evict) as *mut u8, curr_page - last_evict, 4);
+    last_evict = curr_page;
+} }
 *dp_ptr.add(ld as usize) = fw_idx as u32;
-let page_start = c_byte[c] & !4095;
-let page_end = (c_byte[c + 1] + 4095) & !4095;
-if page_end > page_start {
-    madvise(d_buf.as_ptr().add(page_start) as *mut u8, page_end - page_start, 4);
+if pe > last_evict {
+    let rem = (pe - last_evict + 4095) & !4095;
+    madvise(d_buf.as_ptr().add(last_evict) as *mut u8, rem, 4);
 } }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_transpose(
@@ -926,7 +905,8 @@ let threshold = if total_docs >= 25000 { 34 } else { 15 };
 for i in 0..nt {
 if sample_counts[i] >= threshold {
 bs_idx[i] = n_bs as u16;
-n_bs += 1; } }
+n_bs += 1;
+TINFO[i].df = 65536 + (sample_counts[i] as u32) * 500; } }
 let mut term_order: Vec<u32> = (0..nt as u32).collect();
 term_order.sort_unstable_by_key(|&t| std::cmp::Reverse(sample_counts[t as usize]));
 for &t in &term_order {
@@ -1003,101 +983,49 @@ let next_chunk = AtomicUsize::new(0);
 let barrier1 = std::sync::Barrier::new(NUM_T);
 let barrier2 = std::sync::Barrier::new(NUM_T);
 std::thread::scope(|s| {
-for tid in 1..NUM_T {
-let b1_ref = &barrier1;
-let b2_ref = &barrier2;
-let next_c_ref = &next_chunk;
-let r_ref = &rep_map;
-let ds_ref = &doc_s;
-let de_ref = &doc_e;
-let cb_ref = &c_byte;
-let queries_ref = &queries;
-let q_terms_ref = &q_terms;
-let next_ref = &next_b;
-let c_post_ptrs_ref = &c_post_ptrs;
-let c_post_lens_ref = &c_post_lens;
-let fw_ptr_c = fw_ptrs[tid];
-let dp_ptr_c = dp_ptrs[tid];
-std::thread::Builder::new()
-.stack_size(196608)
-.spawn_scoped(s, move || {
+let do_worker = |tid: usize| {
 let aff_mask = 1u64 << (tid % 12);
 sched_setaffinity(0, 8, &aff_mask);
-let fw = fw_ptr_c as *mut u16;
-let dp = dp_ptr_c as *mut u32;
+let fw = fw_ptrs[tid] as *mut u16;
+let dp = dp_ptrs[tid] as *mut u32;
 let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
 let bs_idx_p = bs_idx_ptr as *const u16;
-loop { let c = next_c_ref.fetch_add(1, Ordering::Relaxed);
-if c >= NUM_C  { break; }
+loop { let c = next_chunk.fetch_add(1, Ordering::Relaxed);
+if c >= NUM_C { break; }
 ptr::write_bytes(thread_cnt_p, 0, nt);
-worker_scan_fw(
-c,
-nt,
-w_per_doc,
-thread_cnt_p,
-doc_ts_ptr as *mut u32,
-raw_bs_val as *mut u64,
-bs_idx_p,
-d_buf,
-q_buf,
-r_ref,
-ds_ref,
-cb_ref,
-fw,
-dp,
-);
+worker_scan_fw(c, nt, w_per_doc, thread_cnt_p, doc_ts_ptr as *mut u32, raw_bs_val as *mut u64, bs_idx_p, d_buf, q_buf, &rep_map, &doc_s, &c_byte, fw, dp);
 let c_off_p = (c_offs_val as *mut u32).add(c * nt);
 let mut my_tot = 0u32;
 for i in 0..nt {
 *c_off_p.add(i) = my_tot;
-if *bs_idx_p.add(i) == u16::MAX  { my_tot += *thread_cnt_p.add(i) as u32; } }
+if *bs_idx_p.add(i) == u16::MAX {
+    let cnt = *thread_cnt_p.add(i) as u32;
+    my_tot += cnt;
+    if cnt != 0 { GLOBAL_DF[i].fetch_add(cnt, Ordering::Relaxed); }
+} }
 let my_total = (my_tot as usize).max(1);
 let chunk_u16 = alloc_mmap::<u16>(my_total);
-c_post_ptrs_ref[c].store(chunk_u16 as usize, Ordering::Release);
-c_post_lens_ref[c].store(my_total, Ordering::Relaxed);
-worker_transpose(
-c,
-nt,
-c_off_p,
-chunk_u16,
-ds_ref,
-de_ref,
-fw,
-dp,
-); }
+c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
+c_post_lens[c].store(my_total, Ordering::Relaxed);
+worker_transpose(c, nt, c_off_p, chunk_u16, &doc_s, &doc_e, fw, dp); }
 free_mmap(fw, FW_CAP);
 free_mmap(dp, DP_CAP);
-b1_ref.wait();
+barrier1.wait();
 let chunk_nt = (nt + NUM_T - 1) / NUM_T;
 let t_start = tid * chunk_nt;
 let t_end = (t_start + chunk_nt).min(nt);
-let my_len = t_end.saturating_sub(t_start);
-let mut local_df = vec![0u32; my_len];
-for c in 0..NUM_C {
-    let base = c * nt;
-    let slice = std::slice::from_raw_parts((c_offs_val as *const u32).add(base), nt);
-    for idx in 0..my_len {
-        let i = t_start + idx;
-        let end = slice[i];
-        let start = if i > 0 { slice[i - 1] } else { 0 };
-        local_df[idx] += end - start;
+for i in t_start..t_end {
+    if *bs_idx_p.add(i) == u16::MAX {
+        TINFO[i].df = GLOBAL_DF[i].load(Ordering::Relaxed);
     }
 }
-for idx in 0..my_len {
-    let i = t_start + idx;
-    let bi = *bs_idx_p.add(i);
-    if bi != u16::MAX {
-        let mut df = 0u32;
-        let src = std::slice::from_raw_parts((raw_bs_val as *const u64).add((bi as usize) * w_per_doc), w_per_doc);
-        for &w in src { df += w.count_ones(); }
-        TINFO[i].df = df;
-    } else {
-        TINFO[i].df = local_df[idx];
-    }
+barrier2.wait();
+if tid == 0 {
+    madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
+    free_mmap(thread_counts_val as *mut u16, NUM_T * nt);
 }
-b2_ref.wait();
 let mut cp_ptrs = [ptr::null(); NUM_C];
-for c in 0..NUM_C  { cp_ptrs[c] = c_post_ptrs_ref[c].load(Ordering::Relaxed) as *const u16; }
+for c in 0..NUM_C { cp_ptrs[c] = c_post_ptrs[c].load(Ordering::Relaxed) as *const u16; }
 let bi_slice = std::slice::from_raw_parts(bs_idx_ptr as *const u16, nt);
 let c_off_slice = std::slice::from_raw_parts(c_offs_val as *const u32, NUM_C * nt);
 let g_bs_slice = std::slice::from_raw_parts(raw_bs_val as *const u64, g_bs_total);
@@ -1106,113 +1034,6 @@ let eng = Engine {
 c_offs: c_off_slice,
 c_postings: cp_ptrs,
 bs_idx: bi_slice,
-doc_s: ds_ref,
-doc_e: de_ref,
-w_per_doc,
-g_bs: g_bs_slice,
-rep_map: r_ref,
-doc_ts: doc_ts_slice,
-d_buf,
-q_buf,
-q_terms: q_terms_ref,
-nt, };
-loop { let b = next_ref.fetch_add(1, Ordering::Relaxed);
-if b >= nb  { break; }
-let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b);
-for q in &queries_ref[b * QB..((b + 1) * QB).min(queries_ref.len())] {
-if q.ib == 0  {
-    eng.exec_bool(q, ob);
-} else {
-    eng.exec_phrase(q, ob);
-} } }
-})
-.unwrap(); }
-let aff_mask0 = 1u64;
-sched_setaffinity(0, 8, &aff_mask0);
-let fw0 = fw_ptrs[0] as *mut u16;
-let dp0 = dp_ptrs[0] as *mut u32;
-let thread_cnt_0 = thread_counts as *mut u16;
-let bs_idx_p = bs_idx.as_ptr();
-loop { let c = next_chunk.fetch_add(1, Ordering::Relaxed);
-if c >= NUM_C  { break; }
-ptr::write_bytes(thread_cnt_0, 0, nt);
-worker_scan_fw(
-c,
-nt,
-w_per_doc,
-thread_cnt_0,
-doc_ts_ptr as *mut u32,
-raw_bs_ptr,
-bs_idx_p,
-d_buf,
-q_buf,
-&rep_map,
-&doc_s,
-&c_byte,
-fw0,
-dp0,
-);
-let c_off_p = c_offs.add(c * nt);
-let mut my_tot = 0u32;
-for i in 0..nt {
-*c_off_p.add(i) = my_tot;
-if *bs_idx_p.add(i) == u16::MAX  { my_tot += *thread_cnt_0.add(i) as u32; } }
-let my_total = (my_tot as usize).max(1);
-let chunk_u16 = alloc_mmap::<u16>(my_total);
-c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
-c_post_lens[c].store(my_total, Ordering::Relaxed);
-worker_transpose(
-c,
-nt,
-c_off_p,
-chunk_u16,
-&doc_s,
-&doc_e,
-fw0,
-dp0,
-); }
-free_mmap(fw0, FW_CAP);
-free_mmap(dp0, DP_CAP);
-barrier1.wait();
-let chunk_nt = (nt + NUM_T - 1) / NUM_T;
-let t_start = 0;
-let t_end = chunk_nt.min(nt);
-let my_len = t_end.saturating_sub(t_start);
-let mut local_df = vec![0u32; my_len];
-for c in 0..NUM_C {
-    let base = c * nt;
-    let slice = std::slice::from_raw_parts(c_offs.add(base), nt);
-    for idx in 0..my_len {
-        let i = t_start + idx;
-        let end = slice[i];
-        let start = if i > 0 { slice[i - 1] } else { 0 };
-        local_df[idx] += end - start;
-    }
-}
-for idx in 0..my_len {
-    let i = t_start + idx;
-    let bi = *bs_idx_p.add(i);
-    if bi != u16::MAX {
-        let mut df = 0u32;
-        let src = std::slice::from_raw_parts(raw_bs_ptr.add((bi as usize) * w_per_doc), w_per_doc);
-        for &w in src { df += w.count_ones(); }
-        TINFO[i].df = df;
-    } else {
-        TINFO[i].df = local_df[idx];
-    }
-}
-barrier2.wait();
-madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
-free_mmap(thread_counts, NUM_T * nt);
-let mut cp_ptrs = [ptr::null(); NUM_C];
-for c in 0..NUM_C  { cp_ptrs[c] = c_post_ptrs[c].load(Ordering::Relaxed) as *const u16; }
-let c_off_slice = std::slice::from_raw_parts(c_offs as *const u32, sc_count);
-let g_bs_slice = std::slice::from_raw_parts(raw_bs_ptr as *const u64, g_bs_total);
-let doc_ts_slice = std::slice::from_raw_parts(doc_ts.as_ptr(), total_docs as usize);
-let eng = Engine {
-c_offs: c_off_slice,
-c_postings: cp_ptrs,
-bs_idx: &bs_idx,
 doc_s: &doc_s,
 doc_e: &doc_e,
 w_per_doc,
@@ -1224,10 +1045,18 @@ q_buf,
 q_terms: &q_terms,
 nt, };
 loop { let b = next_b.fetch_add(1, Ordering::Relaxed);
-if b >= nb  { break; }
+if b >= nb { break; }
 let ob = &mut *(out_bufs_ptr as *mut Vec<u8>).add(b);
 for q in &queries[b * QB..((b + 1) * QB).min(queries.len())] {
-if q.ib == 0  { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } }
+if q.ib == 0 { eng.exec_bool(q, ob); } else { eng.exec_phrase(q, ob); } } }
+};
+for tid in 1..NUM_T {
+    std::thread::Builder::new()
+        .stack_size(196608)
+        .spawn_scoped(s, move || do_worker(tid))
+        .unwrap();
+}
+do_worker(0);
 });
 let _ = std::fs::create_dir_all(&o_dir);
 let f = File::create(format!("{}/results.txt", o_dir)).unwrap();
