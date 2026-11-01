@@ -35,5 +35,11 @@
   - **Empirical Finding**: 6 threads is 1.82x slower than 12 SMT threads (457 ms vs 251 ms). On Raptor Lake Golden Cove P-cores, 2-way SMT delivers nearly double the aggregate pipeline throughput by hiding L2/L3 memory latencies during posting list traversals and hash probes.
   - Restored 12 SMT threads (`NUM_T = 12`), full `FW_CAP = 700k`, and `DP_CAP = 32k`.
 
-- **Current Optimization (SIMD Postings Intersection & Dual-Block Scanner)**:
-  - 12 threads with L1-resident `FAST_CACHE` and unrolled vector scanning.
+- **Commit `3448acd`** | Run `run-c08426cfccf3`:
+  - Time: 0.254537s, Memory: 72.84 MB, Points: 63.797 (stable, all gates passed).
+  - Feature: Hardware BZHI word masking, branchless bitset intersection.
+
+- **Current Optimization (2-Way Set-Associative FastBucket & Golden Multiplier Hash)**:
+  - **2-Way FastBucket**: 2 entries per 32-byte bucket (2048 buckets = 4096 entries, 64 KB).
+  - **Single-Cycle Multiplier Hash**: Uses `w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32` to eliminate ASCII clustering, expanding cached top words from 751 to 1,827 (+143% capacity boost!).
+  - Resolves ~65% of all words across the corpus in ~4-5 cycles directly into dense bitsets or forward buffer without Bloom/SWAR overhead.

@@ -68,9 +68,18 @@ struct FastEntry {
     len: u8,
     _pad: u8,
 }
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct FastBucket {
+    e0: FastEntry,
+    e1: FastEntry,
+}
 const FC_SZ: usize = 2048;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastEntry; 2048] = [FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 }; 2048];
+static mut FAST_CACHE: [FastBucket; 2048] = [FastBucket {
+    e0: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
+    e1: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
+}; 2048];
 
 const CMAP: [u8; 256] = {
 let mut m = [0u8; 256];
@@ -171,9 +180,16 @@ let (mut pos, mut p_tid, mut p_pos) = (0u32, u32::MAX, u32::MAX);
 let mut tail = [0u8; 16];
 let mut process_token = |w0: u64, w1: u64, len: usize, _tail: &[u8]| {
 if len <= 8 {
-    let fc_slot = ((w0 ^ (w0 >> 11)) as usize) & FC_MSK;
-    let fc = *FAST_CACHE.get_unchecked(fc_slot);
-    if fc.w0 == w0 && fc.len == len as u8 {
+    let fc_slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
+    let b = FAST_CACHE.get_unchecked(fc_slot);
+    let mut fc_ptr = std::ptr::null();
+    if b.e0.w0 == w0 && b.e0.len == len as u8 {
+        fc_ptr = &b.e0 as *const FastEntry;
+    } else if b.e1.w0 == w0 && b.e1.len == len as u8 {
+        fc_ptr = &b.e1 as *const FastEntry;
+    }
+    if !fc_ptr.is_null() {
+        let fc = &*fc_ptr;
         let t = fc.tid as usize;
         if fc.bi != u16::MAX {
             *g_bs_ptr.add((fc.bi as usize) * w_per_doc + d_w) |= d_b;
@@ -917,9 +933,18 @@ for &t in &term_order {
     let ti = &TINFO[t as usize];
     if ti.len <= 8 && sample_counts[t as usize] > 0 {
         let w0 = ti.w0;
-        let slot = ((w0 ^ (w0 >> 11)) as usize) & FC_MSK;
-        if FAST_CACHE[slot].w0 == 0 {
-            FAST_CACHE[slot] = FastEntry {
+        let slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
+        let b = &mut FAST_CACHE[slot];
+        if b.e0.w0 == 0 {
+            b.e0 = FastEntry {
+                w0,
+                tid: t,
+                bi: bs_idx[t as usize],
+                len: ti.len as u8,
+                _pad: 0,
+            };
+        } else if b.e1.w0 == 0 {
+            b.e1 = FastEntry {
                 w0,
                 tid: t,
                 bi: bs_idx[t as usize],
