@@ -24,7 +24,7 @@ struct SharedData {
     p: [usize; 2304],
     q: [u32; 13312 * 256],
     g: [u32; 65536],
-    l: [[u32; 49152]; 12],
+    l: [[u32; 75000]; 12],
     n: [i32; 13312],
     h: [[[i32; 128]; 12]; 2],
     w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]),
@@ -32,7 +32,7 @@ struct SharedData {
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 
-#[inline(always)]
+#[inline]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
     let (mut b, mut i) = ([b' '; 12], 10);
     b[10] = b'0' + (v % 10) as u8;
@@ -46,23 +46,26 @@ unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
 
 #[inline]
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
-unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
+unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> u64 {
     let (s, mask) = (S.0.get(), if ci > 0 { 32767 } else { 255 });
-    let c0 = crc(0, (p as *const u64).read_unaligned()) << 32;
-    (ci == 0).then(|| h = ((c0 ^ h.wrapping_mul(0x9e3779b97f4a7c15)) & !0xFFFF) | (1 << 63));
+    if ci == 0 {
+        let c0 = crc(0, (p as *const u64).read_unaligned()) << 32;
+        h = ((c0 ^ h.wrapping_mul(0x9e3779b97f4a7c15)) & !0xFFFF) | (1 << 63);
+    }
     let (b_kv, b_id) = ((1 - ci) << 15, (1 - ci) << 11);
     let mut idx = ((h >> 16) as usize) & mask;
     loop {
         let slot = &(*s).k[b_kv + idx];
         let kv = slot.load(Relaxed);
         if (kv ^ h) < 65536 {
-            return (kv & 0xFFFF) as usize;
+            return kv;
         }
         if kv == 0 && slot.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
             ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
-            slot.store(h | ((j - b_id) as u64), Release);
-            return j - b_id;
+            let full_kv = h | ((j - b_id) as u64);
+            slot.store(full_kv, Release);
+            return full_kv;
         }
         idx = (idx + (kv > 1) as usize) & mask;
     }
@@ -83,12 +86,12 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
-    let (mut cur_b, mut cur_f) = (-1i32, 256usize);
+    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 256]);
     while p < ec {
         let hw = u8_at(p.add(5));
         if hw != lhw {
             (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
-            (lhw, hid) = (hw, intern(0, p, 13, hw));
+            (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
         let mut ep = p.add(32);
@@ -111,7 +114,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let eid = intern(1, ep, el as u8, h);
+        let ci = ((h >> 16) as usize) & 255;
+        let mut kv = ep_c[ci];
+        if (kv ^ h) >= 65536 {
+            kv = intern(1, ep, el as u8, h);
+            ep_c[ci] = kv;
+        }
+        let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let lp = st_p.add(4);
@@ -172,7 +181,6 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         (*s).w.2[..ne].sort_unstable_by(|&x, &y| gs(x).cmp(gs(y)));
     }
     bar.wait();
-    let (mut cnt, mut off, mut v_lats, mut bh) = ([0u32; 2048], [0u32; 2048], vec![], 0);
     macro_rules! iter_b {
         ($hid:expr, $act:expr) => {
             for tr in 0..12 {
@@ -187,7 +195,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
             }
         };
     }
-    let g_ptr = (*s).g.as_ptr();
+    let (mut cnt, mut off, mut bh) = ([0u32; 2048], [0u32; 2048], 0);
+    let (g_ptr, lp) = ((*s).g.as_ptr(), (*s).l[t].as_mut_ptr());
     let val = |v: u32| {
         if (v as i32) < 0 {
             *g_ptr.add((v >> 11) as u16 as usize)
@@ -203,12 +212,6 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
             cnt[..ne].fill(0);
             iter_b!(h_id, |v| cnt[(v & 2047) as usize] += 1);
             (0..ne).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
-            (tot > 49152).then(|| v_lats.resize(tot as usize, 0));
-            let lp = if tot <= 49152 {
-                (*s).l[t].as_mut_ptr()
-            } else {
-                v_lats.as_mut_ptr()
-            };
             iter_b!(h_id, |v| {
                 let e = (v & 2047) as usize;
                 *lp.add((off[e] + cnt[e]) as usize) = val(v);
