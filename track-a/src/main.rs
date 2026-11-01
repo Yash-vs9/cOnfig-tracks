@@ -1,21 +1,19 @@
 // Speed Demon 2026 — Track A (Ingest) Championship Rust Solution
-#![allow(unsafe_op_in_unsafe_fn, dead_code, unused_unsafe)]
-#![allow(dangerous_implicit_autorefs, suspicious_runtime_symbol_definitions)]
+#![allow(unsafe_op_in_unsafe_fn, dead_code, unused_unsafe, dangerous_implicit_autorefs, suspicious_runtime_symbol_definitions)]
 use std::arch::x86_64::{_mm256_loadu_si256 as ld, _mm_crc32_u64 as crc, *};
-use std::io::Write;
 use std::ptr::copy_nonoverlapping as copy;
 use std::slice::{from_raw_parts as slc, from_raw_parts_mut as slc_mut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thread::Builder};
-extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; }
+extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn madvise(a: *mut u8, l: usize, b: i32) -> i32; fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize; }
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 #[repr(C, align(64))]
 struct SharedData {
     k: [AtomicU64; 33024], c: [AtomicU32; 163845], p: [usize; 2304],
-    q: [u32; 13312 * 256], g: [u32; 65536], l: [[u32; 49152]; 12], n: [i32; 13312],
-    h: [[[i32; 128]; 12]; 2], w: ([[u16; 128]; 12], [u16; 13312], [u16; 2304]),
-    u: ([u8; 2304], [[u8; 163840]; 12]), hr_buf: [[u8; 16]; 128], ep_buf: [u8; 65536],
+    q: [u32; 14336 * 256], g: [u32; 65536], l: [[u32; 98304]; 12], n: [i32; 14336],
+    h: [[[i32; 128]; 12]; 2], w: ([[u16; 128]; 12], [u16; 14336], [u16; 2304]),
+    u: ([u8; 2304], [[u8; 163840]; 12]),
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[inline(always)]
@@ -27,26 +25,23 @@ unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
 }
 #[inline]
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
-unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> usize {
+unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> u64 {
     let (s, mask) = (S.0.get(), if ci > 0 { 32767 } else { 255 });
-    let c0 = crc(0, (p as *const u64).read_unaligned()) << 32;
-    (ci == 0).then(|| h = ((c0 ^ h.wrapping_mul(0x9e3779b97f4a7c15)) & !0xFFFF) | (1 << 63));
+    if ci == 0 { let c0 = crc(0, (p as *const u64).read_unaligned()) << 32; h = ((c0 ^ h.wrapping_mul(0x9e3779b97f4a7c15)) & !0xFFFF) | (1 << 63); }
     let (b_kv, b_id, mut idx) = ((1 - ci) << 15, (1 - ci) << 11, ((h >> 16) as usize) & mask);
     let mut kv = (*s).k[b_kv + idx].load(Acquire);
     while (kv ^ h) >= 65536 {
         if kv == 0 && (*s).k[b_kv + idx].compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
             let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
-            let str_p = if ci == 0 { copy(p, (*s).hr_buf[j - 2048].as_mut_ptr(), 13); (*s).hr_buf[j - 2048].as_ptr() as usize }
-            else { let o = (*s).c[163844].fetch_add(len as u32, Relaxed) as usize; copy(p, (*s).ep_buf.as_mut_ptr().add(o), len as usize); (*s).ep_buf.as_ptr().add(o) as usize };
-            ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (str_p, len, (j - b_id) as u16);
+            ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
             (*s).k[b_kv + idx].store(h | ((j - b_id) as u64), Release);
         }
         idx = (idx + (kv > 1) as usize) & mask; kv = (*s).k[b_kv + idx].load(Acquire);
     }
-    (kv & 0xFFFF) as usize
+    kv
 }
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
-unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier) {
+unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let (s, lim, sv) = (S.0.get(), bp as usize + sz, _mm256_set1_epi8(b' ' as i8));
     let u8_at = |q: *const u8| (q as *const u64).read_unaligned();
     let find = |q: *const u8, b| slc(q, lim - q as usize).iter().position(|&c| c == b).unwrap();
@@ -54,12 +49,12 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
     let sp_m = |q: *const u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(q as _), sv)) as u32 as u64;
     let (mut p, ec, mut lhw, mut hid) = (sk(t * sz / 12), sk((t + 1) * sz / 12), 0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
-    let (mut cur_b, mut cur_f) = (-1i32, 256usize);
+    let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 256]);
     while p < ec {
         let hw = u8_at(p.add(5));
         if hw != lhw {
             (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
-            (lhw, hid) = (hw, intern(0, p, 13, hw));
+            (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
         let ep = if *p.add(32) == b'/' { p.add(32) } else if *p.add(33) == b'/' { p.add(33) } else if *p.add(34) == b'/' { p.add(34) } else if *p.add(35) == b'/' { p.add(35) } else { p.add(36) };
@@ -71,7 +66,10 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
         let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
-        let eid = intern(1, ep, el as u8, h);
+        let ci = ((h >> 16) as usize) & 255;
+        let mut kv = ep_c[ci];
+        if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
+        let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
         (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
         let lp = st_p.add(4);
@@ -80,8 +78,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         if sub & 0x8080_8080_8080_8080 != 0 {
             let tz = (sub & 0x8080_8080_8080_8080).trailing_zeros();
             let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
-            let w2 = (w.wrapping_mul(6553601) >> 16 & 0xFFFF_0000_FFFF).wrapping_mul(42949672960001);
-            (c, lat) = (lp.add((tz >> 3) as usize), (w2 >> 32) as u32);
+            let m64 = w.wrapping_mul(6553601) >> 16 & 0xFFFF_0000_FFFF;
+            (c, lat) = (lp.add((tz >> 3) as usize), ((m64.wrapping_mul(0x2710_0000_0001)) >> 32) as u32);
         } else {
             while *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
         }
@@ -94,15 +92,12 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
             (*link, cur_b, cur_f) = (nb, nb, 0);
         }
         let mut hb = lat;
-        if lat >= 1 << 20 {
-            hb = 0x10_0000 | (*s).c[163843].fetch_add(1, Relaxed); (*s).g[(hb & 0xFFFF) as usize] = lat;
-        }
+        if lat >= 1 << 20 { hb = 0x10_0000 | (*s).c[163843].fetch_add(1, Relaxed); (*s).g[(hb & 0xFFFF) as usize] = lat; }
         ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
     }
     (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
     for i in 0..128 { ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]); }
     bar.wait();
-    (t == 0).then(|| munmap(bp as _, sz));
     let (nh, ne) = ((*s).c[163840].load(Relaxed) as _, (*s).c[163841].load(Relaxed) as _);
     if t == 0 {
         let (p_arr, u0_arr) = ((*s).p.as_ptr(), (*s).u.0.as_ptr());
@@ -111,8 +106,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         (*s).w.2[..ne].sort_unstable_by(|&x, &y| gs(x).cmp(gs(y)));
     }
     bar.wait();
-    let (mut cnt, mut off, mut v_lats, mut bh) = ([0u32; 2048], [0u32; 2048], vec![], 0);
-    let g_ptr = (*s).g.as_ptr();
+    let (mut cnt, mut off, mut bh) = ([0u32; 2048], [0u32; 2048], 0);
+    let (g_ptr, lp) = ((*s).g.as_ptr(), (*s).l[t].as_mut_ptr());
     let val = |v: u32| if (v as i32) < 0 { *g_ptr.add((v >> 11) as u16 as usize) } else { v >> 11 };
     while bh < nh {
         let (hi, out_b) = (bh + t, (*s).u.1[t].as_mut_ptr());
@@ -129,7 +124,6 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
                 }
             }
             (0..ne).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
-            let lp = if tot <= 49152 { (*s).l[t].as_mut_ptr() } else { v_lats.resize(tot as usize, 0); v_lats.as_mut_ptr() };
             for tr in 0..12 {
                 let mut b = (*s).h[0][tr][h_id];
                 while b >= 0 {
@@ -144,17 +138,15 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
             for &eid_u in (*s).w.2[..ne].iter().filter(|&&e| cnt[e as usize] > 0) {
                 let (eid, n) = (eid_u as usize, cnt[eid_u as usize] as usize);
                 let l = slc_mut(lp.add(off[eid] as usize), n);
-                let pct = |p: usize| (p * n + 99) / 100 - 1;
-                let (i50, i95, i99) = (pct(50), pct(95), pct(99));
-                (n <= 32).then(|| l.sort_unstable());
-                (n > 32).then(|| l.select_nth_unstable(i50));
-                (n > 32 && i95 > i50).then(|| l[i50 + 1..].select_nth_unstable(i95 - i50 - 1));
-                (n > 32 && i99 > i95).then(|| l[i95 + 1..].select_nth_unstable(i99 - i95 - 1));
+                let (i50, i95, i99) = ((50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (99 * n + 99) / 100 - 1);
+                if n <= 32 { l.sort_unstable(); } else {
+                    l.select_nth_unstable(i50);
+                    if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
+                    if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
+                }
                 let (err, el) = ((*s).c[h_id * 2048 + eid].load(Relaxed), (*s).u.0[eid] as usize);
-                copy((*s).p[2048 + h_id] as *const u8, ptr, 13);
-                copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
-                copy((*s).p[eid] as *const u8, ptr.add(21), el);
-                *ptr.add(21 + el) = b' '; ptr = ptr.add(22 + el);
+                copy((*s).p[2048 + h_id] as *const u8, ptr, 13); copy(b":00:00Z ".as_ptr(), ptr.add(13), 8);
+                copy((*s).p[eid] as *const u8, ptr.add(21), el); *ptr.add(21 + el) = b' '; ptr = ptr.add(22 + el);
                 let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
                 for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
                 *ptr.sub(1) = b'\n';
@@ -162,7 +154,15 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, mut out: &File, bar: &Barrier
         }
         (*s).p[2176 + t] = ptr as usize - out_b as usize;
         bar.wait();
-        for k in 0..if t == 0 { 12 } else { 0 } { out.write_all(&(*s).u.1[k][..(*s).p[2176 + k]]).unwrap(); }
+        if t == 0 {
+            let mut iov = [[0usize; 2]; 12];
+            let mut valid = 0;
+            for k in 0..12 {
+                let len = (*s).p[2176 + k];
+                if len > 0 { iov[valid] = [(*s).u.1[k].as_ptr() as usize, len]; valid += 1; }
+            }
+            if valid > 0 { writev(out_fd, iov.as_ptr(), valid as i32); }
+        }
         bar.wait();
         bh += 12;
     }
@@ -177,14 +177,11 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
-            drop(inf);
-            let bar = Barrier::new(12);
-            let (outf, bar) = (&outf, &bar);
+            madvise(base as _, sz, 3);
+            let (out_fd, bar) = (outf.as_raw_fd(), &Barrier::new(12));
             std::thread::scope(|sc| {
-                for t in 1..12 {
-                    Builder::new().stack_size(65536).spawn_scoped(sc, move || work(t, base as _, sz, outf, bar)).unwrap();
-                }
-                work(0, base as _, sz, outf, bar);
+                for t in 1..12 { Builder::new().stack_size(65536).spawn_scoped(sc, move || work(t, base as _, sz, out_fd, bar)).unwrap(); }
+                work(0, base as _, sz, out_fd, bar);
             });
         }
     }
