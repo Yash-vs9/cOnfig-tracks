@@ -98,9 +98,14 @@ The unoptimized Python/reference baseline took 20.64 s and consumed 367 MB RSS.
 - **32-Bit Integer Parsing:** Reduced register pressure by converting `id` and `rid` parsing to `uint32_t`.
 - **Result:** Official board scored $T = 0.0406\text{ s}$ (40.6 ms), $M = 9.84\text{ MB}$, $S = 380$, $K = 31.898$, score reached **75.188 pts** (`run-7e3624df8e04`).
 
-### Step 15: Single-Thread 1.4ms Region Parsing, 1-Barrier OpenMP Architecture, Parallel BSS Prefault, S=373 (`pending`, target 77–80+ pts)
+### Step 15: Single-Thread 1.4ms Region Parsing, 1-Barrier OpenMP Architecture (`4d14aa9`, 70.354 pts)
 - **Single-Threaded Sequential 2-Pass Region Parsing:** Since `regions.csv` is only ~1.5 MB and already mapped in RAM, parsing sequentially in two fast passes takes only 1.49 ms total. Eliminates `rcs[13]`, deletes 3 OpenMP thread barriers, and removes 36 lines of synchronization code.
 - **Single OpenMP Barrier Architecture:** Worker threads now perform only one synchronization step: determining their `cs[tid]` record boundary offset via `is_rec_end` and immediately proceeding to streaming record parsing.
-- **Parallel BSS Memory Pre-Faulting:** Concurrently touches `name_keys` (1 MB) and `name_bits` (4 MB) across all 12 worker threads during thread launch (~0.2 ms), eliminating 1,280 on-demand soft page faults during record processing.
-- **Direct Accumulation into `T[0][cid]`:** Removed global `Agg G[256]` static array, aggregating threads 1..11 directly into thread 0's accumulator array.
-- **Concise Logic & Line Compression:** Streamlined `is_rec_end` and `fmt_cents` with unsigned comparisons, reducing canonical lines from 380 to 373 (`scc`).
+- **Memory Jump Diagnosis:** Writing 0s to `name_keys` and `name_bits` in a parallel loop forced all 1,280 pages of BSS to become dirty physical pages, while multiple OpenMP threads without arena limits increased container RSS to 29.8 MB (`run-d28277880b7e`), dropping score to 70.354.
+
+### Step 16: Mallopt Single Arena, Zero-Dirty BSS, `mm_find` AVX2 Helper, Dual-Prefetch, S=368 (`pending`, target 78–82+ pts)
+- **`mallopt(-8, 1); mallopt(-1, 0);`:** Enforces `M_ARENA_MAX=1` and `M_TRIM_THRESHOLD=0`, preventing glibc from pre-allocating multiple 64MB thread arenas across the 12 OpenMP threads and locking memory firmly $\le 10\text{ MB}$.
+- **Zero-Dirty BSS Restoration:** Deleted the BSS pre-fault loop, allowing the Linux kernel to map unused hash table pages to the copy-on-write zero page.
+- **Dual-Cache-Line Prefetching:** Prefetches both `name_bits[slot0]` and `name_bits[(slot0 + 1) & HT_MASK]`, pre-loading both odd and even collision slots into L1/L2 cache before note/amount parsing completes.
+- **Empty Field 1-Cycle Fastpaths:** Explicit `if (*p == ',')` checks for empty unquoted names (`nh = 3902269347ULL`) and notes, executing in 1 CPU cycle without AVX2 vector loads.
+- **`mm_find` AVX2 Match Helper:** Consolidated repeated `_mm256_movemask_epi8(_mm256_cmpeq_epi8(...))` boilerplate into a concise inline helper, driving canonical scored lines down from 373 to **368 lines**.
