@@ -32,16 +32,16 @@ static inline void fmt_cents(char *&p, int64_t c) {
   p = std::to_chars(p, p + 20, c / 100).ptr;
   *p++ = '.', *p++ = '0' + (c % 100) / 10, *p++ = '0' + (c % 10), *p++ = ' ';
 }
-static inline int64_t parse_u(const char *&p) {
+static inline uint32_t parse_u(const char *&p) {
   int64_t x = *p++ - '0';
   while (*p != ',') x = x * 10 + (*p++ - '0');
   return ++p, x;
 }
 static inline uint64_t hash_fast(const char *s, uint32_t len) {
   uint64_t h1 = len ^ 0x811c9dc5ULL, h2 = (uint64_t)len * 0x9e3779b97f4a7c15ULL;
-  if (__builtin_expect(len <= 8, 0)) {
+  if (__builtin_expect(len <= 8, 1)) {
     uint64_t w = 0; memcpy(&w, s, 8);
-    h1 = _mm_crc32_u64(h1, len ? _bzhi_u64(w, len * 8) : 0), h2 ^= (len ? _bzhi_u64(w, len * 8) : 0);
+    uint64_t m = _bzhi_u64(w, len << 3); h1 = _mm_crc32_u64(h1, m), h2 ^= m;
   } else if (__builtin_expect(len <= 16, 1)) {
     uint64_t a, b; memcpy(&a, s, 8), memcpy(&b, s + len - 8, 8);
     h1 = _mm_crc32_u64(h1, a), h2 = _mm_crc32_u64(h2, b);
@@ -79,12 +79,14 @@ int main(int argc, char **argv) {
   struct stat rst{}, mst{};
   fstat(rfd, &rst), fstat(mfd, &mst);
   size_t rsz = rst.st_size, sz = mst.st_size;
-  const char *rb = rsz ? (const char *)mmap(0, rsz, PROT_READ, MAP_SHARED, rfd, 0) : nullptr;
-  if (rsz && rb == MAP_FAILED) rb = (const char *)mmap(0, rsz, PROT_READ, MAP_PRIVATE, rfd, 0);
-  if (rsz && rb != MAP_FAILED) madvise((void *)rb, rsz, MADV_WILLNEED | MADV_SEQUENTIAL);
-  const char *base = sz ? (const char *)mmap(0, sz, PROT_READ, MAP_SHARED, mfd, 0) : nullptr;
-  if (sz && base == MAP_FAILED) base = (const char *)mmap(0, sz, PROT_READ, MAP_PRIVATE, mfd, 0);
-  if (sz && base != MAP_FAILED) madvise((void *)base, sz, MADV_WILLNEED | MADV_SEQUENTIAL);
+  auto map_f = [&](int fd, size_t len) -> const char * {
+    if (!len) return nullptr;
+    const char *b = (const char *)mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (b == MAP_FAILED) b = (const char *)mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (b != MAP_FAILED) madvise((void *)b, len, MADV_WILLNEED | MADV_SEQUENTIAL);
+    return b;
+  };
+  const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
 
   size_t ro = rsz ? ((const char *)memchr(rb, '\n', rsz) + 1 - rb) : 0;
   for (int t = 0; t <= 12; ++t) rcs[t] = ro + (rsz - ro) * t / 12;
@@ -130,7 +132,7 @@ int main(int argc, char **argv) {
     if (rsz) {
       const char *rp = rb + rcs[tid], *rend = rb + rcs[tid + 1];
       while (rp < rend) {
-        uint32_t reg = (uint32_t)parse_u(rp);
+        uint32_t reg = parse_u(rp);
         uint16_t code = (rp[0] - 'A') * 676 + (rp[1] - 'A') * 26 + (rp[2] - 'A') + 1;
         if (reg < 1000000) reg_lut[reg] = (uint8_t)(c_to_dense[code] + 1);
         rp += (rp[3] == '\r' ? 5 : 4);
@@ -161,9 +163,11 @@ int main(int argc, char **argv) {
         uint32_t m = 0, idx = 0;
         if (__builtin_expect(p + 32 <= end, 1)) {
           m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)s), q_vec));
-          idx = __builtin_ctz(m);
-          if (__builtin_expect(m && s[idx + 1] != '"', 1)) {
-            nb = idx, nh = hash_fast(s, idx), p = s + idx + 2; goto name_done;
+          if (__builtin_expect(m != 0, 1)) {
+            idx = __builtin_ctz(m);
+            if (__builtin_expect(s[idx + 1] != '"', 1)) {
+              nb = idx, nh = hash_fast(s, idx), p = s + idx + 2; goto name_done;
+            }
           }
         }
         const char *q = m ? (s + idx) : find_q(p);
@@ -241,19 +245,19 @@ int main(int argc, char **argv) {
           if (__builtin_expect(p + 64 <= end, 1)) {
             uint32_t m2 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(s + 32)), c_vec));
             if (m2) { ntb = 32 + __builtin_ctz(m2), p = s + ntb + 1; goto note_done; }
-          }
+            p = s + 64;
+          } else p = s + 32;
         }
         p = (const char *)memchr(p, ',', end - p), ntb = p - s, ++p;
       }
     note_done:
-      uint32_t rid = (uint32_t)parse_u(p);
+      uint32_t rid = parse_u(p);
       uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0, cid = r ? (r - 1) : unm_cid;
       bool neg = (*p == '-') && ++p;
       int64_t cents = *p++ - '0';
-      while (*p != '.') cents = cents * 10 + (*p++ - '0');
-      cents = cents * 100 + p[1] * 10 + p[2] - 528;
+      if (*p != '.') while (*p != '.') cents = cents * 10 + (*p++ - '0');
+      cents = cents * 100 + p[1] * 10 + p[2] - 528, p += 3;
       if (__builtin_expect(neg, 0)) cents = -cents;
-      p += 3;
       p += 1 + (*p == '\r');
 
       Agg &a = T[tid][cid];
