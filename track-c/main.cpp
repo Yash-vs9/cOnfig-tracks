@@ -4,7 +4,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <malloc.h>
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -14,8 +13,7 @@ struct alignas(64) Agg {
   uint32_t cnt, dn;
   int64_t id_s, am_s, mi, ma, nb, ntb;
   void add(const Agg &t) {
-    mi = cnt ? std::min(mi, t.mi) : t.mi;
-    ma = cnt ? std::max(ma, t.ma) : t.ma;
+    mi = cnt ? std::min(mi, t.mi) : t.mi, ma = cnt ? std::max(ma, t.ma) : t.ma;
     cnt += t.cnt, id_s += t.id_s, am_s += t.am_s, nb += t.nb, ntb += t.ntb;
   }
 };
@@ -30,8 +28,8 @@ static size_t cs[13];
 static uint8_t unm_cid;
 
 static inline uint32_t mm_find(const char *p, __m256i v) {
-  return _mm256_movemask_epi8(
-      _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), v));
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+      _mm256_loadu_si256((const __m256i *)p), v));
 }
 static inline void fmt_cents(char *&p, int64_t c) {
   c < 0 ? (*p++ = '-', c = -c) : 0;
@@ -76,23 +74,21 @@ static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
   p -= 3;
   const char *s = p;
   while (p > b && (uint32_t)(p[-1] - '0') <= 9) --p;
-  if (p == s || (p > b && p[-1] == '-' && --p, p <= b || p[-1] != ',')) return 0;
+  if (p == s || (p > b && p[-1] == '-' && --p, p <= b || p[-1] != ','))
+    return 0;
   s = --p;
   while (p > b && (uint32_t)(p[-1] - '0') <= 9) --p;
   if (p == s || p <= b || p[-1] != ',') return 0;
   const char *nx = nl + 1;
   if (nx >= b + sz) return 1;
-  nx += (nx + 3 <= b + sz && (uint8_t)nx[0] == 0xEF && (uint8_t)nx[1] == 0xBB &&
-         (uint8_t)nx[2] == 0xBF)
-            ? 3
-            : 0;
-  s = nx;
+  bool bom = nx + 3 <= b + sz && (uint8_t)nx[0] == 0xEF &&
+             (uint8_t)nx[1] == 0xBB && (uint8_t)nx[2] == 0xBF;
+  nx += bom ? 3 : 0, s = nx;
   while (nx < b + sz && (uint32_t)(*nx - '0') <= 9) ++nx;
   return nx > s && nx < b + sz && *nx == ',';
 }
 
 int main(int argc, char **argv) {
-  mallopt(-8, 1), mallopt(-1, 0);
   int rfd = open(argc > 1 ? argv[1] : "/data/regions.csv", O_RDONLY);
   int mfd = open(argc > 2 ? argv[2] : "/data/records.csv", O_RDONLY);
   struct stat rst{}, mst{};
@@ -214,7 +210,6 @@ int main(int argc, char **argv) {
       uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
       _mm_prefetch((const char *)&name_keys[slot0], _MM_HINT_T0);
       _mm_prefetch((const char *)&name_bits[slot0], _MM_HINT_T0);
-      _mm_prefetch((const char *)&name_bits[(slot0 + 1) & HT_MASK], _MM_HINT_T0);
 
       if (__builtin_expect(*p == '"', 1)) {
         const char *s = ++p;
