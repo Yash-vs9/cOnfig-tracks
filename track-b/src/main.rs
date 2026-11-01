@@ -22,8 +22,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 700_000;
-const DP_CAP: usize = 32_000;
+const FW_CAP: usize = 400_000;
+const DP_CAP: usize = 16_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -197,12 +197,19 @@ p_tid = tid;
 p_pos = pos;
 } else { p_tid = u32::MAX; }
 pos += 1; };
-while *p + 32 <= n {
-let c = _mm256_loadu_si256(base.add(*p) as *const __m256i);
-let mut mask_tok = tokmask(c);
-let mask_nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c, nlv)) as u32;
-let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 32 };
-if mask_nl != 0 { mask_tok &= (1u32 << nl_pos).wrapping_sub(1); }
+while *p + 64 <= n {
+let c0 = _mm256_loadu_si256(base.add(*p) as *const __m256i);
+let c1 = _mm256_loadu_si256(base.add(*p + 32) as *const __m256i);
+let mask0 = tokmask(c0);
+let mask1 = tokmask(c1);
+let nl0 = _mm256_cmpeq_epi8(c0, nlv);
+let nl1 = _mm256_cmpeq_epi8(c1, nlv);
+let m_nl0 = _mm256_movemask_epi8(nl0) as u32;
+let m_nl1 = _mm256_movemask_epi8(nl1) as u32;
+let mask_nl = (m_nl0 as u64) | ((m_nl1 as u64) << 32);
+let mut mask_tok = (mask0 as u64) | ((mask1 as u64) << 32);
+let nl_pos = if mask_nl != 0 { mask_nl.trailing_zeros() as usize } else { 64 };
+if mask_nl != 0 { mask_tok &= if nl_pos == 64 { u64::MAX } else { (1u64 << nl_pos).wrapping_sub(1) }; }
 let mut offset = 0usize;
 let mut cross = false;
 while mask_tok != 0 {
@@ -210,7 +217,7 @@ let zeros = mask_tok.trailing_zeros() as usize;
 let tok_start = offset + zeros;
 let rem = mask_tok >> zeros;
 let len = (!rem).trailing_zeros() as usize;
-if mask_nl == 0 && tok_start + len == 32 {
+if mask_nl == 0 && tok_start + len == 64 {
 *p += tok_start;
 cross = true; break; }
 let (w0, w1);
@@ -231,7 +238,7 @@ w0 = r.0;
 w1 = r.1;
 process_token(w0, w1, len, &tail); }
 let consumed = zeros + len;
-if consumed >= 32  { break; }
+if consumed >= 64 { break; }
 mask_tok = rem >> len;
 offset = tok_start + len; }
 if mask_nl != 0 { *p += nl_pos + 1; return; }
@@ -240,7 +247,7 @@ let l = (!tokmask(_mm256_loadu_si256(base.add(*p) as *const __m256i))).trailing_
 if l >= 16 || *p + 32 > n {
 let r = read_tok(d_buf, p, &mut tail);
 process_token(r.0, r.1, r.2, &tail); }
-} else { *p += 32; } }
+} else { *p += 64; } }
 // Tail fallback
 while *p < n {
 while *p < n && *CMAP.get_unchecked(*base.add(*p) as usize) == 0  { *p += 1; }
@@ -270,9 +277,8 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 let f = File::open(path).unwrap();
 let len = f.metadata().unwrap().len() as usize;
 let fd = f.into_raw_fd();
-let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
+let p = mmap(ptr::null_mut(), len, 1, 2, fd, 0);
 close(fd);
-madvise(p, len, 2);
 std::slice::from_raw_parts(p, len) }
 unsafe fn alloc_mmap<T>(count: usize) -> *mut T {
 let sz = count * size_of::<T>();
