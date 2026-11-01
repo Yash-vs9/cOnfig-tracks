@@ -38,10 +38,10 @@ extern "C" {
 }
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_T: usize = 12;
-const NUM_C: usize = 12;
-const FW_CAP: usize = 500_000;
-const DP_CAP: usize = 3_000;
+const NUM_T: usize = 6;
+const NUM_C: usize = 6;
+const FW_CAP: usize = 2_000_000;
+const DP_CAP: usize = 22_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot {
@@ -202,11 +202,17 @@ unsafe fn insert_term(s: &[u8], off: u32, q_buf: &[u8]) -> u32 {
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
     let mut w0 = 0u64;
     let mut len = 0usize;
+    if *p >= d.len() {
+        return (0, 0, 0);
+    }
     let mut m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
     while len < 8 {
         w0 |= (m as u64) << (len * 8);
         len += 1;
         *p += 1;
+        if *p >= d.len() {
+            return (w0, 0, len);
+        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, 0, len);
@@ -217,6 +223,9 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
         w1 |= (m as u64) << ((len - 8) * 8);
         len += 1;
         *p += 1;
+        if *p >= d.len() {
+            return (w0, w1, len);
+        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, w1, len);
@@ -226,6 +235,9 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
         *tail.get_unchecked_mut(len - 16) = m;
         len += 1;
         *p += 1;
+        if *p >= d.len() {
+            return (w0, w1, len);
+        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
         if m <= 1 {
             return (w0, w1, len);
@@ -234,6 +246,9 @@ unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, u
     while m > 1 {
         *p += 1;
         len += 1;
+        if *p >= d.len() {
+            return (w0, w1, len);
+        }
         m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
     }
     (w0, w1, len)
@@ -442,7 +457,7 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
     close(fd);
     madvise(p, len, 2);
     std::slice::from_raw_parts(p, len)
@@ -1352,7 +1367,7 @@ unsafe fn run_all() {
             std::thread::Builder::new()
                 .stack_size(131072)
                 .spawn_scoped(s, move || {
-                    let aff_mask = 1u64 << (tid % 12);
+                    let aff_mask = 1u64 << ((tid * 2) % 12);
                     sched_setaffinity(0, 8, &aff_mask);
                     let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
                     let bs_idx_p = bs_idx_ptr as *const u16;
@@ -1396,34 +1411,28 @@ unsafe fn run_all() {
                         free_mmap(fw, FW_CAP);
                         free_mmap(dp, DP_CAP);
                     }
-                    ready_ref.fetch_add(1, Ordering::Release);
-                    while ready_ref.load(Ordering::Acquire) < NUM_T {
-                        std::hint::spin_loop();
-                    }
-                    let chunk_terms = (nt + NUM_T - 1) / NUM_T;
-                    let t_start = (tid * chunk_terms).min(nt);
-                    let t_end = ((tid + 1) * chunk_terms).min(nt);
-                    for i in t_start..t_end {
-                        if *bs_idx_p.add(i) != u16::MAX {
-                            TINFO[i].df = 65535;
-                        } else {
-                            let mut df = 0u32;
-                            for c in 0..NUM_C {
-                                let base = c * nt;
-                                let end = *(c_offs_val as *const u32).add(base + i);
-                                let start = if i > 0 { *(c_offs_val as *const u32).add(base + i - 1) } else { 0 };
-                                df += end - start;
-                            }
-                            TINFO[i].df = (df as u16).min(65535);
-                        }
-                    }
-                    if tid == 0 {
+                    if ready_ref.fetch_add(1, Ordering::Release) == NUM_T - 1 {
                         madvise(VTAB.0.as_mut_ptr() as *mut u8, size_of::<AlignedVTab>(), 4);
+                        for i in 0..nt {
+                            if *bs_idx_p.add(i) != u16::MAX {
+                                TINFO[i].df = 65535;
+                            } else {
+                                let mut df = 0u32;
+                                for c in 0..NUM_C {
+                                    let base = c * nt;
+                                    let end = *(c_offs_val as *const u32).add(base + i);
+                                    let start = if i > 0 { *(c_offs_val as *const u32).add(base + i - 1) } else { 0 };
+                                    df += end - start;
+                                }
+                                TINFO[i].df = (df as u16).min(65535);
+                            }
+                        }
                         free_mmap(thread_counts_val as *mut u16, NUM_T * nt);
-                    }
-                    phase_ref.fetch_add(1, Ordering::Release);
-                    while phase_ref.load(Ordering::Acquire) < NUM_T {
-                        std::hint::spin_loop();
+                        phase_ref.store(1, Ordering::Release);
+                    } else {
+                        while phase_ref.load(Ordering::Acquire) < 1 {
+                            std::hint::spin_loop();
+                        }
                     }
                     let mut cp_ptrs = [ptr::null(); NUM_C];
                     for c in 0..NUM_C {
