@@ -17,10 +17,10 @@ mem::MaybeUninit,
 os::unix::io::IntoRawFd,
 ptr,
 sync::atomic::{AtomicUsize, AtomicU32, Ordering}, };
-extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; }
+extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8; fn munmap(a: *mut u8, l: usize) -> i32; fn close(fd: i32) -> i32; fn mallopt(p: i32, v: i32) -> i32; fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; fn malloc_trim(pad: usize) -> i32; fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32; }
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const NUM_T: usize = 6;
+const NUM_T: usize = 12;
 const NUM_C: usize = 24;
 const FW_CAP: usize = 700_000;
 const DP_CAP: usize = 32_000;
@@ -47,12 +47,12 @@ struct FastBucket {
     e0: FastEntry,
     e1: FastEntry,
 }
-const FC_SZ: usize = 4096;
+const FC_SZ: usize = 1024;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastBucket; 4096] = [FastBucket {
+static mut FAST_CACHE: [FastBucket; 1024] = [FastBucket {
     e0: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
     e1: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
-}; 4096];
+}; 1024];
 
 const CMAP: [u8; 256] = {
 let mut m = [0u8; 256];
@@ -747,7 +747,6 @@ let mut seen = [0u64; 1280];
 let mut hl = [0u32; 2048];
 let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
 let mut fw_idx = 0usize;
-let mut last_evict = p & !4095;
 while p < pe {
 while *d_buf.get_unchecked(p) != b'\t'  { p += 1; }
 p += 1;
@@ -785,17 +784,8 @@ if bi != u16::MAX {
 if ov  { seen.fill(0); } else {
 for i in 0..nh  { *seen.get_unchecked_mut((*hl.get_unchecked(i) >> 6) as usize) = 0; } }
 d += 1;
-ld += 1;
-let curr_page = p & !4095;
-if curr_page >= last_evict + 262144 {
-    madvise(d_buf.as_ptr().add(last_evict) as *mut u8, curr_page - last_evict, 4);
-    last_evict = curr_page;
-} }
-*dp_ptr.add(ld as usize) = fw_idx as u32;
-if pe > last_evict {
-    let rem = (pe - last_evict + 4095) & !4095;
-    madvise(d_buf.as_ptr().add(last_evict) as *mut u8, rem, 4);
-} }
+ld += 1; }
+*dp_ptr.add(ld as usize) = fw_idx as u32; }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_transpose(
 c: usize,
@@ -988,6 +978,8 @@ let barrier1 = std::sync::Barrier::new(NUM_T);
 let barrier2 = std::sync::Barrier::new(NUM_T);
 std::thread::scope(|s| {
 let do_worker = |tid: usize| {
+let aff_mask = 1u64 << (tid % 12);
+sched_setaffinity(0, 8, &aff_mask);
 let fw = fw_ptrs[tid] as *mut u16;
 let dp = dp_ptrs[tid] as *mut u32;
 let thread_cnt_p = (thread_counts_val as *mut u16).add(tid * nt);
