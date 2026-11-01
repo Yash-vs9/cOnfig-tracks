@@ -164,6 +164,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 256; ++i) T[tid][i].mi = INT64_MAX, T[tid][i].ma = INT64_MIN;
     const char *p = base + cs[tid], *end = base + cs[tid + 1];
     char tmp[520];
+    uint64_t tl[1024][2] = {};
     const __m256i q_vec = _mm256_set1_epi8('"'), c_vec = _mm256_set1_epi8(',');
 
     auto find_q = [&](const char *s) -> const char * {
@@ -218,6 +219,9 @@ int main(int argc, char **argv) {
         nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 1;
       }
     name_done:
+      uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
+      _mm_prefetch((const char *)&name_keys[slot0], _MM_HINT_T0);
+      _mm_prefetch((const char *)&name_bits[slot0], _MM_HINT_T0);
 
       if (__builtin_expect(*p == '"', 1)) {
         const char *s = ++p;
@@ -269,18 +273,22 @@ int main(int argc, char **argv) {
 
       T[tid][cid].add({1, 0, id, cents, cents, cents, nb, ntb});
 
-      uint32_t slot;
-      for (slot = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;; slot = (slot + 1) & HT_MASK) {
-        uint64_t k = name_keys[slot];
-        if (__builtin_expect(k == nh, 1)) break;
-        if (!k) {
-          if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) && name_keys[slot] != nh) continue;
-          break;
+      uint64_t sig = (nh & ~0xFFULL) | cid, *tc = tl[((uint32_t)(nh >> 8) ^ (cid * 131U)) & 1023];
+      if (__builtin_expect(tc[0] != sig && tc[1] != sig, 0)) {
+        tc[1] = tc[0], tc[0] = sig;
+        uint32_t slot;
+        for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
+          uint64_t k = name_keys[slot];
+          if (__builtin_expect(k == nh, 1)) break;
+          if (!k) {
+            if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) && name_keys[slot] != nh) continue;
+            break;
+          }
         }
-      }
 
-      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-      if (__builtin_expect(!(*w & mask), 1) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
+        uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+        if (__builtin_expect(!(*w & mask), 1) && !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask)) T[tid][cid].dn++;
+      }
     }
   }
 
