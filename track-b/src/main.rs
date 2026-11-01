@@ -49,8 +49,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
 const NUM_C: usize = 24;
-const FW_CAP: usize = 450_000;
-const DP_CAP: usize = 16_000;
+const FW_CAP: usize = 700_000;
+const DP_CAP: usize = 32_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -754,9 +754,15 @@ if bi != u16::MAX {
             nh += 1;
         } else { ov = true; }
         *co_ptr.add(t) += 1;
-        if fw_idx < FW_CAP {
-            *fw_ptr.add(fw_idx) = t as u16;
-            fw_idx += 1;
+        if fw_idx + 2 < FW_CAP {
+            if t < 65535 {
+                *fw_ptr.add(fw_idx) = t as u16;
+                fw_idx += 1;
+            } else {
+                *fw_ptr.add(fw_idx) = 65535;
+                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
+                fw_idx += 2;
+            }
         }
     }
 } });
@@ -787,8 +793,11 @@ let start = *dp_ptr.add(ld) as usize;
 let end = *dp_ptr.add(ld + 1) as usize;
 let mut i = start;
 while i < end {
-let t = *fw_ptr.add(i) as usize;
+let mut t = *fw_ptr.add(i) as usize;
 i += 1;
+if t == 65535 {
+t = 65535 + *fw_ptr.add(i) as usize;
+i += 1; }
 let pos = *cur_ptr.add(t);
 *cur_ptr.add(t) = pos + 1;
 *chunk_u16_ptr.add(pos as usize) = ld as u16; }

@@ -23,8 +23,8 @@
   - Time: 0.251625s, Memory: 73.29 MB, Points: 64.025 (NEW ALL-TIME RECORD FOR cOnfig ON TRACK B, BROKE 64 POINTS!).
   - Optimizations: Chunk-by-chunk `MADV_DONTNEED` eviction, removed synchronous `MAP_POPULATE` startup delay.
 
-- **Current Optimization (Dense Bitset Hoisting & Streamlined Transpose)**:
+- **Current Optimization (Doc-Level Mask Hoisting & Safe Full-Scale Vocabulary)**:
   - **Doc-Level Dense Mask Hoisting**: Precalculated `d_w = (d >> 6)` and `d_b = 1 << (d & 63)` once per document instead of re-evaluating for every dense token (eliminates 1.5M redundant shift operations).
   - **Zero Syscall Loop**: Eliminated `madvise(..., MADV_WILLNEED)` syscall overhead from thread inner loops.
-  - **Branchless Transpose**: Removed `t == 65535` branch in `worker_transpose` and `worker_scan_fw` since query vocabulary is strictly < 65,535.
-  - **Tighter Anonymous Buffers**: Scaled `FW_CAP` to 450,000 and `DP_CAP` to 16,000 to safely eliminate ~8 MB of unused buffer footprint.
+  - **Full Scale Safety**: Preserved `FW_CAP = 700_000`, `DP_CAP = 32_000`, and `t >= 65535` two-byte encoding to safely handle large query vocabularies on the 250k full dataset.
+  - Retained 32 KB L1D 2-bit Bloom filter, zero-collision `lookup_swar`, branchless `mix64`, and unpopulated mmap with `MADV_DONTNEED`.
