@@ -3,7 +3,7 @@ name = "speed_demon_b"
 version = "0.1.0"
 edition = "2021"
 
-# Intentionally zero dependencies (scoring: D = 1 + direct_runtime_deps).
+[dependencies]
 
 [profile.release]
 opt-level = 3
