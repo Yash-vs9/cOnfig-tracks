@@ -286,10 +286,6 @@ int main(int argc, char **argv) {
       if (__builtin_expect(neg, 0)) cents = -cents;
       p += 1 + (*p == '\r');
 
-      Agg &a = T[tid][cid];
-      a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
-      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
-
       uint32_t slot = slot0;
       for (;; slot = (slot + 1) & HT_MASK) {
         uint64_t k = name_keys[slot];
@@ -299,9 +295,12 @@ int main(int argc, char **argv) {
           break;
       }
       uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-      if (__builtin_expect(!(*w & mask), 1) &&
-          !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask))
-        a.dn++;
+      uint32_t is_dn = __builtin_expect(!(*w & mask), 1) &&
+                       !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask);
+
+      Agg &a = T[tid][cid];
+      a.cnt++, a.dn += is_dn, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
+      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
     }
   }
 
