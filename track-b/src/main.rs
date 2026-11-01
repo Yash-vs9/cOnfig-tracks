@@ -40,8 +40,8 @@ const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 6;
 const NUM_C: usize = 6;
-const FW_CAP: usize = 2_000_000;
-const DP_CAP: usize = 22_000;
+const FW_CAP: usize = 4_000_000;
+const DP_CAP: usize = 65_536;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot {
@@ -388,11 +388,16 @@ unsafe fn scan_doc<F: FnMut(usize, u16)>(
             return;
         }
         if cross {
-            let l = (!tokmask(_mm256_loadu_si256(base.add(*p) as *const __m256i))).trailing_zeros()
-                as usize;
-            if l >= 16 || *p + 32 > n {
+            if *p + 32 > n {
                 let r = read_tok(d_buf, p, &mut tail);
                 process_token(r.0, r.1, r.2, &tail);
+            } else {
+                let l = (!tokmask(_mm256_loadu_si256(base.add(*p) as *const __m256i))).trailing_zeros()
+                    as usize;
+                if l >= 16 {
+                    let r = read_tok(d_buf, p, &mut tail);
+                    process_token(r.0, r.1, r.2, &tail);
+                }
             }
         } else {
             *p += 32;
@@ -650,9 +655,9 @@ impl<'a> Engine<'a> {
     unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
         let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
         let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
-        let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
+        let mut curr_uninit = MaybeUninit::<[u64; 1024]>::uninit();
         let curr = curr_uninit.assume_init_mut();
-        let mut clist_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+        let mut clist_uninit = MaybeUninit::<[u16; 65536]>::uninit();
         let clist = clist_uninit.assume_init_mut();
         let is_pure_and = (1..q.k as usize).all(|i| ((q.ops >> ((i - 1) * 2)) & 3) == 1);
         for c in 0..NUM_C {
@@ -660,7 +665,7 @@ impl<'a> Engine<'a> {
             if cd == 0 {
                 continue;
             }
-            let cw = (cd as usize + 63) >> 6;
+            let cw = ((cd as usize + 63) >> 6).min(1024);
             let (mut in_bs, mut clen) = (false, 0usize);
             if is_pure_and {
                 let mut min_len = usize::MAX;
@@ -680,8 +685,8 @@ impl<'a> Engine<'a> {
                 }
                 if min_t != usize::MAX {
                     let p0 = self.chunk_postings(c, min_t);
-                    clen = p0.len();
-                    clist[..clen].copy_from_slice(p0);
+                    clen = p0.len().min(clist.len());
+                    clist[..clen].copy_from_slice(&p0[..clen]);
                     for &tid in q_ts {
                         let t = tid as usize;
                         if t != min_t {
@@ -713,8 +718,8 @@ impl<'a> Engine<'a> {
                 curr[..cw].copy_from_slice(&src[..cw]);
             } else {
                 let p = self.chunk_postings(c, t0);
-                clen = p.len();
-                clist[..clen].copy_from_slice(p);
+                clen = p.len().min(clist.len());
+                clist[..clen].copy_from_slice(&p[..clen]);
             }
             for i in 0..(q.k - 1) as usize {
                 let op = ((q.ops >> (i * 2)) & 3) as u8;
@@ -846,7 +851,7 @@ impl<'a> Engine<'a> {
             _mm256_set1_epi8(b'\n' as i8),
         );
         let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-        let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+        let mut cand_uninit = MaybeUninit::<[u16; 65536]>::uninit();
         let cand = cand_uninit.assume_init_mut();
         let record_doc =
             |d: u32, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize| {
@@ -865,20 +870,20 @@ impl<'a> Engine<'a> {
             let (rare, mut clen) = (dist[0], 0usize);
             if !self.is_bs(rare) {
                 let p = self.chunk_postings(c, rare);
-                clen = p.len();
+                clen = p.len().min(cand.len());
                 if clen == 0 {
                     continue;
                 }
-                cand[..clen].copy_from_slice(p);
+                cand[..clen].copy_from_slice(&p[..clen]);
             } else {
-                let cw = (cd as usize + 63) >> 6;
+                let cw = ((cd as usize + 63) >> 6).min(1024);
                 let src = &self.g_bs
                     [(self.bs_idx[rare] as usize) * self.w_per_doc + ((cs >> 6) as usize)..];
                 for w in 0..cw {
                     let mut v = *src.get_unchecked(w);
                     while v != 0 {
                         let id = (w << 6) + v.trailing_zeros() as usize;
-                        if id < cd as usize {
+                        if id < cd as usize && clen < cand.len() {
                             cand[clen] = id as u16;
                             clen += 1;
                         }
@@ -1049,7 +1054,9 @@ unsafe fn worker_scan_fw(
         }
         p += 1;
         *doc_ts_ptr.add(d as usize) = p as u32;
-        *dp_ptr.add(ld as usize) = fw_idx as u32;
+        if (ld as usize) < DP_CAP {
+            *dp_ptr.add(ld as usize) = fw_idx as u32;
+        }
         let (mut nh, mut ov) = (0usize, false);
         let (doc_w, doc_b) = ((d as usize) >> 6, 1u64 << (d & 63));
         scan_doc(d_buf, &mut p, q_buf, rep_map, bs_idx, &mut fc, |t, bi| {
@@ -1067,13 +1074,15 @@ unsafe fn worker_scan_fw(
                         ov = true;
                     }
                     *co_ptr.add(t) += 1;
-                    if t < 65535 {
-                        *fw_ptr.add(fw_idx) = t as u16;
-                        fw_idx += 1;
-                    } else {
-                        *fw_ptr.add(fw_idx) = 65535;
-                        *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
-                        fw_idx += 2;
+                    if fw_idx + 2 < FW_CAP {
+                        if t < 65535 {
+                            *fw_ptr.add(fw_idx) = t as u16;
+                            fw_idx += 1;
+                        } else {
+                            *fw_ptr.add(fw_idx) = 65535;
+                            *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
+                            fw_idx += 2;
+                        }
                     }
                 }
             }
@@ -1088,7 +1097,9 @@ unsafe fn worker_scan_fw(
         d += 1;
         ld += 1;
     }
-    *dp_ptr.add(ld as usize) = fw_idx as u32;
+    if (ld as usize) < DP_CAP {
+        *dp_ptr.add(ld as usize) = fw_idx as u32;
+    }
 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn worker_transpose(
@@ -1356,7 +1367,7 @@ unsafe fn run_all() {
             let fw_ptr_c = fw_ptrs[tid];
             let dp_ptr_c = dp_ptrs[tid];
             std::thread::Builder::new()
-                .stack_size(131072)
+                .stack_size(524288)
                 .spawn_scoped(s, move || {
                     let aff_mask = 1u64 << ((tid * 2) % 12);
                     sched_setaffinity(0, 8, &aff_mask);
