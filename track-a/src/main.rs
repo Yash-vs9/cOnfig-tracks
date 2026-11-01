@@ -1,4 +1,3 @@
-// Speed Demon 2026 — Track A (Ingest) Championship Rust Solution
 #![allow(unsafe_op_in_unsafe_fn, dead_code, unused_unsafe, dangerous_implicit_autorefs)]
 use std::arch::x86_64::{_mm256_loadu_si256 as ld, _mm_crc32_u64 as crc, *};
 use std::ptr::copy_nonoverlapping as copy;
@@ -16,29 +15,48 @@ extern "C" {
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Global<T> {}
 
-#[repr(C, align(64))]
-struct SharedData {
-    k: [AtomicU64; 33024],
-    c: [AtomicU32; 163842],
-    p: [usize; 2304],
-    q: [u32; 13824 * 256],
-    g: [u32; 49152],
-    l: [[u32; 75000]; 12],
-    n: [i32; 13824],
-    h: [[[i32; 128]; 12]; 2],
-    w: ([[u16; 128]; 12], [u16; 13824], [u16; 2304]),
-    u: ([u8; 2304], [[u8; 163840]; 12]),
-}
-static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
+static DIGITS: &[u8; 200] = b"\
+0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
 
 #[inline(always)]
 unsafe fn fmt_u32_sp(p: *mut u8, mut v: u32) -> *mut u8 {
-    let (mut b, mut i) = ([b' '; 12], 10);
-    b[10] = b'0' + (v % 10) as u8;
-    while v >= 10 { (v, i) = (v / 10, i - 1); b[i] = b'0' + (v % 10) as u8; }
+    let (mut b, mut i) = ([b' '; 12], 11);
+    while v >= 100 {
+        let r = ((v % 100) * 2) as usize;
+        v /= 100;
+        i -= 2;
+        copy(DIGITS.as_ptr().add(r), b.as_mut_ptr().add(i), 2);
+    }
+    if v < 10 {
+        i -= 1;
+        b[i] = b'0' + v as u8;
+    } else {
+        i -= 2;
+        let r = (v * 2) as usize;
+        copy(DIGITS.as_ptr().add(r), b.as_mut_ptr().add(i), 2);
+    }
     copy(b.as_ptr().add(i), p, 12 - i);
     p.add(12 - i)
 }
+
+#[repr(C, align(64))]
+struct SharedData {
+    k: [AtomicU64; 33024],
+    c: [AtomicU32; 2],
+    p: [usize; 2304],
+    q: [u32; 13056 * 256],
+    g: [u32; 98304],
+    l: [[u32; 75000]; 12],
+    n: [i32; 13056],
+    h: [[[i32; 128]; 12]; 2],
+    w: ([[u16; 128]; 12], [u16; 13056], [u16; 2304]),
+    u: ([u8; 2304], [[u8; 163840]; 12]),
+}
+static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 
 #[inline]
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
@@ -54,7 +72,7 @@ unsafe fn intern(ci: usize, p: *const u8, len: u8, mut h: u64) -> u64 {
         let kv = slot.load(Relaxed);
         if (kv ^ h) < 65536 { return kv; }
         if kv == 0 && slot.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
-            let j = b_id + (*s).c[163840 + ci].fetch_add(1, Relaxed) as usize;
+            let j = b_id + (*s).c[ci].fetch_add(1, Relaxed) as usize;
             ((*s).p[j], (*s).u.0[j], (*s).w.2[j]) = (p as usize, len, (j - b_id) as u16);
             let full_kv = h | ((j - b_id) as u64);
             slot.store(full_kv, Release);
@@ -75,7 +93,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let (mut phw, mut phid) = (0u64, 0usize);
     ((*s).h[0][t], (*s).h[1][t], (*s).w.0[t]) = ([-1; 128], [-1; 128], [256; 128]);
     let (mut cur_b, mut cur_f, mut ep_c) = (-1i32, 256usize, [0u64; 2048]);
-    let (mut next_blk, mut next_hi) = (t * 1152, t * 4096);
+    let (mut next_blk, mut next_hi) = (t * 1088, t * 8192);
     let fast_ec = bp.add((ec as usize - bp as usize).saturating_sub(256));
     while p < fast_ec {
         let hw = u8_at(p.add(5));
@@ -106,7 +124,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
         let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
-        if *st_p == b'5' { (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed); }
+        let is_err = (*st_p == b'5') as u32;
         let lp = st_p.add(4);
         let sub = u8_at(lp).wrapping_sub(0x3030_3030_3030_3030);
         let mask = sub & 0x8080_8080_8080_8080;
@@ -129,12 +147,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             (cur_b, cur_f) = (nb, 0);
         }
         let mut hb = lat;
-        if lat >= 1 << 20 {
+        if lat >= 524288 {
             let gi = next_hi; next_hi += 1;
-            hb = 0x10_0000 | (gi as u32);
+            hb = 0x8_0000 | (gi as u32);
             (*s).g[gi] = lat;
         }
-        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
+        let word = (hb << 12) | (is_err << 11) | (eid as u32);
+        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = (word, cur_f + 1);
     }
     while p < ec {
         let hw = u8_at(p.add(5));
@@ -158,7 +177,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
         let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
-        if *st_p == b'5' { (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed); }
+        let is_err = (*st_p == b'5') as u32;
         let lp = st_p.add(4);
         let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
         while c < lim as *const u8 && *c >= b'0' { (lat, c) = ((lat << 3) + (lat << 1) + (*c - b'0') as u32, c.add(1)); }
@@ -171,17 +190,18 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             (cur_b, cur_f) = (nb, 0);
         }
         let mut hb = lat;
-        if lat >= 1 << 20 {
+        if lat >= 524288 {
             let gi = next_hi; next_hi += 1;
-            hb = 0x10_0000 | (gi as u32);
+            hb = 0x8_0000 | (gi as u32);
             (*s).g[gi] = lat;
         }
-        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
+        let word = (hb << 12) | (is_err << 11) | (eid as u32);
+        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = (word, cur_f + 1);
     }
     if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
     for i in 0..128 { if (*s).h[1][t][i] >= 0 { (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]; } }
     bar.wait();
-    let (nh, ne) = ((*s).c[163840].load(Relaxed) as usize, (*s).c[163841].load(Relaxed) as usize);
+    let (nh, ne) = ((*s).c[0].load(Relaxed) as usize, (*s).c[1].load(Relaxed) as usize);
     if t == 0 {
         let (p_arr, u0_arr) = ((*s).p.as_ptr(), (*s).u.0.as_ptr());
         let gs = |i: u16| slc(*p_arr.add(i as usize) as *const u8, *u0_arr.add(i as usize) as _);
@@ -201,9 +221,9 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             }
         };
     }
-    let (mut cnt, mut off, mut bh) = ([0u32; 2048], [0u32; 2048], 0);
     let (g_ptr, lp) = ((*s).g.as_ptr(), (*s).l[t].as_mut_ptr());
-    let val = |v: u32| if (v as i32) < 0 { *g_ptr.add((v >> 11) as u16 as usize) } else { v >> 11 };
+    let val = |v: u32| if (v as i32) < 0 { *g_ptr.add(((v >> 12) & 0x7_FFFF) as usize) } else { v >> 12 };
+    let (mut cnt, mut off, mut err, mut bh) = ([0u32; 2048], [0u32; 2048], [0u32; 2048], 0);
     while bh < nh {
         let hi = bh + t;
         let out_b = (*s).u.1[t].as_mut_ptr();
@@ -211,9 +231,14 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         if hi < nh {
             let (h_id, mut tot) = ((*s).w.2[2048 + hi] as usize, 0u32);
             cnt[..ne].fill(0);
-            iter_b!(h_id, |v| cnt[(v & 2047) as usize] += 1);
+            err[..ne].fill(0);
+            iter_b!(h_id, |v: u32| {
+                let e = (v & 2047) as usize;
+                cnt[e] += 1;
+                err[e] += (v >> 11) & 1;
+            });
             (0..ne).for_each(|i| (off[i], tot, cnt[i]) = (tot, tot + cnt[i], 0));
-            iter_b!(h_id, |v| {
+            iter_b!(h_id, |v: u32| {
                 let e = (v & 2047) as usize;
                 *lp.add((off[e] + cnt[e]) as usize) = val(v);
                 cnt[e] += 1;
@@ -226,8 +251,16 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                 let l = slc_mut(lp.add(off[eid] as usize), n);
                 let pct = |p: usize| (p * n + 99) / 100 - 1;
                 let (i50, i95, i99) = (pct(50), pct(95), pct(99));
-                if n <= 2 {
-                    if n == 2 && l[0] > l[1] { l.swap(0, 1); }
+                if n <= 3 {
+                    if n == 2 {
+                        if l[0] > l[1] { l.swap(0, 1); }
+                    } else if n == 3 {
+                        if l[0] > l[1] { l.swap(0, 1); }
+                        if l[1] > l[2] {
+                            l.swap(1, 2);
+                            if l[0] > l[1] { l.swap(0, 1); }
+                        }
+                    }
                 } else if n <= 48 {
                     l.sort_unstable();
                 } else {
@@ -235,14 +268,14 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                     if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
                     if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
                 }
-                let err = (*s).c[h_id * 2048 + eid].load(Relaxed);
+                let err_c = err[eid];
                 let el = (*s).u.0[eid] as usize;
                 copy(hr_pfx.as_ptr(), ptr, 21);
                 copy((*s).p[eid] as *const u8, ptr.add(21), el);
                 *ptr.add(21 + el) = b' ';
                 ptr = ptr.add(22 + el);
-                let ppm = if err == 0 { 0 } else { ((err as u64) * 1_000_000 / (n as u64)) as u32 };
-                for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
+                let ppm = if err_c == 0 { 0 } else { ((err_c as u64) * 1_000_000 / (n as u64)) as u32 };
+                for v in [n as u32, l[i50], l[i95], l[i99], err_c, ppm] { ptr = fmt_u32_sp(ptr, v); }
                 *ptr.sub(1) = b'\n';
             }
         }
