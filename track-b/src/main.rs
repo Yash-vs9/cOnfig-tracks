@@ -21,9 +21,9 @@ extern "C" { fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_C: usize = 24;
-const FW_CAP: usize = 700_000;
-const DP_CAP: usize = 32_000;
+const NUM_C: usize = 32;
+const FW_CAP: usize = 400_000;
+const DP_CAP: usize = 12_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot { w0: u64, h_tag: u32, tid: u32 }
@@ -32,26 +32,23 @@ struct TInfo { w0: u64, w1: u64, off: u32, df: u32, len: u16, _pad: u16 }
 #[derive(Clone, Copy)]
 struct Query { ib: u8, k: u8, ops: u16, t_idx: u32 }
 
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(16))]
-struct FastEntry {
-    w0: u64,
-    tid: u32,
-    bi: u16,
-    len: u8,
-    _pad: u8,
-}
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(32))]
-struct FastBucket {
-    e0: FastEntry,
-    e1: FastEntry,
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct FastBucket4 {
+    keys: [u64; 4],
+    tids: [u32; 4],
+    bis: [u16; 4],
+    lens: [u8; 4],
+    _pad: [u8; 4],
 }
 const FC_SZ: usize = 1024;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastBucket; 1024] = [FastBucket {
-    e0: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
-    e1: FastEntry { w0: 0, tid: u32::MAX, bi: u16::MAX, len: 0, _pad: 0 },
+static mut FAST_CACHE: [FastBucket4; 1024] = [FastBucket4 {
+    keys: [0; 4],
+    tids: [u32::MAX; 4],
+    bis: [u16::MAX; 4],
+    lens: [0; 4],
+    _pad: [0; 4],
 }; 1024];
 
 const CMAP: [u8; 256] = {
@@ -156,28 +153,29 @@ let mut process_token = |w0: u64, w1: u64, len: usize, _tail: &[u8]| {
 if len <= 8 {
     let fc_slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
     let b = FAST_CACHE.get_unchecked(fc_slot);
-    let mut fc_ptr = std::ptr::null();
-    if b.e0.w0 == w0 && b.e0.len == len as u8 {
-        fc_ptr = &b.e0 as *const FastEntry;
-    } else if b.e1.w0 == w0 && b.e1.len == len as u8 {
-        fc_ptr = &b.e1 as *const FastEntry;
-    }
-    if !fc_ptr.is_null() {
-        let fc = &*fc_ptr;
-        let t = fc.tid as usize;
-        if fc.bi != u16::MAX {
-            *g_bs_ptr.add((fc.bi as usize) * w_per_doc + d_w) |= d_b;
-        } else {
-            fn_(t);
+    let keys_v = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+    let target_v = _mm256_set1_epi64x(w0 as i64);
+    let eq = _mm256_cmpeq_epi64(keys_v, target_v);
+    let mask = _mm256_movemask_pd(_mm256_castsi256_pd(eq));
+    if mask != 0 {
+        let lane = mask.trailing_zeros() as usize;
+        if *b.lens.get_unchecked(lane) == len as u8 {
+            let t = *b.tids.get_unchecked(lane) as usize;
+            let bi = *b.bis.get_unchecked(lane);
+            if bi != u16::MAX {
+                *g_bs_ptr.add((bi as usize) * w_per_doc + d_w) |= d_b;
+            } else {
+                fn_(t);
+            }
+            if p_tid == (t as u32) && pos == p_pos + 1 && t < rep_map.len() {
+                let rt = *rep_map.get_unchecked(t);
+                if rt != u32::MAX { fn_(rt as usize); }
+            }
+            p_tid = t as u32;
+            p_pos = pos;
+            pos += 1;
+            return;
         }
-        if p_tid == fc.tid && pos == p_pos + 1 && t < rep_map.len() {
-            let rt = *rep_map.get_unchecked(t);
-            if rt != u32::MAX { fn_(rt as usize); }
-        }
-        p_tid = fc.tid;
-        p_pos = pos;
-        pos += 1;
-        return;
     }
 }
 let h = mix64(w0, w1, len);
@@ -407,9 +405,9 @@ w += 1; } }
 unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
-let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
+let mut curr_uninit = MaybeUninit::<[u64; 160]>::uninit();
 let curr = curr_uninit.assume_init_mut();
-let mut clist_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+let mut clist_uninit = MaybeUninit::<[u16; 8192]>::uninit();
 let clist = clist_uninit.assume_init_mut();
 
 let is_pure_and = (1..q.k as usize).all(|i| ((q.ops >> ((i - 1) * 2)) & 3) == 1);
@@ -561,7 +559,7 @@ let (v2_lo, v2_up) = (_mm256_set1_epi8(c2_lo as i8), _mm256_set1_epi8(c2_up as i
 let p0_has_2 = plen[anchor] >= 2;
 let p0_has_3 = plen[anchor] >= 3;
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+let mut cand_uninit = MaybeUninit::<[u16; 8192]>::uninit();
 let cand = cand_uninit.assume_init_mut();
 let record_doc = |d: u32, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize| {
 *t_cnt += 1;
@@ -894,10 +892,11 @@ if sw & b == 0 {
 if nh < 2048 { *s_hl.get_unchecked_mut(nh) = t as u32; nh += 1; } else { ov = true; }
 sample_counts[t] = sample_counts[t].saturating_add(1); } });
 if ov { s_seen.fill(0); } else { for i in 0..nh { *s_seen.get_unchecked_mut((*s_hl.get_unchecked(i) >> 6) as usize) = 0; } } }
-// Terms with >= 34 hits in 600 docs (~5.6%) are designated bitset terms
-let threshold = if total_docs >= 25000 { 34 } else { 15 };
+// Terms with >= 40 hits in 600 docs (~6.7%) are designated bitset terms, capped at 192
+let max_bs = 192;
+let threshold = if total_docs >= 25000 { 40 } else { 15 };
 for i in 0..nt {
-if sample_counts[i] >= threshold {
+if sample_counts[i] >= threshold && n_bs < max_bs {
 bs_idx[i] = n_bs as u16;
 n_bs += 1;
 TINFO[i].df = 65536 + (sample_counts[i] as u32) * 500; } }
@@ -909,22 +908,14 @@ for &t in &term_order {
         let w0 = ti.w0;
         let slot = (w0.wrapping_mul(0x9e3779b97f4a7c15) >> 32) as usize & FC_MSK;
         let b = &mut FAST_CACHE[slot];
-        if b.e0.w0 == 0 {
-            b.e0 = FastEntry {
-                w0,
-                tid: t,
-                bi: bs_idx[t as usize],
-                len: ti.len as u8,
-                _pad: 0,
-            };
-        } else if b.e1.w0 == 0 {
-            b.e1 = FastEntry {
-                w0,
-                tid: t,
-                bi: bs_idx[t as usize],
-                len: ti.len as u8,
-                _pad: 0,
-            };
+        for lane in 0..4 {
+            if b.keys[lane] == 0 {
+                b.keys[lane] = w0;
+                b.tids[lane] = t;
+                b.bis[lane] = bs_idx[t as usize];
+                b.lens[lane] = ti.len as u8;
+                break;
+            }
         }
     }
 }
