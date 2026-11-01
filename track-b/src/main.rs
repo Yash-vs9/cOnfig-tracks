@@ -66,8 +66,8 @@ m };
 #[repr(align(4096))]
 struct AlignedVTab([Slot; H_SZ]);
 static mut VTAB: AlignedVTab = AlignedVTab([Slot { w0: 0, h_tag: 0, tid: 0 }; H_SZ]);
-static mut TINFO: [TInfo; 81920] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, _pad: 0 }; 81920];
-static mut GLOBAL_DF: [AtomicU32; 81920] = [const { AtomicU32::new(0) }; 81920];
+static mut TINFO: [TInfo; 131072] = [TInfo { w0: 0, w1: 0, off: 0, df: 0, len: 0, _pad: 0 }; 131072];
+static mut GLOBAL_DF: [AtomicU32; 131072] = [const { AtomicU32::new(0) }; 131072];
 static mut N_TERMS: usize = 0;
 const PF_WORDS: usize = 4096; const PF_WMASK: usize = PF_WORDS - 1;
 
@@ -233,11 +233,10 @@ let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) 
 w1 = core::arch::x86_64::_bzhi_u64(raw1, ((len - 8) << 3) as u32);
 process_token(w0, w1, len, &[]);
 } else {
-    let raw0 = std::ptr::read_unaligned(base.add(*p + tok_start) as *const u64) | 0x2020202020202020;
-    let raw1 = std::ptr::read_unaligned(base.add(*p + tok_start + 8) as *const u64) | 0x2020202020202020;
-    tail[0] = *base.add(*p + tok_start + 16) | 0x20;
-    w0 = raw0;
-    w1 = raw1;
+    let mut tp = *p + tok_start;
+    let r = read_tok(d_buf, &mut tp, &mut tail);
+    w0 = r.0;
+    w1 = r.1;
     process_token(w0, w1, len, &tail); }
 let consumed = zeros + len;
 if consumed >= 64 { break; }
@@ -404,6 +403,7 @@ let cnt = val.count_ones() as u64;
 w += 1; } }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn exec_bool(&self, q: &Query, out: &mut Vec<u8>) {
+if q.k == 0 { return fmt_res(0, 0, &[0; 10], 0, out); }
 let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
 let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
 let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
@@ -520,6 +520,7 @@ t_sum += (cs as u64) * (clen as u64) + s;
 fmt_res(t_cnt, t_sum, &top, tc, out); }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn exec_phrase(&self, q: &Query, out: &mut Vec<u8>) {
+if q.k == 0 { return fmt_res(0, 0, &[0; 10], 0, out); }
 let (k, mut nd, mut dist) = (q.k as usize, 0usize, [0usize; 16]);
 let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + k];
 let mut add_dist = |t: usize| {
@@ -768,9 +769,15 @@ if bi != u16::MAX {
             nh += 1;
         } else { ov = true; }
         *co_ptr.add(t) += 1;
-        if fw_idx < FW_CAP {
-            *fw_ptr.add(fw_idx) = t as u16;
-            fw_idx += 1;
+        if fw_idx + 2 < FW_CAP {
+            if t < 65535 {
+                *fw_ptr.add(fw_idx) = t as u16;
+                fw_idx += 1;
+            } else {
+                *fw_ptr.add(fw_idx) = 65535;
+                *fw_ptr.add(fw_idx + 1) = (t - 65535) as u16;
+                fw_idx += 2;
+            }
         }
     }
 } });
@@ -796,8 +803,11 @@ let start = *dp_ptr.add(ld) as usize;
 let end = *dp_ptr.add(ld + 1) as usize;
 let mut i = start;
 while i < end {
-let t = *fw_ptr.add(i) as usize;
+let mut t = *fw_ptr.add(i) as usize;
 i += 1;
+if t == 65535 {
+t = 65535 + *fw_ptr.add(i) as usize;
+i += 1; }
 let pos = *cur_ptr.add(t);
 *cur_ptr.add(t) = pos + 1;
 *chunk_u16_ptr.add(pos as usize) = ld as u16; }
