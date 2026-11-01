@@ -11,6 +11,7 @@ extern "C" {
     fn madvise(a: *mut u8, l: usize, b: i32) -> i32;
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
     fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize;
+    fn mallopt(p: i32, v: i32) -> i32;
 }
 
 #[repr(transparent)] struct Global<T>(UnsafeCell<T>);
@@ -77,7 +78,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     while p < ec {
         let hw = u8_at(p.add(5));
         if hw != lhw {
-            (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
+            if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
             (lhw, hid) = (hw, (intern(0, p, 13, hw) & 0xFFFF) as usize);
             (cur_b, cur_f) = ((*s).h[1][t][hid], (*s).w.0[t][hid] as usize);
         }
@@ -93,20 +94,26 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| u8_at(ep.add(o)) & m8;
         let (w0, w1, w2, w3) = (rd(0), rd(d >> 1), rd(d.saturating_sub(8)), rd(d));
-        let h1 = crc(crc(crc(crc(el as u64, w0), w1), w2), w3);
-        let h2 = (h1 << 32) | crc(crc(el as u64, w2 ^ w0), w3 ^ w1);
+        let a0 = crc(el as u64, w0);
+        let b0 = crc(el as u64, w2 ^ w0);
+        let a1 = crc(a0, w1);
+        let b1 = crc(b0, w3 ^ w1);
+        let a2 = crc(a1, w2);
+        let h1 = crc(a2, w3);
+        let h2 = (h1 << 32) | b1;
         let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
         let ci = ((h >> 16) as usize) & 511;
         let mut kv = ep_c[ci];
         if (kv ^ h) >= 65536 { kv = intern(1, ep, el as u8, h); ep_c[ci] = kv; }
         let eid = (kv & 0xFFFF) as usize;
         let st_p = ep.add(el + 1);
-        (*st_p == b'5').then(|| (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed));
+        if *st_p == b'5' { (*s).c[hid * 2048 + eid].fetch_add(1, Relaxed); }
         let lp = st_p.add(4);
         let sub = if lp.add(8) <= ec { u8_at(lp).wrapping_sub(0x3030_3030_3030_3030) } else { 0 };
         let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
-        if sub & 0x8080_8080_8080_8080 != 0 {
-            let tz = (sub & 0x8080_8080_8080_8080).trailing_zeros();
+        let mask = sub & 0x8080_8080_8080_8080;
+        if mask != 0 {
+            let tz = mask.trailing_zeros();
             let w = (((sub << 8) << (tz ^ 63)).wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
             let m64 = (w.wrapping_mul(6553601) >> 16) & 0xFFFF_0000_FFFF;
             (c, lat) = (lp.add((tz >> 3) as usize), (m64.wrapping_mul(42949672960001) >> 32) as u32);
@@ -115,7 +122,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         }
         p = c.add(1 + (*c == b'\r') as usize);
         if cur_f == 256 {
-            (cur_b >= 0).then(|| (*s).w.1[cur_b as usize] = 256);
+            if cur_b >= 0 { (*s).w.1[cur_b as usize] = 256; }
             let nb = (*s).c[163842].fetch_add(1, Relaxed) as i32;
             (*s).n[nb as usize] = -1;
             if cur_b < 0 { (*s).h[0][t][hid] = nb; } else { (*s).n[cur_b as usize] = nb; }
@@ -128,8 +135,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         }
         ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
     }
-    (cur_b >= 0).then(|| ((*s).h[1][t][hid], (*s).w.0[t][hid]) = (cur_b, cur_f as u16));
-    for i in 0..128 { ((*s).h[1][t][i] >= 0).then(|| (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]); }
+    if cur_b >= 0 { (*s).h[1][t][hid] = cur_b; (*s).w.0[t][hid] = cur_f as u16; }
+    for i in 0..128 { if (*s).h[1][t][i] >= 0 { (*s).w.1[(*s).h[1][t][i] as usize] = (*s).w.0[t][i]; } }
     bar.wait();
     let nh = (*s).c[163840].load(Relaxed) as usize;
     let ne = (*s).c[163841].load(Relaxed) as usize;
@@ -174,10 +181,15 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                 let l = slc_mut(lp.add(off[eid] as usize), n);
                 let pct = |p| (p * n + 99) / 100 - 1;
                 let (i50, i95, i99) = (pct(50), pct(95), pct(99));
-                (n <= 32).then(|| l.sort_unstable());
-                (n > 32).then(|| l.select_nth_unstable(i50));
-                (n > 32 && i95 > i50).then(|| l[i50 + 1..].select_nth_unstable(i95 - i50 - 1));
-                (n > 32 && i99 > i95).then(|| l[i95 + 1..].select_nth_unstable(i99 - i95 - 1));
+                if n <= 2 {
+                    if n == 2 && l[0] > l[1] { l.swap(0, 1); }
+                } else if n <= 32 {
+                    l.sort_unstable();
+                } else {
+                    l.select_nth_unstable(i50);
+                    if i95 > i50 { l[i50 + 1..].select_nth_unstable(i95 - i50 - 1); }
+                    if i99 > i95 { l[i95 + 1..].select_nth_unstable(i99 - i95 - 1); }
+                }
                 let err = (*s).c[h_id * 2048 + eid].load(Relaxed);
                 let el = (*s).u.0[eid] as usize;
                 copy((*s).p[2048 + h_id] as *const u8, ptr, 13);
@@ -185,7 +197,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                 copy((*s).p[eid] as *const u8, ptr.add(21), el);
                 *ptr.add(21 + el) = b' ';
                 ptr = ptr.add(22 + el);
-                let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
+                let ppm = if err == 0 { 0 } else { ((err as u64) * 1_000_000 / (n as u64)) as u32 };
                 for v in [n as u32, l[i50], l[i95], l[i99], err, ppm] { ptr = fmt_u32_sp(ptr, v); }
                 *ptr.sub(1) = b'\n';
             }
@@ -205,6 +217,8 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
 
 fn main() {
     unsafe {
+        mallopt(-8, 1);
+        mallopt(-1, 0);
         let mut a = std::env::args().skip(1);
         let in_p = a.next().unwrap_or_else(|| "/data/requests.log".into());
         let out_p = a.next().unwrap_or_else(|| "/out/summary.txt".into());
