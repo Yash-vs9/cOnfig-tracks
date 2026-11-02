@@ -9,6 +9,8 @@ extern "C" {
 const E: u64 = u64::MAX;
 const M: u64 = (1 << 21) - 1;
 const NT: usize = 12;
+static TOT: AtomicU64 = AtomicU64::new(0);
+static MX: AtomicU64 = AtomicU64::new(0);
 
 fn map(p: &str) -> &'static [u8] {
     let f = std::fs::File::open(p).unwrap();
@@ -38,11 +40,11 @@ fn each(b: &[u8], mut p: usize, hi: usize, mut f: impl FnMut(usize, usize, u32))
     }
 }
 // Per-thread dist table: open addressing, entry = dist << 21 | node. Small (L2-resident), resets only touched slots.
-struct Ws { t: Vec<u64>, used: Vec<u32>, h: BinaryHeap<Reverse<u64>> }
+struct Ws { cnt: u64, t: Vec<u64>, used: Vec<u32>, h: BinaryHeap<Reverse<u64>> }
 impl Ws {
     fn slot(&self, k: u64) -> usize {
         let m = self.t.len() - 1;
-        let mut i = (k.wrapping_mul(0x9E3779B97F4A7C15) >> 32) as usize & m;
+        let mut i = ((((k >> 3).wrapping_mul(0x9E3779B97F4A7C15) >> 32) as usize) << 3 | (k as usize & 7)) & m;
         while self.t[i] != E && self.t[i] & M != k {
             i = (i + 1) & m;
         }
@@ -81,6 +83,7 @@ fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: us
         }
     }
     (w.used.clear(), w.h.clear());
+    w.cnt = 0;
     w.set(s as u64, 0);
     w.h.push(Reverse(s as u64));
     while let Some(Reverse(x)) = w.h.pop() {
@@ -91,6 +94,7 @@ fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: us
         if d > w.get(u as u64) {
             continue;
         }
+        w.cnt += 1;
         if let Some(&Reverse(nx)) = w.h.peek() {
             // next node to settle: prefetch its first edge (its head entry was prefetched at push time)
             if let Some(a) = adj.get(h[(nx & M) as usize].load(R) as usize) {
@@ -115,7 +119,7 @@ fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: us
 }
 fn main() {
     let t0 = std::time::Instant::now();
-    let dbg = std::env::var_os("T").is_some();
+    let dbg = true;
     let g = map("/data/graph.txt");
     let mut p = 0;
     let n = num(g, &mut p) as usize;
@@ -179,6 +183,70 @@ fn main() {
     }
     side.sort_unstable();
     let side: &[(u32, u32)] = side.leak();
+    // BFS relabel: after this, a query's ball of nodes is contiguous in memory (huge cache win).
+    let (mut ord, mut seen, mut k) = (Vec::<u32>::with_capacity(n), vec![0u64; n / 64 + 1], 0);
+    for r in 0..n {
+        if seen[r >> 6] >> (r & 63) & 1 == 1 {
+            continue;
+        }
+        (seen[r >> 6] |= 1 << (r & 63), ord.push(r as u32));
+        while k < ord.len() {
+            let u = ord[k] as usize;
+            k += 1;
+            if let Some(&x) = ord.get(k + 15) {
+                pf(&head[x as usize]);
+            }
+            if let Some(&x) = ord.get(k + 7) {
+                if let Some(a) = adj.get(head[x as usize].load(R) as usize) {
+                    pf(a);
+                }
+            }
+            for i in head[u].load(R)..head[u + 1].load(R) {
+                let v = (adj[i as usize].load(R) >> 11) as usize;
+                if seen[v >> 6] >> (v & 63) & 1 == 0 {
+                    (seen[v >> 6] |= 1 << (v & 63), ord.push(v as u32));
+                }
+            }
+        }
+    }
+    let mut nid = vec![0u32; n];
+    for (k, &o) in ord.iter().enumerate() {
+        nid[o as usize] = k as u32;
+    }
+    let (ord, nid): (&[u32], &[u32]) = (ord.leak(), nid.leak());
+    let (nh, mut run) = (z::<AtomicU32>(n + 1), 0);
+    for (k, &o) in ord.iter().enumerate() {
+        nh[k].store(run, R);
+        run += head[o as usize + 1].load(R) - head[o as usize].load(R);
+    }
+    nh[n].store(run, R);
+    let nadj = z::<AtomicU32>(run as usize);
+    let ns: Vec<(u32, u32)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..NT)
+            .map(|t| {
+                s.spawn(move || {
+                    let mut sd = vec![];
+                    for k in t * n / NT..(t + 1) * n / NT {
+                        let (o, mut j) = (ord[k] as usize, nh[k].load(R));
+                        for i in head[o].load(R)..head[o + 1].load(R) {
+                            let e = adj[i as usize].load(R);
+                            if e & 2047 == 2047 {
+                                sd.push((j, side[side.binary_search_by_key(&i, |p| p.0).unwrap()].1));
+                            }
+                            nadj[j as usize].store(nid[(e >> 11) as usize] << 11 | e & 2047, R);
+                            j += 1;
+                        }
+                    }
+                    sd
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect() // thread ranges are ordered, so already sorted
+    });
+    let ns: &[(u32, u32)] = ns.leak();
+    if dbg {
+        eprintln!("relabel {:?}", t0.elapsed());
+    }
     let (qb, mut qs, mut p) = (map("/data/queries.txt"), vec![], 0);
     while p < qb.len() {
         qs.push((num(qb, &mut p) as usize, num(qb, &mut p) as usize));
@@ -187,29 +255,29 @@ fn main() {
     std::thread::scope(|s| {
         for _ in 0..NT {
             s.spawn(move || {
-                let mut w = Ws { t: vec![E; 1 << 13], used: vec![], h: BinaryHeap::new() };
+                let mut w = Ws { cnt: 0, t: vec![E; 1 << 13], used: vec![], h: BinaryHeap::new() };
                 loop {
                     let i = nxt.fetch_add(1, R);
                     if i >= qs.len() {
                         break;
                     }
                     let (a, b) = qs[i];
-                    res[i].store(
-                        if a == b {
-                            0
-                        } else if head[a].load(R) == head[a + 1].load(R) || inb[b >> 6].load(R) >> (b & 63) & 1 == 0 {
-                            -1
-                        } else {
-                            sp(&mut w, head, adj, side, a, b)
-                        },
-                        R,
-                    );
+                    w.cnt = 0;
+                    let r = if a == b {
+                        0
+                    } else if head[a].load(R) == head[a + 1].load(R) || inb[b >> 6].load(R) >> (b & 63) & 1 == 0 {
+                        -1
+                    } else {
+                        sp(&mut w, nh, nadj, ns, nid[a] as usize, nid[b] as usize)
+                    };
+                    (TOT.fetch_add(w.cnt, R), MX.fetch_max(w.cnt, R));
+                    res[i].store(r, R);
                 }
             });
         }
     });
     if dbg {
-        eprintln!("queries {:?} side={}", t0.elapsed(), side.len());
+        eprintln!("queries {:?} side={} settled total={} max={}", t0.elapsed(), side.len(), TOT.load(R), MX.load(R));
     }
     let mut o = String::new();
     for r in &res[..qs.len()] {
