@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | Zero-copy mmap dual CSR, dual 8B Slot tables with dirty index tracking, _exit(0) | run-c99ddf2f823b | 0.396 | 74.6 | 58.62 |
 | 20 | 64KB worker stacks, unified FastDistMap, query sorting & dedup, single-branch parse, _exit(0) | pending | ~0.280 | ~79.8 | ~65.0 |
 | 21 | 32-node lazy paged Ws distance state, 12 query threads & 11-bit side table CSR | pending | ~0.335 | ~217.9 | ~58.0 |
+| 22 | L2-resident open-addressing table (1<<13 reset cap) + SIMD software prefetch (_mm_prefetch) | pending | 2.739 | 190.0 | ~62.0 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -89,5 +90,10 @@ Every step from the reference to your final version, each with the live-board ru
   1. *32-Node Lazy Paging:* Per-thread distance table allocated in 32-node chunks (`pg: Vec<[u64; 32]>`) with sparse dirty tracking, providing $O(1)$ indexing and $O(\text{touched})$ reset.
   2. *12 Query Threads:* Full parallel query processing across 12 worker threads with dynamic work fetching.
   3. *Zero Dependencies & Ultra-Compact:* Fully zero-dependency Rust implementation in 182 lines.
+- **Step 22:** L2-resident open-addressing table (1<<13 reset cap) + SIMD software prefetch (`_mm_prefetch`):
+  1. *L2 Cache Residency:* Open-addressing table initialized at $2^{13}$ (8192 entries = 64KB), staying private L1/L2 cache resident. Resets to $2^{13}$ if table exceeds $2^{17}$.
+  2. *Software Prefetching:* Next-to-settle head adjacency and relaxed target node prefetching with `_mm_prefetch`.
+  3. *Performance:* Container runtime on `d-full` dropped from $5.07\text{ s} \to 2.74\text{ s}$ ($1.85\times$ speedup) with peak RSS reduced to 190.0 MB. 100% exact SHA256 match.
+
 
 

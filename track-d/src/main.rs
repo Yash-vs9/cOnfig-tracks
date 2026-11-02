@@ -37,38 +37,65 @@ fn each(b: &[u8], mut p: usize, hi: usize, mut f: impl FnMut(usize, usize, u32))
         f(u, v, w);
     }
 }
-// Per-thread Dijkstra state: dist stored in lazily allocated 32-node pages, O(1) indexing, O(touched) reset.
-struct Ws { pi: Vec<u32>, pg: Vec<[u64; 32]>, dirty: Vec<u32>, h: BinaryHeap<Reverse<u64>> }
+// Per-thread dist table: open addressing, entry = dist << 21 | node. Small (L2-resident), resets only touched slots.
+struct Ws { t: Vec<u64>, used: Vec<u32>, h: BinaryHeap<Reverse<u64>> }
 impl Ws {
-    fn at(&mut self, v: usize) -> &mut u64 {
-        let p = &mut self.pi[v >> 5];
-        if *p == u32::MAX {
-            *p = self.dirty.len() as u32;
-            self.dirty.push((v >> 5) as u32);
-            match self.pg.get_mut(*p as usize) {
-                Some(pg) => *pg = [E; 32],
-                None => self.pg.push([E; 32]),
+    fn slot(&self, k: u64) -> usize {
+        let m = self.t.len() - 1;
+        let mut i = (k.wrapping_mul(0x9E3779B97F4A7C15) >> 32) as usize & m;
+        while self.t[i] != E && self.t[i] & M != k {
+            i = (i + 1) & m;
+        }
+        i
+    }
+    fn get(&self, k: u64) -> u64 {
+        let e = self.t[self.slot(k)];
+        if e == E { E } else { e >> 21 }
+    }
+    fn set(&mut self, k: u64, d: u64) {
+        if (self.used.len() + 1) * 2 > self.t.len() {
+            let old: Vec<u64> = self.used.iter().map(|&i| self.t[i as usize]).collect();
+            (self.t, self.used) = (vec![E; self.t.len() * 2], vec![]);
+            for e in old {
+                let i = self.slot(e & M);
+                self.used.push(i as u32);
+                self.t[i] = e;
             }
         }
-        &mut self.pg[*p as usize][v & 31]
+        let i = self.slot(k);
+        if self.t[i] == E {
+            self.used.push(i as u32);
+        }
+        self.t[i] = d << 21 | k;
     }
 }
+fn pf<T>(p: &T) {
+    unsafe { std::arch::x86_64::_mm_prefetch::<3>(p as *const T as *const i8) }
+}
 fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: usize, t: usize) -> i64 {
-    for &p in &w.dirty {
-        w.pi[p as usize] = u32::MAX;
+    if w.t.len() > 1 << 17 {
+        w.t = vec![E; 1 << 13]; // drop oversized table so small queries stay cache-resident
+    } else {
+        for &i in &w.used {
+            w.t[i as usize] = E;
+        }
     }
-    (w.dirty.clear(), w.h.clear());
-    w.pg.truncate(4096);
-    w.pg.shrink_to(4096);
-    *w.at(s) = 0;
+    (w.used.clear(), w.h.clear());
+    w.set(s as u64, 0);
     w.h.push(Reverse(s as u64));
     while let Some(Reverse(x)) = w.h.pop() {
         let (u, d) = ((x & M) as usize, x >> 21);
         if u == t {
             return d as i64;
         }
-        if d > *w.at(u) {
+        if d > w.get(u as u64) {
             continue;
+        }
+        if let Some(&Reverse(nx)) = w.h.peek() {
+            // next node to settle: prefetch its first edge (its head entry was prefetched at push time)
+            if let Some(a) = adj.get(h[(nx & M) as usize].load(R) as usize) {
+                pf(a);
+            }
         }
         for i in h[u].load(R)..h[u + 1].load(R) {
             let e = adj[i as usize].load(R);
@@ -76,17 +103,19 @@ fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: us
             if c == 2047 {
                 c = side[side.binary_search_by_key(&i, |p| p.0).unwrap()].1 as u64;
             }
-            let v = (e >> 11) as usize;
-            let a = w.at(v);
-            if d + c < *a {
-                *a = d + c;
-                w.h.push(Reverse((d + c) << 21 | v as u64));
+            let v = (e >> 11) as u64;
+            if d + c < w.get(v) {
+                w.set(v, d + c);
+                w.h.push(Reverse((d + c) << 21 | v));
+                pf(&h[v as usize]);
             }
         }
     }
     -1
 }
 fn main() {
+    let t0 = std::time::Instant::now();
+    let dbg = std::env::var_os("T").is_some();
     let g = map("/data/graph.txt");
     let mut p = 0;
     let n = num(g, &mut p) as usize;
@@ -114,6 +143,9 @@ fn main() {
             });
         }
     });
+    if dbg {
+        eprintln!("pass1 {:?}", t0.elapsed());
+    }
     let mut run = 0;
     for h in head.iter().take(n) {
         run += h.load(R);
@@ -142,6 +174,9 @@ fn main() {
             .collect();
         hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
+    if dbg {
+        eprintln!("pass2 {:?}", t0.elapsed());
+    }
     side.sort_unstable();
     let side: &[(u32, u32)] = side.leak();
     let (qb, mut qs, mut p) = (map("/data/queries.txt"), vec![], 0);
@@ -152,7 +187,7 @@ fn main() {
     std::thread::scope(|s| {
         for _ in 0..NT {
             s.spawn(move || {
-                let mut w = Ws { pi: vec![u32::MAX; (n >> 5) + 1], pg: vec![], dirty: vec![], h: BinaryHeap::new() };
+                let mut w = Ws { t: vec![E; 1 << 13], used: vec![], h: BinaryHeap::new() };
                 loop {
                     let i = nxt.fetch_add(1, R);
                     if i >= qs.len() {
@@ -173,6 +208,9 @@ fn main() {
             });
         }
     });
+    if dbg {
+        eprintln!("queries {:?} side={}", t0.elapsed(), side.len());
+    }
     let mut o = String::new();
     for r in &res[..qs.len()] {
         o += &format!("{}\n", r.load(R));
