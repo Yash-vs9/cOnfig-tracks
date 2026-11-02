@@ -25,6 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | FastDistMap zero-page COW allocation, 12-thread batching, and code compaction | run-a04042b99951 | 0.313 | 84.6 | 60.38 |
 | 19 | Zero-copy mmap dual CSR, dual 8B Slot tables with dirty index tracking, _exit(0) | run-c99ddf2f823b | 0.396 | 74.6 | 58.62 |
 | 20 | 64KB worker stacks, unified FastDistMap, query sorting & dedup, single-branch parse, _exit(0) | pending | ~0.280 | ~79.8 | ~65.0 |
+| 21 | 32-node lazy paged Ws distance state, 12 query threads & 11-bit side table CSR | pending | ~0.335 | ~217.9 | ~58.0 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
@@ -84,4 +85,9 @@ Every step from the reference to your final version, each with the live-board ru
   4. *64KB Worker Stacks:* Replaced default 2MB thread stacks with 64KB stacks (`Builder::new().stack_size(65536)`), eliminating virtual memory bloat.
   5. *Single-Branch Digit Parser:* Single comparison `**p >= b'0'` cuts branch instructions in half across 105M digit reads.
   6. *Zero-Overhead Teardown:* Instant `_exit(0)` bypasses glibc teardown. Reduced LOC to 522 lines.
+- **Step 21:** 32-node lazy paged distance state (`Ws`), 12 query threads & 11-bit side table CSR:
+  1. *32-Node Lazy Paging:* Per-thread distance table allocated in 32-node chunks (`pg: Vec<[u64; 32]>`) with sparse dirty tracking, providing $O(1)$ indexing and $O(\text{touched})$ reset.
+  2. *12 Query Threads:* Full parallel query processing across 12 worker threads with dynamic work fetching.
+  3. *Zero Dependencies & Ultra-Compact:* Fully zero-dependency Rust implementation in 182 lines.
+
 

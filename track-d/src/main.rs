@@ -9,12 +9,10 @@ extern "C" {
 const E: u64 = u64::MAX;
 const M: u64 = (1 << 21) - 1;
 const NT: usize = 12;
-const QT: usize = 6;
 
 fn map(p: &str) -> &'static [u8] {
     let f = std::fs::File::open(p).unwrap();
     let l = f.metadata().unwrap().len() as usize;
-    // MAP_SHARED | MAP_POPULATE: reuses host page cache, no heap charge
     unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), l, 1, 0x8001, f.as_raw_fd(), 0), l) }
 }
 fn z<T>(k: usize) -> &'static [T] {
@@ -24,9 +22,11 @@ fn z<T>(k: usize) -> &'static [T] {
 #[inline(always)]
 fn num(b: &[u8], p: &mut usize) -> u64 {
     let mut x = 0;
-    while b[*p] >= b'0' {
-        x = x * 10 + (b[*p] - b'0') as u64;
-        *p += 1;
+    unsafe {
+        while *b.get_unchecked(*p) >= b'0' {
+            x = x * 10 + (*b.get_unchecked(*p) - b'0') as u64;
+            *p += 1;
+        }
     }
     *p += 1;
     x
@@ -37,59 +37,50 @@ fn each(b: &[u8], mut p: usize, hi: usize, mut f: impl FnMut(usize, usize, u32))
         f(u, v, w);
     }
 }
-// open-addressing dist table: entry = dist << 21 | node; grows on demand, resets only touched slots
-struct Tab { t: Vec<u64>, used: Vec<u32> }
-impl Tab {
-    fn slot(&self, k: u64) -> usize {
-        let m = self.t.len() - 1;
-        let mut i = (k.wrapping_mul(0x9E3779B97F4A7C15) >> 32) as usize & m;
-        while self.t[i] != E && self.t[i] & M != k {
-            i = (i + 1) & m;
-        }
-        i
-    }
-    fn get(&self, k: u64) -> u64 {
-        let e = self.t[self.slot(k)];
-        if e == E { E } else { e >> 21 }
-    }
-    fn set(&mut self, k: u64, d: u64) {
-        if (self.used.len() + 1) * 2 > self.t.len() {
-            let old: Vec<u64> = self.used.iter().map(|&i| self.t[i as usize]).collect();
-            self.t = vec![E; self.t.len() * 2];
-            self.used.clear();
-            for e in old {
-                let i = self.slot(e & M);
-                self.used.push(i as u32);
-                self.t[i] = e;
+// Per-thread Dijkstra state: dist stored in lazily allocated 32-node pages, O(1) indexing, O(touched) reset.
+struct Ws { pi: Vec<u32>, pg: Vec<[u64; 32]>, dirty: Vec<u32>, h: BinaryHeap<Reverse<u64>> }
+impl Ws {
+    fn at(&mut self, v: usize) -> &mut u64 {
+        let p = &mut self.pi[v >> 5];
+        if *p == u32::MAX {
+            *p = self.dirty.len() as u32;
+            self.dirty.push((v >> 5) as u32);
+            match self.pg.get_mut(*p as usize) {
+                Some(pg) => *pg = [E; 32],
+                None => self.pg.push([E; 32]),
             }
         }
-        let i = self.slot(k);
-        if self.t[i] == E {
-            self.used.push(i as u32);
-        }
-        self.t[i] = d << 21 | k;
+        &mut self.pg[*p as usize][v & 31]
     }
 }
-fn sp(h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], tb: &mut Tab, q: &mut BinaryHeap<Reverse<u64>>, s: usize, t: usize) -> i64 {
-    for &i in &tb.used { tb.t[i as usize] = E; }
-    tb.used.clear();
-    q.clear();
-    tb.set(s as u64, 0);
-    q.push(Reverse(s as u64));
-    while let Some(Reverse(x)) = q.pop() {
+fn sp(w: &mut Ws, h: &[AtomicU32], adj: &[AtomicU32], side: &[(u32, u32)], s: usize, t: usize) -> i64 {
+    for &p in &w.dirty {
+        w.pi[p as usize] = u32::MAX;
+    }
+    (w.dirty.clear(), w.h.clear());
+    w.pg.truncate(4096);
+    w.pg.shrink_to(4096);
+    *w.at(s) = 0;
+    w.h.push(Reverse(s as u64));
+    while let Some(Reverse(x)) = w.h.pop() {
         let (u, d) = ((x & M) as usize, x >> 21);
-        if u == t { return d as i64; }
-        if tb.get(u as u64) < d { continue; }
+        if u == t {
+            return d as i64;
+        }
+        if d > *w.at(u) {
+            continue;
+        }
         for i in h[u].load(R)..h[u + 1].load(R) {
             let e = adj[i as usize].load(R);
-            let mut w = (e & 2047) as u64;
-            if w == 2047 {
-                w = side[side.binary_search_by_key(&i, |p| p.0).unwrap()].1 as u64;
+            let mut c = (e & 2047) as u64;
+            if c == 2047 {
+                c = side[side.binary_search_by_key(&i, |p| p.0).unwrap()].1 as u64;
             }
-            let v = (e >> 11) as u64;
-            if d + w < tb.get(v) {
-                tb.set(v, d + w);
-                q.push(Reverse((d + w) << 21 | v));
+            let v = (e >> 11) as usize;
+            let a = w.at(v);
+            if d + c < *a {
+                *a = d + c;
+                w.h.push(Reverse((d + c) << 21 | v as u64));
             }
         }
     }
@@ -102,9 +93,10 @@ fn main() {
     num(g, &mut p);
     let bd: &[usize] = (0..=NT)
         .map(|i| {
-            if i == 0 { return p; }
             let mut x = p + (g.len() - p) * i / NT;
-            while g[x - 1] != b'\n' { x += 1; }
+            while i > 0 && g[x - 1] != b'\n' {
+                x += 1;
+            }
             x
         })
         .collect::<Vec<_>>()
@@ -127,7 +119,7 @@ fn main() {
         run += h.load(R);
         h.store(run, R);
     }
-    head[n].store(run, R); // head[u] = exclusive end; pass 2 decrements it to the start
+    head[n].store(run, R); // head[u] = end offset; pass 2 decrements it down to the start offset
     let adj = z::<AtomicU32>(run as usize);
     let mut side: Vec<(u32, u32)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..NT)
@@ -137,8 +129,10 @@ fn main() {
                     each(g, bd[i], bd[i + 1], |u, v, w| {
                         if u != v {
                             let j = head[u].fetch_sub(1, R) - 1;
-                            let c = w.min(2047); // 2047 = escape to side table
-                            if c == 2047 { sd.push((j, w)); }
+                            let c = w.min(2047); // 2047 = escape into side table
+                            if c == 2047 {
+                                sd.push((j, w));
+                            }
                             adj[j as usize].store((v as u32) << 11 | c, R);
                         }
                     });
@@ -150,35 +144,38 @@ fn main() {
     });
     side.sort_unstable();
     let side: &[(u32, u32)] = side.leak();
-    let (qb, mut qs, mut p) = (std::fs::read("/data/queries.txt").unwrap(), vec![], 0);
+    let (qb, mut qs, mut p) = (map("/data/queries.txt"), vec![], 0);
     while p < qb.len() {
-        qs.push((num(&qb, &mut p) as usize, num(&qb, &mut p) as usize));
+        qs.push((num(qb, &mut p) as usize, num(qb, &mut p) as usize));
     }
     let (qs, res, nxt): (&[(usize, usize)], _, _) = (qs.leak(), z::<AtomicI64>(qb.len() / 4 + 1), &AtomicUsize::new(0));
     std::thread::scope(|s| {
-        for _ in 0..QT {
+        for _ in 0..NT {
             s.spawn(move || {
-                let (mut tb, mut q) = (Tab { t: vec![E; 4096], used: vec![] }, BinaryHeap::new());
+                let mut w = Ws { pi: vec![u32::MAX; (n >> 5) + 1], pg: vec![], dirty: vec![], h: BinaryHeap::new() };
                 loop {
                     let i = nxt.fetch_add(1, R);
-                    if i >= qs.len() { break; }
+                    if i >= qs.len() {
+                        break;
+                    }
                     let (a, b) = qs[i];
-                    let r = if a == b {
-                        0
-                    } else if head[a].load(R) == head[a + 1].load(R) || inb[b >> 6].load(R) >> (b & 63) & 1 == 0 {
-                        -1
-                    } else {
-                        sp(head, adj, side, &mut tb, &mut q, a, b)
-                    };
-                    res[i].store(r, R);
+                    res[i].store(
+                        if a == b {
+                            0
+                        } else if head[a].load(R) == head[a + 1].load(R) || inb[b >> 6].load(R) >> (b & 63) & 1 == 0 {
+                            -1
+                        } else {
+                            sp(&mut w, head, adj, side, a, b)
+                        },
+                        R,
+                    );
                 }
             });
         }
     });
     let mut o = String::new();
     for r in &res[..qs.len()] {
-        o += &r.load(R).to_string();
-        o.push('\n');
+        o += &format!("{}\n", r.load(R));
     }
     std::fs::write("/out/distances.txt", o).unwrap();
     unsafe { _exit(0) }
