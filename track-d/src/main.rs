@@ -13,14 +13,11 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 131072;
+const H_SZ: usize = 65536;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 32 - 17;
-const H_MAX_LOAD: u32 = 85000;
+const H_SHIFT: u32 = 16;
+const H_MAX_LOAD: u32 = 45875;
 const BUF_SZ: usize = 128 * 1024;
-
-#[derive(Clone, Copy)]
-struct Query(u32, u32, u32);
 
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
@@ -379,10 +376,9 @@ fn main() {
     head_fwd[0] = 0; head_rev[0] = 0;
 
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries");
-    let mut queries = Vec::with_capacity(4096);
+    let mut queries = Vec::with_capacity(2048);
     let mut qp = q_bytes.as_ptr();
     let q_end_p = unsafe { qp.add(q_bytes.len()) };
-    let mut qid = 0u32;
     unsafe {
         while qp < q_end_p {
             while qp < q_end_p && *qp < b'0' { qp = qp.add(1); }
@@ -390,32 +386,18 @@ fn main() {
             let s = parse_u32(&mut qp);
             while qp < q_end_p && *qp < b'0' { qp = qp.add(1); }
             let t = parse_u32(&mut qp);
-            queries.push(Query(s, t, qid));
-            qid += 1;
+            queries.push((s, t));
         }
     }
     drop(q_bytes);
 
-    queries.sort_unstable_by_key(|q| (q.0, q.1));
-    let mut unique_queries: Vec<Query> = Vec::with_capacity(queries.len());
-    let mut duplicates = Vec::new();
-    for q in queries {
-        if let Some(prev) = unique_queries.last() {
-            if prev.0 == q.0 && prev.1 == q.1 {
-                duplicates.push((q.2, prev.2));
-                continue;
-            }
-        }
-        unique_queries.push(q);
-    }
-
-    let mut answers = vec![-1i64; unique_queries.len() + duplicates.len()];
+    let mut answers = vec![-1i64; queries.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
     let next_query = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
-        for _ in 0..nt.min(12).min(unique_queries.len()) {
-            let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &unique_queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
+        for _ in 0..nt.min(12).min(queries.len()) {
+            let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
             let has_oflow = !overflow_map.is_empty();
 
             std::thread::Builder::new().stack_size(65536).spawn_scoped(scope, move || {
@@ -428,13 +410,12 @@ fn main() {
                 loop {
                     let qi = nq.fetch_add(1, Ordering::Relaxed);
                     if qi >= qref.len() { break; }
-                    let q = qref[qi];
-                    let (s, t) = (q.0 as usize, q.1 as usize);
-                    if s == t { unsafe { *ans_ptr.add(q.2 as usize) = 0; } continue; }
+                    let (s, t) = (qref[qi].0 as usize, qref[qi].1 as usize);
+                    if s == t { unsafe { *ans_ptr.add(qi) = 0; } continue; }
 
                     unsafe {
                         if *hf_ptr.add(s + 1) == *hf_ptr.add(s) || *hr_ptr.add(t + 1) == *hr_ptr.add(t) {
-                            *ans_ptr.add(q.2 as usize) = -1;
+                            *ans_ptr.add(qi) = -1;
                             continue;
                         }
                     }
@@ -493,16 +474,12 @@ fn main() {
                         if table_full || (ans == -1 && touched_oflow) {
                             ans = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow);
                         }
-                        *ans_ptr.add(q.2 as usize) = ans;
+                        *ans_ptr.add(qi) = ans;
                     }
                 }
             }).unwrap();
         }
     });
-
-    for &(tid, sid) in &duplicates {
-        answers[tid as usize] = answers[sid as usize];
-    }
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut f = File::create(format!("{}/distances.txt", out_dir)).expect("out");
