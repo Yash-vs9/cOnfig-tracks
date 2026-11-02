@@ -1,10 +1,3 @@
-
-#include <cstdlib>
-__attribute__((constructor)) static void pre_init() {
-  setenv("OMP_WAIT_POLICY", "ACTIVE", 0);
-  setenv("OMP_PROC_BIND", "TRUE", 0);
-  setenv("OMP_STACKSIZE", "64k", 0);
-}
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -21,7 +14,7 @@ struct alignas(64) Agg {
   int64_t id_s, am_s, mi, ma, nb, ntb;
   void add(const Agg &t) {
     mi = cnt ? std::min(mi, t.mi) : t.mi, ma = cnt ? std::max(ma, t.ma) : t.ma;
-    cnt += t.cnt, dn += t.dn, id_s += t.id_s, am_s += t.am_s, nb += t.nb, ntb += t.ntb;
+    cnt += t.cnt, id_s += t.id_s, am_s += t.am_s, nb += t.nb, ntb += t.ntb;
   }
 };
 
@@ -35,8 +28,8 @@ static size_t cs[13];
 static uint8_t unm_cid;
 
 static inline uint32_t mm_find(const char *p, __m256i v) {
-  __m256i l = _mm256_loadu_si256((const __m256i *)p);
-  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(l, v));
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+      _mm256_loadu_si256((const __m256i *)p), v));
 }
 static inline void fmt_cents(char *&p, int64_t c) {
   c < 0 ? (*p++ = '-', c = -c) : 0;
@@ -71,8 +64,7 @@ static inline uint64_t hash_fast(const char *s, uint32_t len) {
       h2 = (h2 * 31) + (uint8_t)s[i];
   }
   uint64_t h = (h1 ^ (h2 * 0x9e3779b97f4a7c15ULL));
-  h ^= (h >> 31);
-  return h ? h : 1;
+  return (h ^ (h >> 31)) ? (h ^ (h >> 31)) : 1;
 }
 static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
   const char *p = nl - (nl > b && nl[-1] == '\r');
@@ -95,14 +87,6 @@ static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
   while (nx < b + sz && (uint32_t)(*nx - '0') <= 9) ++nx;
   return nx > s && nx < b + sz && *nx == ',';
 }
-static inline bool test_and_set_bit(uint64_t *bits, uint32_t bit) {
-  bool old_bit;
-  asm volatile("lock btsq %2, %0; setc %1"
-               : "+m"(*bits), "=r"(old_bit)
-               : "r"((uint64_t)bit)
-               : "cc", "memory");
-  return old_bit;
-}
 
 int main(int argc, char **argv) {
   int rfd = open(argc > 1 ? argv[1] : "/data/regions.csv", O_RDONLY);
@@ -112,10 +96,11 @@ int main(int argc, char **argv) {
   size_t rsz = rst.st_size, sz = mst.st_size;
   auto map_f = [&](int fd, size_t len) -> const char * {
     if (!len) return nullptr;
-    auto m = mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED) m = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (m != MAP_FAILED) madvise(m, len, MADV_WILLNEED | MADV_SEQUENTIAL | MADV_HUGEPAGE);
-    return (const char *)m;
+    const char *b = (const char *)mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (b == MAP_FAILED)
+      b = (const char *)mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (b != MAP_FAILED) madvise((void *)b, len, MADV_WILLNEED | MADV_SEQUENTIAL);
+    return b;
   };
   const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
 
@@ -210,8 +195,16 @@ int main(int argc, char **argv) {
           }
           nh = hash_fast(tmp, (uint32_t)nb);
         }
-      } else {
+      } else if (__builtin_expect(*p == ',', 0)) {
         nb = 0, nh = 3902269347ULL, ++p;
+      } else {
+        const char *q = nullptr;
+        if (__builtin_expect(p + 32 <= end, 1)) {
+          uint32_t m = mm_find(p, c_vec);
+          if (m) q = p + __builtin_ctz(m);
+        }
+        if (!q) q = (const char *)memchr(p, ',', end - p);
+        nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 1;
       }
     name_done:
       uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
@@ -260,14 +253,31 @@ int main(int argc, char **argv) {
         }
       done_q:
         ntb += p - s, p += 2;
-      } else {
+      } else if (__builtin_expect(*p == ',', 0)) {
         ntb = 0, ++p;
+      } else {
+        const char *s = p;
+        if (__builtin_expect(p + 32 <= end, 1)) {
+          uint32_t m = mm_find(s, c_vec);
+          if (m) {
+            ntb = __builtin_ctz(m), p = s + ntb + 1;
+            goto note_done;
+          }
+          if (__builtin_expect(p + 64 <= end, 1)) {
+            uint32_t m2 = mm_find(s + 32, c_vec);
+            if (m2) {
+              ntb = 32 + __builtin_ctz(m2), p = s + ntb + 1;
+              goto note_done;
+            }
+            p = s + 64;
+          } else
+            p = s + 32;
+        }
+        p = (const char *)memchr(p, ',', end - p), ntb = p - s, ++p;
       }
     note_done:
       uint32_t rid = parse_u(p);
-      if (__builtin_expect(rid < 1000000, 1)) {
-        _mm_prefetch((const char *)&reg_lut[rid], _MM_HINT_T0);
-      }
+      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0, cid = r ? (r - 1) : unm_cid;
       bool neg = (*p == '-') && ++p;
       int64_t cents = *p++ - '0';
       if (*p != '.')
@@ -276,47 +286,49 @@ int main(int argc, char **argv) {
       if (__builtin_expect(neg, 0)) cents = -cents;
       p += 1 + (*p == '\r');
 
-      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0, cid = r ? (r - 1) : unm_cid;
-
       Agg &a = T[tid][cid];
       a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
       a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
 
-      uint32_t slot = slot0;
-      for (;; slot = (slot + 1) & HT_MASK) {
+      uint32_t slot;
+      for (slot = slot0;; slot = (slot + 1) & HT_MASK) {
         uint64_t k = name_keys[slot];
         if (__builtin_expect(k == nh, 1)) break;
-        if (!k && (__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) ||
-                   name_keys[slot] == nh))
+        if (!k) {
+          if (!__sync_bool_compare_and_swap(&name_keys[slot], 0ULL, nh) &&
+              name_keys[slot] != nh)
+            continue;
           break;
+        }
       }
-      uint64_t mask = 1ULL << (cid & 63);
-      if (__builtin_expect(!(name_bits[slot][cid >> 6] & mask), 1) &&
-          !test_and_set_bit(name_bits[slot], cid))
+      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
+      if (__builtin_expect(!(*w & mask), 1) &&
+          !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask))
         a.dn++;
     }
   }
 
-  for (int c = 0; c <= unm_cid; ++c)
-    for (int t = 1; t < 12; ++t) {
-      if (T[t][c].cnt) T[0][c].add(T[t][c]);
+  for (int cid = 0; cid <= unm_cid; ++cid)
+    for (int tid = 1; tid < 12; ++tid) {
+      T[0][cid].dn += T[tid][cid].dn;
+      if (T[tid][cid].cnt) T[0][cid].add(T[tid][cid]);
     }
 
   char *ptr = out_buf;
   auto emit_u = [&](int64_t x) {
     ptr = std::to_chars(ptr, ptr + 24, x).ptr, *ptr++ = ' ';
   };
-  for (int c = 0; c <= unm_cid; ++c) {
-    Agg &g = T[0][c];
+  for (int cid = 0; cid <= unm_cid; ++cid) {
+    Agg &g = T[0][cid];
     if (!g.cnt) continue;
-    if (c == unm_cid) memcpy(ptr, "_UNMATCHED ", 11), ptr += 11;
-    else memcpy(ptr, dense_to_code[c], 3), ptr[3] = ' ', ptr += 4;
+    if (cid == unm_cid) memcpy(ptr, "_UNMATCHED ", 11), ptr += 11;
+    else memcpy(ptr, dense_to_code[cid], 3), ptr[3] = ' ', ptr += 4;
     emit_u(g.cnt), emit_u(g.id_s), fmt_cents(ptr, g.am_s), fmt_cents(ptr, g.mi);
     fmt_cents(ptr, g.ma), emit_u(g.dn), emit_u(g.nb);
     ptr = std::to_chars(ptr, ptr + 24, g.ntb).ptr, *ptr++ = '\n';
   }
-  const char *out_path = argc > 3 ? argv[3] : "/out/aggregates.txt";
-  int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  int ofd = open(argc > 3 ? argv[3] : "/out/aggregates.txt",
+                 O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (write(ofd, out_buf, ptr - out_buf) < 0) {}
   close(ofd);
   return 0;
