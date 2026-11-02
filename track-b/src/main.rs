@@ -213,40 +213,27 @@ unsafe fn insert_term(s: &[u8], off: u32, _q_buf: &[u8]) -> u32 {
 #[inline(always)]
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
     let mut w0 = 0u64;
-    let mut len = 0usize;
-    let mut m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
-    while len < 8 {
-        w0 |= (m as u64) << (len * 8);
-        len += 1;
-        *p += 1;
-        m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
-        if m <= 1 {
-            return (w0, 0, len);
-        }
-    }
     let mut w1 = 0u64;
-    while len < 16 {
-        w1 |= (m as u64) << ((len - 8) * 8);
-        len += 1;
-        *p += 1;
-        m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
-        if m <= 1 {
-            return (w0, w1, len);
+    let mut len = 0usize;
+    while *p < d.len() {
+        let b = *d.get_unchecked(*p);
+        if !b.is_ascii_alphanumeric() {
+            break;
         }
-    }
-    while len < 32 {
-        *tail.get_unchecked_mut(len - 16) = m;
-        len += 1;
-        *p += 1;
-        m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
-        if m <= 1 {
-            return (w0, w1, len);
+        let c = if b.is_ascii_uppercase() {
+            b.to_ascii_lowercase()
+        } else {
+            b
+        };
+        if len < 8 {
+            w0 |= (c as u64) << (len * 8);
+        } else if len < 16 {
+            w1 |= (c as u64) << ((len - 8) * 8);
+        } else {
+            tail[len - 16] = c;
         }
-    }
-    while m > 1 {
-        *p += 1;
         len += 1;
-        m = *CMAP.get_unchecked(*d.get_unchecked(*p) as usize);
+        *p += 1;
     }
     (w0, w1, len)
 }
@@ -258,6 +245,15 @@ unsafe fn tokmask(c: __m256i) -> u32 {
     let d = _mm256_sub_epi8(c, _mm256_set1_epi8(0x30));
     let n = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
     _mm256_movemask_epi8(_mm256_or_si256(l, n)) as u32
+}
+#[inline(always)]
+unsafe fn is_word_byte(b: u8) -> bool {
+    let c = if b.is_ascii_uppercase() {
+        b.to_ascii_lowercase()
+    } else {
+        b
+    };
+    c.is_ascii_digit() || c.is_ascii_lowercase()
 }
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
@@ -404,9 +400,8 @@ unsafe fn scan_doc<F: FnMut(usize)>(
             *p += 64;
         }
     }
-    // Tail fallback
     while *p < n {
-        while *p < n && *CMAP.get_unchecked(*base.add(*p) as usize) == 0 {
+        while *p < n && !is_word_byte(*base.add(*p)) {
             *p += 1;
         }
         if *p >= n || *base.add(*p) == b'\n' {
@@ -1118,10 +1113,10 @@ impl<'a> Engine<'a> {
                         }
                         sp += 32;
                     } else {
-                        while *CMAP.get_unchecked(*self.d_buf.get_unchecked(sp) as usize) == 0 {
+                        while sp < d_len && !is_word_byte(*self.d_buf.get_unchecked(sp)) {
                             sp += 1;
                         }
-                        if *self.d_buf.get_unchecked(sp) == b'\n' {
+                        if sp >= d_len || *self.d_buf.get_unchecked(sp) == b'\n' {
                             break 'doc_scan;
                         }
                         if match_phrase(sp, doc_start) {
@@ -1324,7 +1319,6 @@ unsafe fn run_all() {
     let w_per_doc = ((total_docs + 63) >> 6) as usize;
     let mut bs_idx = vec![u16::MAX; nt];
     let mut n_bs = 0usize;
-    // Pre-sample 600 docs to detect heavy terms (>5.6% df) up-front
     let sample_docs = total_docs.min(600);
     let mut sample_counts = vec![0u16; nt];
     let mut sp = 0usize;
@@ -1371,7 +1365,6 @@ unsafe fn run_all() {
             }
         }
     }
-    // Terms with >= 34 hits in 600 docs (~5.6%) are designated bitset terms
     let threshold = if total_docs >= 25000 { 34 } else { 15 };
     for i in 0..nt {
         if sample_counts[i] >= threshold {
