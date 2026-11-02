@@ -13,11 +13,14 @@ const W_BITS: u32 = 11;
 const W_SENTINEL: u32 = (1 << W_BITS) - 1;
 const V_MASK: u32 = (1 << 21) - 1;
 const INF: u32 = u32::MAX;
-const H_SZ: usize = 65536;
+const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
-const H_SHIFT: u32 = 16;
-const H_MAX_LOAD: u32 = 45875;
+const H_SHIFT: u32 = 32 - 17;
+const H_MAX_LOAD: u32 = 85000;
 const BUF_SZ: usize = 128 * 1024;
+
+#[derive(Clone, Copy)]
+struct Query(u32, u32, u32);
 
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
@@ -271,7 +274,7 @@ fn main() {
     std::thread::scope(|scope| {
         for t in 0..nt {
             let (start, finish, hf, hr, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
-            std::thread::Builder::new().stack_size(65536).spawn_scoped(scope, move || {
+            scope.spawn(move || {
                 let mut buf = vec![0u8; BUF_SZ + 64];
                 let (mut off, mut left) = (start, 0usize);
                 while off < finish {
@@ -300,7 +303,7 @@ fn main() {
                     left = total - vend;
                     if left > 0 { buf.copy_within(vend..total, 0); }
                 }
-            }).unwrap();
+            });
         }
     });
 
@@ -316,7 +319,7 @@ fn main() {
         let mut handlers = Vec::with_capacity(nt);
         for t in 0..nt {
             let (start, finish, hf, hr, gf_ref) = (bounds[t], bounds[t + 1], &head_fwd, &head_rev, &gf);
-            handlers.push(std::thread::Builder::new().stack_size(65536).spawn_scoped(scope, move || {
+            handlers.push(scope.spawn(move || {
                 let mut local_oflow = Vec::new();
                 let mut buf = vec![0u8; BUF_SZ + 64];
                 let (mut off, mut left) = (start, 0usize);
@@ -356,7 +359,7 @@ fn main() {
                     if left > 0 { buf.copy_within(vend..total, 0); }
                 }
                 local_oflow
-            }).unwrap());
+            }));
         }
         handlers.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -376,9 +379,10 @@ fn main() {
     head_fwd[0] = 0; head_rev[0] = 0;
 
     let q_bytes = std::fs::read(format!("{}/queries.txt", data_dir)).expect("queries");
-    let mut queries = Vec::with_capacity(2048);
+    let mut queries = Vec::with_capacity(4096);
     let mut qp = q_bytes.as_ptr();
     let q_end_p = unsafe { qp.add(q_bytes.len()) };
+    let mut qid = 0u32;
     unsafe {
         while qp < q_end_p {
             while qp < q_end_p && *qp < b'0' { qp = qp.add(1); }
@@ -386,21 +390,35 @@ fn main() {
             let s = parse_u32(&mut qp);
             while qp < q_end_p && *qp < b'0' { qp = qp.add(1); }
             let t = parse_u32(&mut qp);
-            queries.push((s, t));
+            queries.push(Query(s, t, qid));
+            qid += 1;
         }
     }
     drop(q_bytes);
 
-    let mut answers = vec![-1i64; queries.len()];
+    queries.sort_unstable_by_key(|q| (q.0, q.1));
+    let mut unique_queries: Vec<Query> = Vec::with_capacity(queries.len());
+    let mut duplicates = Vec::new();
+    for q in queries {
+        if let Some(prev) = unique_queries.last() {
+            if prev.0 == q.0 && prev.1 == q.1 {
+                duplicates.push((q.2, prev.2));
+                continue;
+            }
+        }
+        unique_queries.push(q);
+    }
+
+    let mut answers = vec![-1i64; unique_queries.len() + duplicates.len()];
     let answers_addr = answers.as_mut_ptr() as usize;
     let next_query = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
-        for _ in 0..nt.min(12).min(queries.len()) {
-            let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
+        for _ in 0..nt.min(12).min(unique_queries.len()) {
+            let (nq, qref, hf, hr, ef, er, oflow) = (&next_query, &unique_queries, &head_fwd, &head_rev, &edges_fwd, &edges_rev, &overflow_map);
             let has_oflow = !overflow_map.is_empty();
 
-            std::thread::Builder::new().stack_size(65536).spawn_scoped(scope, move || {
+            scope.spawn(move || {
                 let mut dist_map = FastDistMap::new();
                 let mut heap_f = MinHeap::with_capacity(16384);
                 let mut heap_b = MinHeap::with_capacity(16384);
@@ -410,12 +428,13 @@ fn main() {
                 loop {
                     let qi = nq.fetch_add(1, Ordering::Relaxed);
                     if qi >= qref.len() { break; }
-                    let (s, t) = (qref[qi].0 as usize, qref[qi].1 as usize);
-                    if s == t { unsafe { *ans_ptr.add(qi) = 0; } continue; }
+                    let q = qref[qi];
+                    let (s, t) = (q.0 as usize, q.1 as usize);
+                    if s == t { unsafe { *ans_ptr.add(q.2 as usize) = 0; } continue; }
 
                     unsafe {
                         if *hf_ptr.add(s + 1) == *hf_ptr.add(s) || *hr_ptr.add(t + 1) == *hr_ptr.add(t) {
-                            *ans_ptr.add(qi) = -1;
+                            *ans_ptr.add(q.2 as usize) = -1;
                             continue;
                         }
                     }
@@ -436,7 +455,7 @@ fn main() {
                             if top_f.saturating_add(top_b) >= mu { break; }
                             if dist_map.used >= H_MAX_LOAD { table_full = true; break; }
 
-                            let is_fwd = heap_f.data.len() <= heap_b.data.len();
+                            let is_fwd = top_f <= top_b;
                             let (d, u) = if is_fwd { heap_f.pop() } else { heap_b.pop() };
                             let top_opp = if is_fwd { top_b } else { top_f };
                             if d.saturating_add(top_opp) >= mu { break; }
@@ -474,12 +493,16 @@ fn main() {
                         if table_full || (ans == -1 && touched_oflow) {
                             ans = solve_query_64(s, t, hf_ptr, hr_ptr, ef_ptr, er_ptr, oflow);
                         }
-                        *ans_ptr.add(qi) = ans;
+                        *ans_ptr.add(q.2 as usize) = ans;
                     }
                 }
-            }).unwrap();
+            });
         }
     });
+
+    for &(tid, sid) in &duplicates {
+        answers[tid as usize] = answers[sid as usize];
+    }
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut f = File::create(format!("{}/distances.txt", out_dir)).expect("out");
