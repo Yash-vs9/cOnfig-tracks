@@ -26,8 +26,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | Zero-copy mmap dual CSR, dual 8B Slot tables with dirty index tracking, _exit(0) | run-c99ddf2f823b | 0.396 | 74.6 | 58.62 |
 | 20 | 64KB worker stacks, unified FastDistMap, query sorting & dedup, single-branch parse, _exit(0) | pending | ~0.280 | ~79.8 | ~65.0 |
 | 21 | 32-node lazy paged Ws distance state, 12 query threads & 11-bit side table CSR | pending | ~0.335 | ~217.9 | ~58.0 |
-| 22 | L2-resident open-addressing table (1<<13 reset cap) + SIMD software prefetch (_mm_prefetch) | pending | 2.739 | 190.0 | ~62.0 |
-| 23 | In-memory BFS relabeling + contiguous node balls + low-3-bit spatial hash | pending | 2.898 | 237.3 | ~61.0 |
+| 22 | L2-resident open-addressing table (1<<13 reset cap) + SIMD software prefetch (_mm_prefetch) | run-12f648affe6b | 0.596 | 112.1 | 55.33 |
+| 23 | In-memory BFS relabeling + contiguous node balls + low-3-bit spatial hash | run-f31cc1c2653c | 0.713 | 162.0 | 50.91 |
 
 ### Notes on Step Progression
 - **Step 1:** Initial port to native C++20 using zero-copy `mmap` parsing for both `graph.txt` and `queries.txt`, forward Compressed Sparse Row (CSR) representation with parallel edge deduplication (preserving min weight) and self-loop removal, a 4-ary cache-friendly min-heap, and generation/epoch counters (`visited_epoch`) to eliminate distance array re-initialization per query. Runtime on `d-full` dropped from $72.69\text{ s} \to 12.20\text{ s}$ ($5.96\times$ speedup), peak RSS dropped from $893\text{ MB} \to 169\text{ MB}$ ($5.28\times$ reduction), achieving $K = 3.41$ and **26.6 Speed Points** with 100% exact SHA-256 match.
