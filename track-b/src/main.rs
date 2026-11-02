@@ -28,9 +28,9 @@ extern "C" {
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
 }
 const NUM_T: usize = 12;
-const NUM_C: usize = 48;
-const FW_CAP: usize = 350_000;
-const DP_CAP: usize = 8_000;
+const NUM_C: usize = 12;
+const FW_CAP: usize = 1_300_000;
+const DP_CAP: usize = 22_000;
 #[derive(Clone, Copy, Default)]
 struct TInfo {
     w0: u64,
@@ -102,6 +102,14 @@ static mut TABLE_SHORT: [SlotShort; SHORT_CAP] = [SlotShort {
     len: 0,
     _pad: 0,
 }; SHORT_CAP];
+static mut L1_CACHE: [SlotShort; 2048] = [SlotShort {
+    w0: 0,
+    tid: u32::MAX,
+    bi: u16::MAX,
+    len: 0,
+    _pad: 0,
+}; 2048];
+const L1_MULT: u64 = 0x9e3779b97f4a7c15;
 static mut TABLE_LONG: [SlotLong; LONG_CAP] = [SlotLong {
     w0: 0,
     w1: 0,
@@ -111,15 +119,15 @@ static mut TABLE_LONG: [SlotLong; LONG_CAP] = [SlotLong {
     tail: 0,
     _pad: [0; 8],
 }; LONG_CAP];
-static mut TINFO: [TInfo; 131072] = [TInfo {
+static mut TINFO: [TInfo; 80000] = [TInfo {
     w0: 0,
     w1: 0,
     off: 0,
     df: 0,
     len: 0,
     bi: u16::MAX,
-}; 131072];
-static mut GLOBAL_DF: [AtomicU32; 131072] = [const { AtomicU32::new(0) }; 131072];
+}; 80000];
+static mut GLOBAL_DF: [AtomicU32; 80000] = [const { AtomicU32::new(0) }; 80000];
 static mut N_TERMS: usize = 0;
 
 #[inline(always)]
@@ -263,6 +271,29 @@ unsafe fn scan_doc<F: FnMut(usize)>(
     let mut tail = [0u8; 16];
     let mut process_token = |w0: u64, w1: u64, len: usize, tail: &[u8]| {
         if len <= 8 {
+            let l1_slot = (w0.wrapping_mul(L1_MULT) >> 53) as usize & 2047;
+            let s_l1 = L1_CACHE.get_unchecked(l1_slot);
+            if s_l1.w0 == w0 && s_l1.len == len as u8 {
+                let bi = s_l1.bi;
+                if bi != u16::MAX {
+                    let bi_u = bi as usize;
+                    if bi_u < 1024 {
+                        *doc_bs.add(bi_u >> 6) |= 1u64 << (bi_u & 63);
+                    }
+                } else {
+                    fn_(s_l1.tid as usize);
+                }
+                if p_tid == s_l1.tid && pos == p_pos + 1 && (s_l1.tid as usize) < rep_map.len() {
+                    let rt = *rep_map.get_unchecked(s_l1.tid as usize);
+                    if rt != u32::MAX {
+                        fn_(rt as usize);
+                    }
+                }
+                p_tid = s_l1.tid;
+                p_pos = pos;
+                pos += 1;
+                return;
+            }
             let mut idx = (w0.wrapping_mul(H_MULT) >> 47) as usize & SHORT_MSK;
             loop {
                 let s = TABLE_SHORT.get_unchecked(idx);
@@ -654,7 +685,7 @@ impl<'a> Engine<'a> {
         let q_ts = &self.q_terms[q.t_idx as usize..q.t_idx as usize + q.k as usize];
         let mut curr_uninit = MaybeUninit::<[u64; 352]>::uninit();
         let curr = curr_uninit.assume_init_mut();
-        let mut clist_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+        let mut clist_uninit = MaybeUninit::<[u16; 22000]>::uninit();
         let clist = clist_uninit.assume_init_mut();
 
         let is_pure_and = (1..q.k as usize).all(|i| ((q.ops >> ((i - 1) * 2)) & 3) == 1);
@@ -877,7 +908,7 @@ impl<'a> Engine<'a> {
         let p0_has_2 = plen[anchor] >= 2;
         let p0_has_3 = plen[anchor] >= 3;
         let (mut t_cnt, mut t_sum, mut top, mut tc) = (0u64, 0u64, [0u32; 10], 0usize);
-        let mut cand_uninit = MaybeUninit::<[u16; 21000]>::uninit();
+        let mut cand_uninit = MaybeUninit::<[u16; 22000]>::uninit();
         let cand = cand_uninit.assume_init_mut();
         let record_doc =
             |d: u32, t_cnt: &mut u64, t_sum: &mut u64, top: &mut [u32; 10], tc: &mut usize| {
@@ -1445,6 +1476,24 @@ unsafe fn run_all() {
             }
         }
     }
+    let mut term_order: Vec<u32> = (0..n_query_terms as u32).collect();
+    term_order.sort_unstable_by_key(|&t| std::cmp::Reverse(sample_counts[t as usize]));
+    for &t in &term_order {
+        let ti = &TINFO[t as usize];
+        if ti.len <= 8 {
+            let l1_slot = (ti.w0.wrapping_mul(L1_MULT) >> 53) as usize & 2047;
+            let slot = &mut L1_CACHE[l1_slot];
+            if slot.w0 == 0 {
+                *slot = SlotShort {
+                    w0: ti.w0,
+                    tid: t,
+                    bi: bs_idx[t as usize],
+                    len: ti.len as u8,
+                    _pad: 0,
+                };
+            }
+        }
+    }
     drop(sample_counts);
     let g_bs_total = n_bs * w_per_doc;
     let raw_bs_ptr = alloc_mmap::<u64>(g_bs_total);
@@ -1581,7 +1630,12 @@ unsafe fn run_all() {
                 );
                 madvise(
                     GLOBAL_DF.as_mut_ptr() as *mut u8,
-                    size_of::<[AtomicU32; 131072]>(),
+                    size_of::<[AtomicU32; 80000]>(),
+                    4,
+                );
+                madvise(
+                    L1_CACHE.as_mut_ptr() as *mut u8,
+                    size_of::<[SlotShort; 2048]>(),
                     4,
                 );
 
