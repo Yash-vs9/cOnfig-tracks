@@ -165,30 +165,32 @@ unsafe fn insert_term(s: &[u8], off: u32, _q_buf: &[u8]) -> u32 {
         );
     }
     let h = mix64(w0, w1, len);
-    let tid = lookup_swar(w0, h, len);
-    if tid != u32::MAX {
-        return tid;
-    }
     let (h32, mut idx) = (((h ^ (h >> 32)) as u32) | 1, (h as usize) & H_MSK);
     let h_tag = (h32 & 0x00FFFFFF) | ((len as u32) << 24);
-    while VTAB.0[idx].h_tag != 0 {
+    loop {
+        let slot = VTAB.0.get_unchecked_mut(idx);
+        if slot.h_tag == 0 {
+            let nt = N_TERMS as u32;
+            N_TERMS += 1;
+            *slot = Slot { w0, h_tag, tid: nt };
+            TINFO[nt as usize] = TInfo {
+                w0,
+                w1,
+                off,
+                df: 0,
+                len: len as u16,
+                _pad: 0,
+            };
+            let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
+            let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
+            PF[widx] |= m;
+            return nt;
+        }
+        if slot.h_tag == h_tag && slot.w0 == w0 {
+            return slot.tid;
+        }
         idx = (idx + 1) & H_MSK;
     }
-    let nt = N_TERMS as u32;
-    N_TERMS += 1;
-    VTAB.0[idx] = Slot { w0, h_tag, tid: nt };
-    TINFO[nt as usize] = TInfo {
-        w0,
-        w1,
-        off,
-        df: 0,
-        len: len as u16,
-        _pad: 0,
-    };
-    let widx = ((h ^ (h >> 16)) as usize) & PF_WMASK;
-    let m = (1u64 << ((h >> 32) & 63)) | (1u64 << ((h >> 40) & 63));
-    PF[widx] |= m;
-    nt
 }
 #[inline(always)]
 unsafe fn read_tok(d: &[u8], p: &mut usize, tail: &mut [u8; 16]) -> (u64, u64, usize) {
