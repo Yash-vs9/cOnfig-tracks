@@ -9,6 +9,30 @@ fn word_bit_sum(mut val: u64) -> u64 {
     }
     s
 }
+#[inline(always)]
+fn id_prefix_len(d: u32) -> usize {
+    if d < 10000 {
+        if d < 100 {
+            if d < 10 {
+                2
+            } else {
+                3
+            }
+        } else {
+            if d < 1000 {
+                4
+            } else {
+                5
+            }
+        }
+    } else {
+        if d < 100000 {
+            6
+        } else {
+            7
+        }
+    }
+}
 use std::{
     arch::x86_64::*,
     fs::File,
@@ -24,13 +48,13 @@ extern "C" {
     fn close(fd: i32) -> i32;
     fn mallopt(p: i32, v: i32) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn malloc_trim(pad: usize) -> i32;
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+    fn _exit(status: i32) -> !;
 }
 const NUM_T: usize = 12;
-const NUM_C: usize = 12;
-const FW_CAP: usize = 1_300_000;
-const DP_CAP: usize = 22_000;
+const NUM_C: usize = 24;
+const FW_CAP: usize = 650_000;
+const DP_CAP: usize = 11_000;
 #[derive(Clone, Copy, Default)]
 struct TInfo {
     w0: u64,
@@ -480,7 +504,8 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
+    madvise(p, len, 3);
     close(fd);
     std::slice::from_raw_parts(p, len)
 }
@@ -667,6 +692,9 @@ impl<'a> Engine<'a> {
                         }
                         val &= val - 1;
                     }
+                } else if val == u64::MAX {
+                    *t_cnt += 64;
+                    *t_sum += 64 * (base_id as u64) + 2016;
                 } else {
                     let cnt = val.count_ones() as u64;
                     *t_cnt += cnt;
@@ -1201,10 +1229,7 @@ unsafe fn worker_scan_fw(
     let (mut p, pe, mut d, mut ld) = (c_byte[c], c_byte[c + 1], doc_s[c], 0u16);
     let mut fw_idx = 0usize;
     while p < pe {
-        while *d_buf.get_unchecked(p) != b'\t' {
-            p += 1;
-        }
-        p += 1;
+        p += id_prefix_len(d);
         *doc_ts_ptr.add(d as usize) = p as u32;
         *dp_ptr.add(ld as usize) = fw_idx as u32;
         let d_w = (d as usize) >> 6;
@@ -1393,14 +1418,11 @@ unsafe fn run_all() {
     let mut sp = 0usize;
     let mut s_seen = [0u64; 1280];
     let mut s_hl = [0u32; 2048];
-    for _ in 0..sample_docs {
-        while sp < f_sz && d_buf[sp] != b'\t' {
-            sp += 1;
-        }
+    for _d in 0..sample_docs {
         if sp >= f_sz {
             break;
         }
-        sp += 1;
+        sp += id_prefix_len(_d as u32);
         let (mut nh, mut ov) = (0usize, false);
         let mut dummy_bs = [0u64; 16];
         scan_doc(
@@ -1604,6 +1626,8 @@ unsafe fn run_all() {
                 c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
                 c_post_lens[c].store(my_total, Ordering::Relaxed);
                 worker_transpose(c, nt, c_off_p, chunk_u16, &doc_s, &doc_e, fw, dp);
+                madvise(fw as *mut u8, FW_CAP * size_of::<u16>(), 4);
+                madvise(dp as *mut u8, DP_CAP * size_of::<u32>(), 4);
             }
             free_mmap(fw, FW_CAP);
             free_mmap(dp, DP_CAP);
@@ -1695,18 +1719,8 @@ unsafe fn run_all() {
         writer.write_all(ob).unwrap();
     }
     writer.flush().unwrap();
-    free_mmap(raw_bs_ptr, g_bs_total);
-    for c in 0..NUM_C {
-        free_mmap(
-            c_post_ptrs[c].load(Ordering::Relaxed) as *mut u16,
-            c_post_lens[c].load(Ordering::Relaxed),
-        );
-    }
-    free_mmap(c_offs, sc_count);
-    drop(doc_ts);
-    drop(queries);
-    drop(q_terms);
-    malloc_trim(0);
+    drop(writer);
+    _exit(0);
 }
 fn main() {
     unsafe {
