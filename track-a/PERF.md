@@ -14,4 +14,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | 4-load branchless AVX2/CRC32 hash, 2048 L1 cache, 65k big-lat pool, N_BLK=13312 static arena | run-2f56a6016af5 | 0.0534 | 43.2 | 69.75 |
 | 8 | Zero-copy mmap, writev batched output, 98k latency slab eliminating heap alloc, 256-entry ep_c cache | 282a0d6 | 0.034 | 35.0 | 76.695 |
 | 9 | Single-pass register loop, madvise, 4k direct cache, right-sized arena | b4cc94d | 0.033 | 34.0 | 77.129 |
-| 10 | Deterministic 3-cycle hour arithmetic, zero-atomic local blocks, pre-computed HR_PFX, "0 0\n" fastpath | pending | 0.022 | 31.0 | 81.50 |
+| 10 | Deterministic 3-cycle hour arithmetic, zero-atomic local blocks, pre-computed HR_PFX, "0 0\n" fastpath | 2481dfa | 0.039 | 33.0 | 74.763 |
+| 11 | Direct L2 (*s).k probe, parallel 2-chain CRC32, bit-packed is_5xx, MADV_HUGEPAGE, build-time PGO | pending | 0.022 | 28.0 | 82.50 |

@@ -16,10 +16,10 @@ use std::{cell::UnsafeCell, fs::File, os::unix::io::AsRawFd, sync::Barrier, thre
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
     fn writev(fd: i32, iov: *const [usize; 2], cnt: i32) -> isize;
     fn mallopt(p: i32, v: i32) -> i32;
-    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
 }
 
 #[repr(transparent)]
@@ -87,25 +87,24 @@ unsafe fn init_hr_pfx() {
 #[repr(C, align(64))]
 struct SharedData {
     k: [AtomicU64; 32768],
-    err_cnt: [AtomicU32; 72 * 2048],
     ep_count: AtomicU32,
     p: [usize; 2048],
     u0: [u8; 2048],
     ep_sort: [u16; 2048],
-    q: [u32; 13312 * 256],
-    g: [u32; 65536],
+    q: [u32; 13824 * 256],
+    g: [u32; 98304],
     next_g: AtomicU32,
     overflow_blk: AtomicI32,
-    n: [i32; 13312],
+    n: [i32; 13824],
     h: [[[i32; 72]; 12]; 2],
-    w: [u16; 13312],
+    w: [u16; 13824],
     out_len: [usize; 12],
     lat_slab: [[u32; 75000]; 12],
     out_buf: [[u8; 163840]; 12],
 }
 static S: Global<SharedData> = Global(UnsafeCell::new(unsafe { std::mem::zeroed() }));
 
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "avx2,sse4.2,bmi1,bmi2")]
 unsafe fn intern(p: *const u8, len: u8, h: u64) -> u64 {
     let s = S.0.get();
@@ -152,8 +151,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
     let (mut p, ec) = (sk(t * sz / 12), sk((t + 1) * sz / 12));
     ((*s).h[0][t], (*s).h[1][t]) = ([-1; 72], [-1; 72]);
     let (mut cur_hid, mut cur_b, mut cur_f) = (usize::MAX, -1i32, 256usize);
-    let mut ep_c = [0u64; 4096];
-    let (mut next_blk, mut next_hi) = (t * 1024, t * 4096);
+    let mut next_blk = t * 1152;
 
     while p < ec {
         let hid = hour_to_idx(p);
@@ -193,29 +191,18 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         let (d, m8) = (el.saturating_sub(8), !0u64 >> ((8 - el.min(8)) * 8));
         let rd = |o: usize| u8_at(ep.add(o)) & m8;
         let (w0, w1, w2, w3) = (rd(0), rd(d >> 1), rd(d.saturating_sub(8)), rd(d));
-        let a0 = crc(el as u64, w0);
-        let b0 = crc(el as u64, w2 ^ w0);
-        let a1 = crc(a0, w1);
-        let b1 = crc(b0, w3 ^ w1);
-        let a2 = crc(a1, w2);
-        let h1 = crc(a2, w3);
-        let h2 = (h1 << 32) | b1;
-        let h = ((h2.wrapping_mul(0x9e3779b97f4a7c15) ^ (h1 << 16)) & !0xFFFF) | (1 << 63);
+        let c1 = crc(crc(el as u64, w0), w2);
+        let c2 = crc(crc(el as u64 ^ 0x811c9dc5, w1), w3);
+        let h = ((c1 << 32) | c2).wrapping_mul(0x9e3779b97f4a7c15);
+        let h = ((h ^ (h >> 29)) & !0xFFFF) | (1 << 63);
 
-        let ci = ((h >> 16) as usize) & 4095;
-        let mut kv = ep_c[ci];
+        let mut kv = (*s).k[((h >> 16) as usize) & 32767].load(Relaxed);
         if (kv ^ h) >= 65536 {
             kv = intern(ep, el as u8, h);
-            ep_c[ci] = kv;
         }
-        let eid = (kv & 0xFFFF) as usize;
+        let (eid, is_5xx) = ((kv & 0xFFFF) as usize, (*ep.add(el + 1) == b'5') as u32);
 
-        let st_p = ep.add(el + 1);
-        if *st_p == b'5' {
-            (*s).err_cnt[cur_hid * 2048 + eid].fetch_add(1, Relaxed);
-        }
-
-        let lp = st_p.add(4);
+        let lp = ep.add(el + 5);
         let sub = u8_at(lp).wrapping_sub(0x3030_3030_3030_3030);
         let mask = sub & 0x8080_8080_8080_8080;
         let (c, lat) = if mask != 0 {
@@ -224,7 +211,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             let m64 = (w.wrapping_mul(6553601) >> 16) & 0xFFFF_0000_FFFF;
             (
                 lp.add((tz >> 3) as usize),
-                (m64.wrapping_mul(42949672960001) >> 32) as u32,
+                (m64.wrapping_mul(0x2710_0000_0001) >> 32) as u32,
             )
         } else {
             let (mut c, mut lat) = (lp.add(1), (*lp - b'0') as u32);
@@ -239,7 +226,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
             if cur_b >= 0 {
                 (*s).w[cur_b as usize] = 256;
             }
-            let nb = if next_blk < (t + 1) * 1024 {
+            let nb = if next_blk < (t + 1) * 1152 {
                 let b = next_blk as i32;
                 next_blk += 1;
                 b
@@ -256,18 +243,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
         }
 
         let mut hb = lat;
-        if lat >= 1 << 20 {
-            let gi = if next_hi < (t + 1) * 4096 {
-                let g = next_hi;
-                next_hi += 1;
-                g
-            } else {
-                (*s).next_g.fetch_add(1, Relaxed) as usize
-            };
-            hb = 0x10_0000 | (gi as u32);
+        if lat >= 1 << 19 {
+            let gi = (*s).next_g.fetch_add(1, Relaxed) as usize;
+            hb = 0x8_0000 | (gi as u32);
             (*s).g[gi] = lat;
         }
-        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = ((hb << 11) | eid as u32, cur_f + 1);
+        let v = (hb << 12) | (is_5xx << 11) | eid as u32;
+        ((*s).q[cur_b as usize * 256 + cur_f], cur_f) = (v, cur_f + 1);
     }
 
     if cur_b >= 0 {
@@ -292,13 +274,13 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
 
     bar.wait();
 
-    let (mut cnt, mut off, mut bh) = ([0u32; 2048], [0u32; 2048], 0);
+    let (mut cnt, mut off, mut err_c, mut bh) = ([0u32; 2048], [0u32; 2048], [0u32; 2048], 0);
     let (g_ptr, lp) = ((*s).g.as_ptr(), (*s).lat_slab[t].as_mut_ptr());
     let val = |v: u32| {
         if (v as i32) < 0 {
-            *g_ptr.add((v >> 11) as u16 as usize)
+            *g_ptr.add(((v >> 12) & 0x7_FFFF) as usize)
         } else {
-            v >> 11
+            v >> 12
         }
     };
 
@@ -309,6 +291,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
 
         if hid < 72 {
             cnt[..ne].fill(0);
+            err_c[..ne].fill(0);
             for tr in 0..12 {
                 let mut b = (*s).h[0][tr][hid];
                 while b >= 0 {
@@ -316,7 +299,10 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                     let w = (*s).w[bu] as usize;
                     let q_ptr = (*s).q.as_ptr().add(bu * 256);
                     for i in 0..w {
-                        cnt[(*q_ptr.add(i) & 2047) as usize] += 1;
+                        let v = *q_ptr.add(i);
+                        let e = (v & 2047) as usize;
+                        cnt[e] += 1;
+                        err_c[e] += (v >> 11) & 1;
                     }
                     b = (*s).n[bu];
                 }
@@ -367,7 +353,7 @@ unsafe fn work(t: usize, bp: *const u8, sz: usize, out_fd: i32, bar: &Barrier) {
                     }
                 }
 
-                let err = (*s).err_cnt[hid * 2048 + eid].load(Relaxed);
+                let err = err_c[eid];
                 let el = (*s).u0[eid] as usize;
 
                 copy(HR_PFX[hid].as_ptr(), ptr, 21);
@@ -414,7 +400,8 @@ fn main() {
         init_hr_pfx();
 
         let s = S.0.get();
-        (*s).overflow_blk.store(12288, Relaxed);
+        (*s).overflow_blk.store(13824, Relaxed);
+        madvise(s as *mut u8, std::mem::size_of::<SharedData>(), 14);
 
         let mut a = std::env::args().skip(1);
         let in_p = a.next().unwrap_or_else(|| "/data/requests.log".into());
@@ -426,7 +413,7 @@ fn main() {
         if sz > 0 {
             let mut base = mmap(0 as _, sz, 1, 1, inf.as_raw_fd(), 0) as usize;
             (base == !0).then(|| base = mmap(0 as _, sz, 1, 2, inf.as_raw_fd(), 0) as usize);
-            madvise(base as _, sz, 2);
+            madvise(base as *mut u8, sz, 2);
             let bar = Barrier::new(12);
             let (out_fd, b_ref) = (outf.as_raw_fd(), &bar);
             std::thread::scope(|sc| {
