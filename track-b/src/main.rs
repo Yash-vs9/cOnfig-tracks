@@ -30,9 +30,9 @@ extern "C" {
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_C: usize = 12;
-const FW_CAP: usize = 1_300_000;
-const DP_CAP: usize = 22_000;
+const NUM_C: usize = 24;
+const FW_CAP: usize = 650_000;
+const DP_CAP: usize = 12_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot {
@@ -1520,9 +1520,9 @@ unsafe fn run_all() {
                 c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
                 c_post_lens[c].store(my_total, Ordering::Relaxed);
                 worker_transpose(c, nt, c_off_p, chunk_u16, &doc_s, &doc_e, fw, dp);
-                free_mmap(fw, FW_CAP);
-                free_mmap(dp, DP_CAP);
             }
+            free_mmap(fw, FW_CAP);
+            free_mmap(dp, DP_CAP);
             barrier1.wait();
             let chunk_nt = (nt + NUM_T - 1) / NUM_T;
             let t_start = tid * chunk_nt;
