@@ -30,9 +30,9 @@ extern "C" {
 const H_SZ: usize = 131072;
 const H_MSK: usize = H_SZ - 1;
 const NUM_T: usize = 12;
-const NUM_C: usize = 24;
-const FW_CAP: usize = 650_000;
-const DP_CAP: usize = 24_000;
+const NUM_C: usize = 12;
+const FW_CAP: usize = 1_300_000;
+const DP_CAP: usize = 22_000;
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct Slot {
@@ -72,9 +72,9 @@ struct FastBucket {
     e0: FastEntry,
     e1: FastEntry,
 }
-const FC_SZ: usize = 1024;
+const FC_SZ: usize = 2048;
 const FC_MSK: usize = FC_SZ - 1;
-static mut FAST_CACHE: [FastBucket; 1024] = [FastBucket {
+static mut FAST_CACHE: [FastBucket; 2048] = [FastBucket {
     e0: FastEntry {
         w0: 0,
         tid: u32::MAX,
@@ -89,7 +89,7 @@ static mut FAST_CACHE: [FastBucket; 1024] = [FastBucket {
         len: 0,
         _pad: 0,
     },
-}; 1024];
+}; 2048];
 
 const CMAP: [u8; 256] = {
     let mut m = [0u8; 256];
@@ -129,10 +129,10 @@ static mut TINFO: [TInfo; 81920] = [TInfo {
 }; 81920];
 static mut GLOBAL_DF: [AtomicU32; 81920] = [const { AtomicU32::new(0) }; 81920];
 static mut N_TERMS: usize = 0;
-const PF_WORDS: usize = 4096;
+const PF_WORDS: usize = 16384;
 const PF_WMASK: usize = PF_WORDS - 1;
 
-static mut PF: [u64; 4096] = [0; 4096];
+static mut PF: [u64; 16384] = [0; 16384];
 #[inline(always)]
 fn mix64(w0: u64, w1: u64, len: usize) -> u64 {
     let h = (w0 ^ (w1.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(len as u64)))
@@ -431,7 +431,7 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 2, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     close(fd);
     std::slice::from_raw_parts(p, len)
 }
@@ -1520,9 +1520,9 @@ unsafe fn run_all() {
                 c_post_ptrs[c].store(chunk_u16 as usize, Ordering::Release);
                 c_post_lens[c].store(my_total, Ordering::Relaxed);
                 worker_transpose(c, nt, c_off_p, chunk_u16, &doc_s, &doc_e, fw, dp);
+                free_mmap(fw, FW_CAP);
+                free_mmap(dp, DP_CAP);
             }
-            free_mmap(fw, FW_CAP);
-            free_mmap(dp, DP_CAP);
             barrier1.wait();
             let chunk_nt = (nt + NUM_T - 1) / NUM_T;
             let t_start = tid * chunk_nt;
