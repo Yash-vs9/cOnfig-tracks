@@ -1,3 +1,10 @@
+
+#include <cstdlib>
+__attribute__((constructor)) static void pre_init() {
+  setenv("OMP_WAIT_POLICY", "ACTIVE", 0);
+  setenv("OMP_PROC_BIND", "TRUE", 0);
+  setenv("OMP_STACKSIZE", "64k", 0);
+}
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -14,7 +21,7 @@ struct alignas(64) Agg {
   int64_t id_s, am_s, mi, ma, nb, ntb;
   void add(const Agg &t) {
     mi = cnt ? std::min(mi, t.mi) : t.mi, ma = cnt ? std::max(ma, t.ma) : t.ma;
-    cnt += t.cnt, id_s += t.id_s, am_s += t.am_s, nb += t.nb, ntb += t.ntb;
+    cnt += t.cnt, dn += t.dn, id_s += t.id_s, am_s += t.am_s, nb += t.nb, ntb += t.ntb;
   }
 };
 
@@ -88,6 +95,14 @@ static inline bool is_rec_end(const char *b, size_t sz, const char *nl) {
   while (nx < b + sz && (uint32_t)(*nx - '0') <= 9) ++nx;
   return nx > s && nx < b + sz && *nx == ',';
 }
+static inline bool test_and_set_bit(uint64_t *bits, uint32_t bit) {
+  bool old_bit;
+  asm volatile("lock btsq %2, %0; setc %1"
+               : "+m"(*bits), "=r"(old_bit)
+               : "r"((uint64_t)bit)
+               : "cc", "memory");
+  return old_bit;
+}
 
 int main(int argc, char **argv) {
   int rfd = open(argc > 1 ? argv[1] : "/data/regions.csv", O_RDONLY);
@@ -99,7 +114,7 @@ int main(int argc, char **argv) {
     if (!len) return nullptr;
     auto m = mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) m = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (m != MAP_FAILED) madvise(m, len, MADV_WILLNEED | MADV_SEQUENTIAL);
+    if (m != MAP_FAILED) madvise(m, len, MADV_WILLNEED | MADV_SEQUENTIAL | MADV_HUGEPAGE);
     return (const char *)m;
   };
   const char *rb = map_f(rfd, rsz), *base = map_f(mfd, sz);
@@ -195,19 +210,11 @@ int main(int argc, char **argv) {
           }
           nh = hash_fast(tmp, (uint32_t)nb);
         }
-      } else if (__builtin_expect(*p == ',', 0)) {
-        nb = 0, nh = 3902269347ULL, ++p;
       } else {
-        const char *q = nullptr;
-        if (__builtin_expect(p + 32 <= end, 1)) {
-          uint32_t m = mm_find(p, c_vec);
-          if (m) q = p + __builtin_ctz(m);
-        }
-        if (!q) q = (const char *)memchr(p, ',', end - p);
-        nb = q - p, nh = hash_fast(p, (uint32_t)nb), p = q + 1;
+        nb = 0, nh = 3902269347ULL, ++p;
       }
     name_done:
-      uint32_t slot0 = (uint32_t)nh & HT_MASK;
+      uint32_t slot0 = (uint32_t)(nh ^ (nh >> 32)) & HT_MASK;
       _mm_prefetch((const char *)&name_keys[slot0], _MM_HINT_T0);
       _mm_prefetch((const char *)&name_bits[slot0], _MM_HINT_T0);
 
@@ -253,31 +260,14 @@ int main(int argc, char **argv) {
         }
       done_q:
         ntb += p - s, p += 2;
-      } else if (__builtin_expect(*p == ',', 0)) {
-        ntb = 0, ++p;
       } else {
-        const char *s = p;
-        if (__builtin_expect(p + 32 <= end, 1)) {
-          uint32_t m = mm_find(s, c_vec);
-          if (m) {
-            ntb = __builtin_ctz(m), p = s + ntb + 1;
-            goto note_done;
-          }
-          if (__builtin_expect(p + 64 <= end, 1)) {
-            uint32_t m2 = mm_find(s + 32, c_vec);
-            if (m2) {
-              ntb = 32 + __builtin_ctz(m2), p = s + ntb + 1;
-              goto note_done;
-            }
-            p = s + 64;
-          } else
-            p = s + 32;
-        }
-        p = (const char *)memchr(p, ',', end - p), ntb = p - s, ++p;
+        ntb = 0, ++p;
       }
     note_done:
       uint32_t rid = parse_u(p);
-      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0, cid = r ? (r - 1) : unm_cid;
+      if (__builtin_expect(rid < 1000000, 1)) {
+        _mm_prefetch((const char *)&reg_lut[rid], _MM_HINT_T0);
+      }
       bool neg = (*p == '-') && ++p;
       int64_t cents = *p++ - '0';
       if (*p != '.')
@@ -285,6 +275,12 @@ int main(int argc, char **argv) {
       cents = cents * 100 + p[1] * 10 + p[2] - 528, p += 3;
       if (__builtin_expect(neg, 0)) cents = -cents;
       p += 1 + (*p == '\r');
+
+      uint8_t r = (rid < 1000000) ? reg_lut[rid] : 0, cid = r ? (r - 1) : unm_cid;
+
+      Agg &a = T[tid][cid];
+      a.cnt++, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
+      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
 
       uint32_t slot = slot0;
       for (;; slot = (slot + 1) & HT_MASK) {
@@ -294,19 +290,15 @@ int main(int argc, char **argv) {
                    name_keys[slot] == nh))
           break;
       }
-      uint64_t mask = 1ULL << (cid & 63), *w = &name_bits[slot][cid >> 6];
-      uint32_t is_dn = __builtin_expect(!(*w & mask), 1) &&
-                       !(__atomic_fetch_or(w, mask, __ATOMIC_RELAXED) & mask);
-
-      Agg &a = T[tid][cid];
-      a.cnt++, a.dn += is_dn, a.id_s += id, a.am_s += cents, a.nb += nb, a.ntb += ntb;
-      a.mi = std::min(a.mi, cents), a.ma = std::max(a.ma, cents);
+      uint64_t mask = 1ULL << (cid & 63);
+      if (__builtin_expect(!(name_bits[slot][cid >> 6] & mask), 1) &&
+          !test_and_set_bit(name_bits[slot], cid))
+        a.dn++;
     }
   }
 
   for (int c = 0; c <= unm_cid; ++c)
     for (int t = 1; t < 12; ++t) {
-      T[0][c].dn += T[t][c].dn;
       if (T[t][c].cnt) T[0][c].add(T[t][c]);
     }
 
