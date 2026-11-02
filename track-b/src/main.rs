@@ -504,8 +504,9 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let fd = f.into_raw_fd();
-    let p = mmap(ptr::null_mut(), len, 1, 1 | 0x8000, fd, 0);
+    let p = mmap(ptr::null_mut(), len, 1, 1, fd, 0);
     madvise(p, len, 3);
+    madvise(p, len, 2);
     close(fd);
     std::slice::from_raw_parts(p, len)
 }
@@ -994,7 +995,7 @@ impl<'a> Engine<'a> {
             }
             let (d_ptr, d_len) = (self.d_buf.as_ptr(), self.d_buf.len());
             let is_alnum = |b: u8| -> bool {
-                b.wrapping_sub(b'0') <= 9 || (b | 0x20).wrapping_sub(b'a') <= 25
+                *CMAP.get_unchecked(b as usize) > 1
             };
             let match_word = |tp: usize, j: usize| -> bool {
                 let l = plen[j];
